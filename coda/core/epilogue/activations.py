@@ -2,6 +2,12 @@ import cutlass.cute as cute
 from quack.activation import dswiglu, swiglu
 # Re-exported unchanged
 from quack.epilogue.library import amax_epi, lse_epi, rstd_lse_epi
+from quack.epilogue.rotary import (
+    _angle_turns,
+    _sincos_turns,
+    rope_posfreq_epi,
+    rstd_rope_posfreq_epi,
+)
 from quack.epilogue.math import F2, Pair, pack, unpack
 from quack.epilogue.frontend import gemm_epilogue
 from quack.epilogue.ops import (
@@ -76,6 +82,20 @@ def alpha_residual_sqsum_scaled_epi(acc: EpiValue, c: EpiValue, weight: EpiValue
     y = acc * alpha + c
     o = y * weight
     return {"D": y, "scaled_out": o, "sqsum": (y, y)}
+
+
+@gemm_epilogue(
+    ops={
+        "pos": ColVecLoad("pos"),
+        "freq": RowVecLoad("freq"),
+        "alpha": Scalar("alpha"),
+    },
+    mode="acc_pair",
+)
+def alpha_rope_posfreq_epi(acc: EpiValue, pos: EpiValue, freq: EpiValue, alpha: EpiValue) -> EpiOut:
+    x1, x2 = unpack(acc * alpha)
+    s, c = _sincos_turns(*_angle_turns(pos, freq))
+    return {"D": pack(x1 * c - x2 * s, x1 * s + x2 * c)}
 
 
 @gemm_epilogue(
