@@ -37,13 +37,23 @@ GEMM_CONFIGS = _extend_configs(GEMM_CONFIGS, lambda config: dataclasses.replace(
 
 
 def prune_gemm_configs(configs: list[AutotuneConfig], named_args: dict, **kwargs) -> list[AutotuneConfig]:
-    kwargs = named_args | kwargs
     configs = prune_invalid_gemm_configs(
         configs=configs,
         named_args=named_args,
         **kwargs,
     )
     configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
+    return configs
+
+
+def prune_gated_gemm_configs(configs: list[AutotuneConfig], named_args: dict, **kwargs) -> list[AutotuneConfig]:
+    configs = prune_gemm_configs(
+        configs=configs,
+        named_args=named_args,
+        **kwargs,
+    )
+    # https://github.com/Dao-AILab/quack/blob/v0.6.4/quack/epilogue/ops.py#L928
+    configs = [conf for conf in configs if conf.kwargs["config"].tile_n % 32 == 0]
     return configs
 
 
