@@ -10,7 +10,6 @@ from quack.gemm_config import GemmConfig, get_all_configs
 from quack.gemm_interface import prune_invalid_gemm_configs
 
 from coda.core.ops.constants import AUTOTUNE_CACHE_RESULTS
-from coda.core.ops.torch_utils import preprocess_tensor
 
 
 def _extend_configs(
@@ -80,23 +79,3 @@ def _kernel_op(
         return op
 
     return decorator
-
-
-def _preprocess_gemm_operands(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    D: torch.Tensor | None,
-    C: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    # quack rotates batched operands from caller order (l, x, y) to kernel order
-    # (x, y, l) itself at trace time (GemmBase.rotate_batch_last), so hand them over
-    # batch-first and do not permute here
-    # Preprocess A: (M, K) -> (L, M, K)
-    A = preprocess_tensor(A, permute=False, transpose=False)
-    # Preprocess B: (K, N) -> (L, N, K) with transpose
-    B = preprocess_tensor(B, permute=False, transpose=True)
-    # Preprocess D: (M, N) -> (L, M, N)
-    D = preprocess_tensor(D, permute=False, transpose=False) if D is not None else None
-    # Preprocess C: (M, N) -> (L, M, N)
-    C = preprocess_tensor(C, permute=False, transpose=False) if C is not None else None
-    return A, B, D, C
