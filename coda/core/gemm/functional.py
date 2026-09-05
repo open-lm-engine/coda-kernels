@@ -53,7 +53,9 @@ def _gemm_tuned(
     backend: str,
 ) -> None:
     if backend == "quack":
-        quack_gemm(A=A, B=B, out=out, tuned=True)
+        # setting `split_k=None` so the autotuner adds split-K candidates
+        # only for occupancy-starved shapes (fewer tiles than SMs)
+        quack_gemm(A=A, B=B, out=out, tuned=True, split_k=None)
     else:
         torch.matmul(A, B, out=out)
 
