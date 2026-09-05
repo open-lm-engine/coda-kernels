@@ -78,6 +78,9 @@ def _preprocess_gemm_operands(
     D: torch.Tensor | None,
     C: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    # quack rotates batched operands from caller order (l, x, y) to kernel order
+    # (x, y, l) itself at trace time (GemmBase.rotate_batch_last), so hand them over
+    # batch-first and do not permute here
     # Preprocess A: (M, K) -> (L, M, K)
     A = preprocess_tensor(A, permute=False, transpose=False)
     # Preprocess B: (K, N) -> (L, N, K) with transpose
