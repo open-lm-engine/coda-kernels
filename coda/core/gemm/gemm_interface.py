@@ -29,10 +29,16 @@ def _extend_configs(
     return configs_extended
 
 
+# https://github.com/Dao-AILab/quack/blob/v0.6.4/quack/gemm_config.py#L127
+def _cooperative_compatible(config: GemmConfig) -> bool:
+    return config.device_capacity != 9 or config.pingpong or config.tile_m != 192
+
+
 GEMM_CONFIGS = get_all_configs()
 GEMM_CONFIGS = _extend_configs(GEMM_CONFIGS, lambda config: dataclasses.replace(config, cluster_m=1, cluster_n=1))
 GEMM_CONFIGS = _extend_configs(GEMM_CONFIGS, lambda config: dataclasses.replace(config, cluster_m=1, cluster_n=1, pingpong=False))
 GEMM_CONFIGS = _extend_configs(GEMM_CONFIGS, lambda config: dataclasses.replace(config, is_dynamic_persistent=True))
+GEMM_CONFIGS = [config for config in GEMM_CONFIGS if _cooperative_compatible(config)]
 
 
 def prune_gemm_configs(configs: list[AutotuneConfig], named_args: dict, **kwargs) -> list[AutotuneConfig]:
