@@ -85,3 +85,20 @@ def _kernel_op(
         return op
 
     return decorator
+
+
+def epilogue_autotune(
+    gated: bool = False,
+    configs: list[GemmConfig] | None = None,
+) -> Callable[[Callable], Callable]:
+    if configs is None:
+        configs = GEMM_CONFIGS
+    if gated:
+        prune_fn = prune_gated_gemm_configs
+    else:
+        prune_fn = prune_gemm_configs
+    return autotune(
+        configs=[AutotuneConfig(config=c) for c in configs],
+        prune_configs_by={"early_config_prune": prune_fn},
+        cache_results=AUTOTUNE_CACHE_RESULTS,
+    )
