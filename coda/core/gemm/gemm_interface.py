@@ -99,12 +99,10 @@ def epilogue_launch(
     add_to_output: bool = False,
     fp8_fast_accum: bool = False,
 ) -> None:
-    # sm90 dynamic persistent scheduling needs a tile counter in global memory
-    semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device)
-        if config.is_dynamic_persistent
-        else None
-    )
+    if config.is_dynamic_persistent:
+        semaphore = torch.zeros(1, dtype=torch.int32, device=A.device)
+    else:
+        semaphore = None
     if fp8_fast_accum:
         post_init_attrs = (("fp8_slow_accum", False),)
     else:
@@ -124,6 +122,8 @@ def epilogue_launch(
         is_dynamic_persistent=config.is_dynamic_persistent,
         max_swizzle_size=config.max_swizzle_size,
         tile_count_semaphore=semaphore,
+        use_tma_gather=config.use_tma_gather,
+        swap_ab=config.swap_ab,
         split_k=config.split_k,
         add_to_output=add_to_output,
         post_init_attrs=post_init_attrs,
