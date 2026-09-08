@@ -144,54 +144,31 @@ def gemm_swiglu(
     return preact, postact
 
 
-@autotune(
-    configs=[AutotuneConfig(config=c) for c in GEMM_CONFIGS],
-    prune_configs_by={"early_config_prune": prune_gemm_configs},
-    cache_results=AUTOTUNE_CACHE_RESULTS,
+@_kernel_op(
+    name="coda::_gemm_rmsnorm_swiglu_epi",
+    mutates_args=("D", "postact"),
 )
-def _gemm_rmsnorm_swiglu_tuned(
+@epilogue_autotune(
+    gated=True,
+)
+def _gemm_rmsnorm_swiglu_epi(
     A: torch.Tensor,
     B: torch.Tensor,
     D: torch.Tensor,
-    R: torch.Tensor,
-    O: torch.Tensor,
+    rstd: torch.Tensor,
+    postact: torch.Tensor,
     config: GemmConfig,
 ) -> None:
-    epi_args = {
-        "mColVecBroadcast": R,
-        "mAuxOut": O,
-    }
-    _gemm_epilogue_tuned(
-        GemmCls=GemmScaleSwiGLU,
+    epilogue_launch(
+        epi_fn=epilogues.rstd_swiglu_scaled_preact_epi,
         A=A,
         B=B,
         D=D,
-        C=None,
-        epi_args=epi_args,
-        epi_keys=make_epi_keys(GemmScaleSwiGLU, epi_args),
-        pin_tile_M=None,
-        pin_tile_N=None,
-        fp8_fast_accum=False,
-        batch_idx_permute=None,
-        add_to_output=False,
+        epi_args={
+            "rstd": rstd,
+            "postact": postact,
+        },
         config=config,
-    )
-
-
-@_kernel_op("coda::_gemm_rmsnorm_swiglu", mutates_args=("D", "O"))
-def _gemm_rmsnorm_swiglu(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    D: torch.Tensor,
-    R: torch.Tensor,
-    O: torch.Tensor,
-) -> None:
-    _gemm_rmsnorm_swiglu_tuned(
-        A=A,
-        B=B,
-        D=D,
-        R=R,
-        O=O,
     )
 
 
@@ -211,135 +188,14 @@ def gemm_rmsnorm_swiglu(
         pre = torch.empty(M, N, dtype=A.dtype, device=A.device)
     if post is None:
         post = torch.empty(M, N // 2, dtype=A.dtype, device=A.device)
-    A, B, D, _ = _preprocess_gemm_operands(
+    _gemm_rmsnorm_swiglu_epi(
         A=A,
-        B=B,
+        B=B.mT,
         D=pre,
-        C=None,
-    )
-    epi_args = preprocess_epi_args(
-        GemmCls=GemmScaleSwiGLU,
-        epi_args={
-            "mColVecBroadcast": rstd,
-            "mAuxOut": post,
-        },
-    )
-    _gemm_rmsnorm_swiglu(
-        A=A,
-        B=B,
-        D=D,
-        R=epi_args["mColVecBroadcast"],
-        O=epi_args["mAuxOut"],
+        rstd=rstd,
+        postact=post,
     )
     return pre, post
-
-
-# a head spans at most ceil(head_dim / tile_n) + 1 tiles; size ssq for the narrowest sm90 tile
-_SQSUM_MIN_TILE_N = min(
-    c.tile_n
-    for c in GEMM_CONFIGS
-    if c.device_capacity == _DEVICE_CAPACITY
-)
-
-
-def _sqsum_num_segments(head_dim: int) -> int:
-    return misc_utils.ceil_div(head_dim, _SQSUM_MIN_TILE_N) + 1
-
-
-@autotune(
-    configs=[AutotuneConfig(config=c) for c in GEMM_CONFIGS],
-    key=["head_dim", "num_segments"],
-    prune_configs_by={"early_config_prune": prune_gemm_configs},
-    cache_results=AUTOTUNE_CACHE_RESULTS,
-)
-def _gemm_qkv_sqsum_tuned(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    D: torch.Tensor,
-    ssq: torch.Tensor,
-    head_dim: int,
-    num_segments: int,
-    config: GemmConfig,
-) -> None:
-    epi_args = {
-        "mSqSumVec": ssq,
-        "head_dim": head_dim,
-        "num_segments": num_segments,
-    }
-    _gemm_epilogue_tuned(
-        GemmCls=GemmQKVSqSum,
-        A=A,
-        B=B,
-        D=D,
-        C=None,
-        epi_args=epi_args,
-        epi_keys=make_epi_keys(GemmQKVSqSum, epi_args),
-        pin_tile_M=None,
-        pin_tile_N=None,
-        fp8_fast_accum=False,
-        batch_idx_permute=None,
-        add_to_output=False,
-        config=config,
-    )
-
-
-@_kernel_op("coda::_gemm_qkv_sqsum", mutates_args=("D", "ssq"))
-def _gemm_qkv_sqsum(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    D: torch.Tensor,
-    ssq: torch.Tensor,
-    head_dim: int,
-    num_segments: int,
-) -> None:
-    _gemm_qkv_sqsum_tuned(
-        A=A,
-        B=B,
-        D=D,
-        ssq=ssq,
-        head_dim=head_dim,
-        num_segments=num_segments,
-    )
-
-
-def gemm_qkv_sqsum(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    head_dim: int,
-    num_segments: int,
-    out: torch.Tensor | None = None,
-    ssq: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    M, _ = A.shape
-    _, N = B.shape
-    if out is None:
-        out = torch.empty(M, N, dtype=A.dtype, device=A.device)
-    if ssq is None:
-        # zero-init as heads whose segments a tile never writes must read 0
-        ssq = torch.zeros(M, (N // head_dim) * num_segments, dtype=torch.float32, device=A.device)
-    A, B, D, _ = _preprocess_gemm_operands(
-        A=A,
-        B=B,
-        D=out,
-        C=None,
-    )
-    epi_args = preprocess_epi_args(
-        GemmCls=GemmQKVSqSum,
-        epi_args={
-            "mSqSumVec": ssq,
-            "head_dim": head_dim,
-            "num_segments": num_segments,
-        },
-    )
-    _gemm_qkv_sqsum(
-        A=A,
-        B=B,
-        D=D,
-        ssq=epi_args["mSqSumVec"],
-        head_dim=head_dim,
-        num_segments=num_segments,
-    )
-    return out, ssq
 
 
 @torch.compile(fullgraph=True, dynamic=False)
