@@ -87,6 +87,49 @@ def _kernel_op(
     return decorator
 
 
+def epilogue_launch(
+    epi_fn: EpiMod,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    D: torch.Tensor,
+    C: torch.Tensor | None = None,
+    *,
+    epi_args: dict,
+    config: GemmConfig,
+    add_to_output: bool = False,
+    fp8_fast_accum: bool = False,
+) -> None:
+    # sm90 dynamic persistent scheduling needs a tile counter in global memory
+    semaphore = (
+        torch.zeros(1, dtype=torch.int32, device=A.device)
+        if config.is_dynamic_persistent
+        else None
+    )
+    if fp8_fast_accum:
+        post_init_attrs = (("fp8_slow_accum", False),)
+    else:
+        post_init_attrs = ()
+    _ = epi_fn.gemm(
+        A=A,
+        B=B,
+        D=D,
+        C=C,
+        epi_args=epi_args,
+        tile_M=config.tile_m,
+        tile_N=config.tile_n,
+        tile_K=config.tile_k,
+        cluster_M=config.cluster_m,
+        cluster_N=config.cluster_n,
+        pingpong=config.pingpong,
+        is_dynamic_persistent=config.is_dynamic_persistent,
+        max_swizzle_size=config.max_swizzle_size,
+        tile_count_semaphore=semaphore,
+        split_k=config.split_k,
+        add_to_output=add_to_output,
+        post_init_attrs=post_init_attrs,
+    )
+
+
 def epilogue_autotune(
     gated: bool = False,
     configs: list[GemmConfig] | None = None,
