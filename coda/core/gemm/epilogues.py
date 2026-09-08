@@ -1,13 +1,6 @@
 import cutlass.cute as cute
 from quack.activation import dswiglu, swiglu
-# Re-exported unchanged
-from quack.epilogue.library import amax_epi, lse_epi, rstd_lse_epi
-from quack.epilogue.rotary import (
-    _angle_turns,
-    _sincos_turns,
-    rope_posfreq_epi,
-    rstd_rope_posfreq_epi,
-)
+from quack.epilogue.rotary import _angle_turns, _sincos_turns
 from quack.epilogue.math import F2, Pair, pack, unpack
 from quack.epilogue.frontend import gemm_epilogue
 from quack.epilogue.ops import (
