@@ -100,7 +100,7 @@ def gemm_scalar_scale(
 
 @_kernel_op(
     name="coda::_gemm_swiglu_epi",
-    mutates_args=("D", "post_act"),
+    mutates_args=("D", "postact"),
 )
 @epilogue_autotune(
     gated=True,
@@ -109,7 +109,7 @@ def _gemm_swiglu_epi(
     A: torch.Tensor,
     B: torch.Tensor,
     D: torch.Tensor,
-    post_act: torch.Tensor,
+    postact: torch.Tensor,
     config: GemmConfig,
 ) -> None:
     epilogue_launch(
@@ -117,7 +117,7 @@ def _gemm_swiglu_epi(
         A=A,
         B=B,
         D=D,
-        epi_args={"postact": post_act},
+        epi_args={"postact": postact},
         config=config,
     )
 
@@ -125,23 +125,23 @@ def _gemm_swiglu_epi(
 def gemm_swiglu(
     A: torch.Tensor,
     B: torch.Tensor,
-    pre_act: torch.Tensor | None = None,
-    post_act: torch.Tensor | None = None,
+    preact: torch.Tensor | None = None,
+    postact: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     M, _ = A.shape
     _, N = B.shape
     assert N % 2 == 0, f"swiglu needs an even gate||up width, got N={N}"
-    if pre_act is None:
-        pre_act = torch.empty(M, N, dtype=A.dtype, device=A.device)
-    if post_act is None:
-        post_act = torch.empty(M, N // 2, dtype=A.dtype, device=A.device)
+    if preact is None:
+        preact = torch.empty(M, N, dtype=A.dtype, device=A.device)
+    if postact is None:
+        postact = torch.empty(M, N // 2, dtype=A.dtype, device=A.device)
     _gemm_swiglu_epi(
         A=A,
         B=B.mT,
-        D=pre_act,
-        post_act=post_act,
+        D=preact,
+        postact=postact,
     )
-    return pre_act, post_act
+    return preact, postact
 
 
 @autotune(
