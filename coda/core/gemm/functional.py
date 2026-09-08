@@ -1,44 +1,28 @@
 import torch
-from quack.gemm_config import GemmConfig
-from quack.gemm_interface import gemm as quack_gemm
-from quack.cross_entropy import cross_entropy_fwd_out
-from quack.rms_final_reduce import _rms_final_reduce_out
 from quack.autotuner import autotune, AutotuneConfig
 from quack.cute_dsl_utils import get_device_capacity
+from quack.gemm_config import GemmConfig
+from quack.gemm_interface import gemm as quack_gemm
+from quack.rms_final_reduce import _rms_final_reduce_out
 
+from coda.core.gemm import epilogues
 from coda.core.ops import misc_utils
 from coda.core.ops.constants import AUTOTUNE_CACHE_RESULTS
-from coda.core.epilogue.utils import (
-    preprocess_epi_args,
-    make_epi_keys,
-)
 from coda.core.gemm.gemm_interface import (
     _kernel_op,
-    _gemm_epilogue_tuned,
-    _preprocess_gemm_operands,
-    prune_gemm_configs,
+    epilogue_launch,
+    epilogue_autotune,
     GEMM_CONFIGS,
-)
-from coda.core.gemm.registry import (
-    GemmScale,
-    GemmScalarScale,
-    GemmScalarScaleResidualRMSNormBwd,
-    GemmSwiGLU,
-    GemmScaleSwiGLU,
-    GemmSwiGLUBwdZdZ,
-    GemmRoPE,
-    GemmScaleRoPE,
-    GemmLSE,
-    GemmScaleLSE,
-    GemmLSESelectLogits,
-    GemmQKVSqSum,
-    GemmResidualSqSumScaledAux,
 )
 
 _DEVICE_CAPACITY = 9
 assert get_device_capacity()[0] == _DEVICE_CAPACITY
 
 
+@_kernel_op(
+    name="coda::_gemm",
+    mutates_args=("out",),
+)
 @autotune(
     configs=[
         AutotuneConfig(backend="quack"),
@@ -46,7 +30,7 @@ assert get_device_capacity()[0] == _DEVICE_CAPACITY
     ],
     cache_results=AUTOTUNE_CACHE_RESULTS,
 )
-def _gemm_tuned(
+def _gemm(
     A: torch.Tensor,
     B: torch.Tensor,
     out: torch.Tensor,
@@ -58,11 +42,6 @@ def _gemm_tuned(
         quack_gemm(A=A, B=B, out=out, tuned=True, split_k=None)
     else:
         torch.matmul(A, B, out=out)
-
-
-@_kernel_op("coda::_gemm", mutates_args=("out",))
-def _gemm(A: torch.Tensor, B: torch.Tensor, out: torch.Tensor) -> None:
-    _gemm_tuned(A=A, B=B, out=out)
 
 
 def gemm(
@@ -78,50 +57,25 @@ def gemm(
     return out
 
 
-@autotune(
-    configs=[AutotuneConfig(config=c) for c in GEMM_CONFIGS],
-    prune_configs_by={"early_config_prune": prune_gemm_configs},
-    cache_results=AUTOTUNE_CACHE_RESULTS,
+@_kernel_op(
+    name="coda::_gemm_scalar_scale_epi",
+    mutates_args=("D",),
 )
-def _gemm_scalar_scale_tuned(
+@epilogue_autotune()
+def _gemm_scalar_scale_epi(
     A: torch.Tensor,
     B: torch.Tensor,
     D: torch.Tensor,
     alpha: torch.Tensor,
     config: GemmConfig,
 ) -> None:
-    epi_args = {
-        "alpha": alpha,
-    }
-    _gemm_epilogue_tuned(
-        GemmCls=GemmScalarScale,
+    epilogue_launch(
+        epi_fn=epilogues.alpha_epi,
         A=A,
         B=B,
         D=D,
-        C=None,
-        epi_args=epi_args,
-        epi_keys=make_epi_keys(GemmScalarScale, epi_args),
-        pin_tile_M=None,
-        pin_tile_N=None,
-        fp8_fast_accum=False,
-        batch_idx_permute=None,
-        add_to_output=False,
+        epi_args={"alpha": alpha},
         config=config,
-    )
-
-
-@_kernel_op("coda::_gemm_scalar_scale", mutates_args=("D",))
-def _gemm_scalar_scale(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    D: torch.Tensor,
-    alpha: torch.Tensor,
-) -> None:
-    _gemm_scalar_scale_tuned(
-        A=A,
-        B=B,
-        D=D,
-        alpha=alpha,
     )
 
 
@@ -135,71 +89,36 @@ def gemm_scalar_scale(
     _, N = B.shape
     if out is None:
         out = torch.empty(M, N, dtype=A.dtype, device=A.device)
-    A, B, D, _ = _preprocess_gemm_operands(
+    _gemm_scalar_scale_epi(
         A=A,
-        B=B,
+        B=B.mT,
         D=out,
-        C=None,
-    )
-    epi_args = preprocess_epi_args(
-        GemmCls=GemmScalarScale,
-        epi_args={
-            "alpha": alpha,
-        },
-    )
-    _gemm_scalar_scale(
-        A=A,
-        B=B,
-        D=D,
-        alpha=epi_args["alpha"],
+        alpha=alpha,
     )
     return out
 
 
-@autotune(
-    configs=[AutotuneConfig(config=c) for c in GEMM_CONFIGS],
-    prune_configs_by={"early_config_prune": prune_gemm_configs},
-    cache_results=AUTOTUNE_CACHE_RESULTS,
+@_kernel_op(
+    name="coda::_gemm_swiglu_epi",
+    mutates_args=("D", "post_act"),
 )
-def _gemm_swiglu_tuned(
+@epilogue_autotune(
+    gated=True,
+)
+def _gemm_swiglu_epi(
     A: torch.Tensor,
     B: torch.Tensor,
     D: torch.Tensor,
     post_act: torch.Tensor,
     config: GemmConfig,
 ) -> None:
-    epi_args = {
-        "mAuxOut": post_act,
-    }
-    _gemm_epilogue_tuned(
-        GemmCls=GemmSwiGLU,
+    epilogue_launch(
+        epi_fn=epilogues.swiglu_preact_epi,
         A=A,
         B=B,
         D=D,
-        C=None,
-        epi_args=epi_args,
-        epi_keys=make_epi_keys(GemmSwiGLU, epi_args),
-        pin_tile_M=None,
-        pin_tile_N=None,
-        fp8_fast_accum=False,
-        batch_idx_permute=None,
-        add_to_output=False,
+        epi_args={"postact": post_act},
         config=config,
-    )
-
-
-@_kernel_op("coda::_gemm_swiglu", mutates_args=("D", "post_act"))
-def _gemm_swiglu(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    D: torch.Tensor,
-    post_act: torch.Tensor,
-) -> None:
-    _gemm_swiglu_tuned(
-        A=A,
-        B=B,
-        D=D,
-        post_act=post_act,
     )
 
 
@@ -216,23 +135,11 @@ def gemm_swiglu(
         pre_act = torch.empty(M, N, dtype=A.dtype, device=A.device)
     if post_act is None:
         post_act = torch.empty(M, N // 2, dtype=A.dtype, device=A.device)
-    A, B, D, _ = _preprocess_gemm_operands(
+    _gemm_swiglu_epi(
         A=A,
-        B=B,
+        B=B.mT,
         D=pre_act,
-        C=None,
-    )
-    epi_args = preprocess_epi_args(
-        GemmCls=GemmSwiGLU,
-        epi_args={
-            "mAuxOut": post_act,
-        },
-    )
-    _gemm_swiglu(
-        A=A,
-        B=B,
-        D=D,
-        post_act=epi_args["mAuxOut"],
+        post_act=post_act,
     )
     return pre_act, post_act
 
