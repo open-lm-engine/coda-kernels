@@ -201,8 +201,8 @@ def gemm_rmsnorm_swiglu(
 
 
 @torch.compile(fullgraph=True, dynamic=False)
-def _lse_reduce_compiled(lses: torch.Tensor, lse_partial: torch.Tensor) -> None:
-    torch.logsumexp(lse_partial, dim=1, out=lses)
+def _lse_reduce_compiled(lses: torch.Tensor, partials: torch.Tensor) -> None:
+    torch.logsumexp(partials, dim=1, out=lses)
 
 
 @_kernel_op(
@@ -230,7 +230,7 @@ def _gemm_lse_epi(
     )
     _lse_reduce_compiled(
         lses=lses,
-        lse_partial=partials,
+        partials=partials,
     )
 
 
@@ -284,7 +284,7 @@ def _gemm_rmsnorm_lse_epi(
     )
     _lse_reduce_compiled(
         lses=lses,
-        lse_partial=partials,
+        partials=partials,
     )
 
 
