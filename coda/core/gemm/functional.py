@@ -4,6 +4,8 @@ from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm_config import GemmConfig
 from quack.gemm_interface import gemm as quack_gemm
 from quack.rms_final_reduce import _rms_final_reduce_out
+from quack.epilogue.library import lse_epi, lse_target_epi, rstd_lse_epi
+from quack.epilogue.rotary import rope_posfreq_epi, rstd_rope_posfreq_epi
 
 from coda.core.gemm import epilogues
 from coda.core.ops import misc_utils
@@ -12,8 +14,8 @@ from coda.core.gemm.gemm_interface import (
     _kernel_op,
     epilogue_launch,
     epilogue_autotune,
-    GEMM_CONFIGS,
 )
+
 
 _DEVICE_CAPACITY = 9
 assert get_device_capacity()[0] == _DEVICE_CAPACITY
@@ -203,65 +205,32 @@ def _lse_reduce_compiled(lses: torch.Tensor, lse_partial: torch.Tensor) -> None:
     torch.logsumexp(lse_partial, dim=1, out=lses)
 
 
-@autotune(
-    configs=[AutotuneConfig(config=c) for c in GEMM_CONFIGS],
-    key=["vocab_size"],
-    prune_configs_by={"early_config_prune": prune_gemm_configs},
-    cache_results=AUTOTUNE_CACHE_RESULTS,
+@_kernel_op(
+    name="coda::_gemm_lse_epi",
+    mutates_args=("logits", "lses"),
 )
-def _gemm_lse_tuned(
+@epilogue_autotune()
+def _gemm_lse_epi(
     A: torch.Tensor,
     B: torch.Tensor,
-    D: torch.Tensor,
+    logits: torch.Tensor,
     lses: torch.Tensor,
-    vocab_size: int,
     config: GemmConfig,
 ) -> None:
-    M, _, _ = A.shape
-    n_tiles = misc_utils.ceil_div(vocab_size, config.tile_n)
-    lse_partial = torch.empty(M, n_tiles, dtype=torch.float32, device=A.device)
-    epi_args = preprocess_epi_args(
-        GemmCls=GemmLSE,
-        epi_args={
-            "mLSEVec": lse_partial,
-            "vocab_size": vocab_size,
-        },
-    )
-    _gemm_epilogue_tuned(
-        GemmCls=GemmLSE,
+    M, N = logits.shape
+    n_tiles = misc_utils.ceil_div(N, config.tile_n)
+    partials = torch.empty(M, n_tiles, dtype=torch.float32, device=A.device)
+    epilogue_launch(
+        epi_fn=lse_epi,
         A=A,
         B=B,
-        D=D,
-        C=None,
-        epi_args=epi_args,
-        epi_keys=make_epi_keys(GemmLSE, epi_args),
-        pin_tile_M=None,
-        pin_tile_N=None,
-        fp8_fast_accum=False,
-        batch_idx_permute=None,
-        add_to_output=False,
+        D=logits,
+        epi_args={"lse": partials},
         config=config,
     )
     _lse_reduce_compiled(
         lses=lses,
-        lse_partial=lse_partial,
-    )
-
-
-@_kernel_op("coda::_gemm_lse", mutates_args=("D", "lses"))
-def _gemm_lse(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    D: torch.Tensor,
-    lses: torch.Tensor,
-    vocab_size: int,
-) -> None:
-    _gemm_lse_tuned(
-        A=A,
-        B=B,
-        D=D,
-        lses=lses,
-        vocab_size=vocab_size,
+        lse_partial=partials,
     )
 
 
@@ -277,85 +246,45 @@ def gemm_lse(
         logits = torch.empty(M, vocab_size, dtype=A.dtype, device=A.device)
     if lses is None:
         lses = torch.empty(M, dtype=torch.float32, device=A.device)
-    A, B, D, _ = _preprocess_gemm_operands(
+    _gemm_lse_epi(
         A=A,
-        B=B,
-        D=logits,
-        C=None,
-    )
-    _gemm_lse(
-        A=A,
-        B=B,
-        D=D,
+        B=B.mT,
+        logits=logits,
         lses=lses,
-        vocab_size=vocab_size,
     )
     return logits, lses
 
 
-@autotune(
-    configs=[AutotuneConfig(config=c) for c in GEMM_CONFIGS],
-    key=["vocab_size"],
-    prune_configs_by={"early_config_prune": prune_gemm_configs},
-    cache_results=AUTOTUNE_CACHE_RESULTS,
+@_kernel_op(
+    name="coda::_gemm_rmsnorm_lse_epi",
+    mutates_args=("logits", "lses"),
 )
-def _gemm_rmsnorm_lse_tuned(
+@epilogue_autotune()
+def _gemm_rmsnorm_lse_epi(
     A: torch.Tensor,
     B: torch.Tensor,
-    D: torch.Tensor,
-    R: torch.Tensor,
+    rstd: torch.Tensor,
+    logits: torch.Tensor,
     lses: torch.Tensor,
-    vocab_size: int,
     config: GemmConfig,
 ) -> None:
-    M, _, _ = A.shape
-    n_tiles = misc_utils.ceil_div(vocab_size, config.tile_n)
-    lse_partial = torch.empty(M, n_tiles, dtype=torch.float32, device=A.device)
-    epi_args = preprocess_epi_args(
-        GemmCls=GemmScaleLSE,
-        epi_args={
-            "mColVecBroadcast": R,
-            "mLSEVec": lse_partial,
-            "vocab_size": vocab_size,
-        },
-    )
-    _gemm_epilogue_tuned(
-        GemmCls=GemmScaleLSE,
+    M, N = logits.shape
+    n_tiles = misc_utils.ceil_div(N, config.tile_n)
+    partials = torch.empty(M, n_tiles, dtype=torch.float32, device=A.device)
+    epilogue_launch(
+        epi_fn=rstd_lse_epi,
         A=A,
         B=B,
-        D=D,
-        C=None,
-        epi_args=epi_args,
-        epi_keys=make_epi_keys(GemmScaleLSE, epi_args),
-        pin_tile_M=None,
-        pin_tile_N=None,
-        fp8_fast_accum=False,
-        batch_idx_permute=None,
-        add_to_output=False,
+        D=logits,
+        epi_args={
+            "rstd": rstd,
+            "lse": partials,
+        },
         config=config,
     )
     _lse_reduce_compiled(
         lses=lses,
-        lse_partial=lse_partial,
-    )
-
-
-@_kernel_op("coda::_gemm_rmsnorm_lse", mutates_args=("D", "lses"))
-def _gemm_rmsnorm_lse(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    D: torch.Tensor,
-    R: torch.Tensor,
-    lses: torch.Tensor,
-    vocab_size: int,
-) -> None:
-    _gemm_rmsnorm_lse_tuned(
-        A=A,
-        B=B,
-        D=D,
-        R=R,
-        lses=lses,
-        vocab_size=vocab_size,
+        lse_partial=partials,
     )
 
 
@@ -374,19 +303,12 @@ def gemm_rmsnorm_lse(
         logits = torch.empty(M, vocab_size, dtype=A.dtype, device=A.device)
     if lses is None:
         lses = torch.empty(M, dtype=torch.float32, device=A.device)
-    A, B, D, _ = _preprocess_gemm_operands(
+    _gemm_rmsnorm_lse_epi(
         A=A,
-        B=B,
-        D=logits,
-        C=None,
-    )
-    _gemm_rmsnorm_lse(
-        A=A,
-        B=B,
-        D=D,
-        R=rstd,
+        B=B.mT,
+        rstd=rstd,
+        logits=logits,
         lses=lses,
-        vocab_size=vocab_size,
     )
     return logits, lses
 
