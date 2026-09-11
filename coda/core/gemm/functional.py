@@ -364,14 +364,14 @@ def gemm_lse_select_logits(
     ignore_index: int,
     return_lse: bool,
     losses: torch.Tensor | None = None,
-    target_logit: torch.Tensor | None = None,
+    target_logits: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     assert target.dtype == torch.int32
     M, _ = A.shape
     if losses is None:
         losses = torch.empty(M, dtype=torch.float32, device=A.device)
-    if target_logit is None:
-        target_logit = torch.empty(M, dtype=torch.float32, device=A.device)
+    if target_logits is None:
+        target_logits = torch.empty(M, dtype=torch.float32, device=A.device)
     if return_lse:
         lses = torch.empty(M, dtype=torch.float32, device=A.device)
     else:
@@ -382,10 +382,10 @@ def gemm_lse_select_logits(
         lses=lses,
         target=target,
         losses=losses,
-        target_logit=target_logit,
+        target_logit=target_logits,
         ignore_index=ignore_index,
     )
-    return losses, lses, target_logit
+    return losses, lses, target_logits
 
 
 @_kernel_op(
