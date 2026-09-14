@@ -748,27 +748,6 @@ def _gemm_swiglu_bwd_zdz_tuned(
     )
 
 
-@_kernel_op("coda::_gemm_swiglu_bwd_zdz", mutates_args=("D", "ZdZ", "dZ_packed"))
-def _gemm_swiglu_bwd_zdz(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    D: torch.Tensor,
-    ZdZ: torch.Tensor,
-    Z_packed: torch.Tensor,
-    dZ_packed: torch.Tensor,
-    scale: float | None,
-) -> None:
-    _gemm_swiglu_bwd_zdz_tuned(
-        A=A,
-        B=B,
-        D=D,
-        ZdZ=ZdZ,
-        Z_packed=Z_packed,
-        dZ_packed=dZ_packed,
-        scale=scale,
-    )
-
-
 def gemm_swiglu_bwd_zdz(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -788,38 +767,35 @@ def gemm_swiglu_bwd_zdz(
         ZdZ = torch.empty(M, dtype=torch.float32, device=A.device)
     if out is None:
         out = torch.empty(M, N, dtype=A.dtype, device=A.device)
-
-    # Transpose B for GEMM (we want A @ B.T)
-    B_T = B.mT
-
-    # Z and dZ travel as (M, N) 32-bit containers: two model-dtype halves per element
-    Z_packed = Z.view(dtype=torch.int32)
-    dZ_packed = dZ.view(dtype=torch.int32)
-
-    A, B_T, D, _ = _preprocess_gemm_operands(
-        A=A,
-        B=B_T,
-        D=out,
-        C=None,
-    )
-    _gemm_swiglu_bwd_zdz(
-        A=A,
-        B=B_T,
-        D=D,
-        ZdZ=ZdZ,
-        Z_packed=Z_packed,
-        dZ_packed=dZ_packed,
-        scale=scale,
-    )
+    # B arrives (n, k), so no `.mT`
+    if scale is None:
+        _gemm_swiglu_bwd_zdz_epi(
+            A=A,
+            B=B,
+            D=out,
+            ZdZ=ZdZ,
+            Z=Z,
+            dZ=dZ,
+        )
+    else:
+        _gemm_swiglu_bwd_zdz_epi_scaled(
+            A=A,
+            B=B,
+            D=out,
+            ZdZ=ZdZ,
+            Z=Z,
+            dZ=dZ,
+            scale=scale,
+        )
     return dZ, ZdZ, out
 
 
-@autotune(
-    configs=[AutotuneConfig(config=c) for c in GEMM_CONFIGS],
-    prune_configs_by={"early_config_prune": prune_gemm_configs},
-    cache_results=AUTOTUNE_CACHE_RESULTS,
+@_kernel_op(
+    name="coda::_gemm_rope_epi",
+    mutates_args=("D",),
 )
-def _gemm_rope_tuned(
+@epilogue_autotune()
+def _gemm_rope_epi(
     A: torch.Tensor,
     B: torch.Tensor,
     D: torch.Tensor,
@@ -827,41 +803,16 @@ def _gemm_rope_tuned(
     freq: torch.Tensor,
     config: GemmConfig,
 ) -> None:
-    epi_args = {
-        "mPos": pos,
-        "mFreq": freq,
-    }
-    _gemm_epilogue_tuned(
-        GemmCls=GemmRoPE,
+    epilogue_launch(
+        epi_fn=rope_posfreq_epi,
         A=A,
         B=B,
         D=D,
-        C=None,
-        epi_args=epi_args,
-        epi_keys=make_epi_keys(GemmRoPE, epi_args),
-        pin_tile_M=None,
-        pin_tile_N=None,
-        fp8_fast_accum=False,
-        batch_idx_permute=None,
-        add_to_output=False,
+        epi_args={
+            "pos": pos,
+            "freq": freq,
+        },
         config=config,
-    )
-
-
-@_kernel_op("coda::_gemm_rope", mutates_args=("D",))
-def _gemm_rope(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    D: torch.Tensor,
-    pos: torch.Tensor,
-    freq: torch.Tensor,
-) -> None:
-    _gemm_rope_tuned(
-        A=A,
-        B=B,
-        D=D,
-        pos=pos,
-        freq=freq,
     )
 
 
@@ -881,81 +832,41 @@ def gemm_rope(
     assert frequencies.dtype == torch.float32
     if out is None:
         out = torch.empty(M, N, dtype=A.dtype, device=A.device)
-    A, B, D, _ = _preprocess_gemm_operands(
+    _gemm_rope_epi(
         A=A,
-        B=B,
+        B=B.mT,
         D=out,
-        C=None,
-    )
-    epi_args = preprocess_epi_args(
-        GemmCls=GemmRoPE,
-        epi_args={
-            "mPos": positions,
-            "mFreq": frequencies,
-        },
-    )
-    _gemm_rope(
-        A=A,
-        B=B,
-        D=D,
-        pos=epi_args["mPos"],
-        freq=epi_args["mFreq"],
+        pos=positions,
+        freq=frequencies,
     )
     return out
 
 
-@autotune(
-    configs=[AutotuneConfig(config=c) for c in GEMM_CONFIGS],
-    prune_configs_by={"early_config_prune": prune_gemm_configs},
-    cache_results=AUTOTUNE_CACHE_RESULTS,
+@_kernel_op(
+    name="coda::_gemm_rmsnorm_rope_epi",
+    mutates_args=("D",),
 )
-def _gemm_rmsnorm_rope_tuned(
+@epilogue_autotune()
+def _gemm_rmsnorm_rope_epi(
     A: torch.Tensor,
     B: torch.Tensor,
     D: torch.Tensor,
-    R: torch.Tensor,
+    rstd: torch.Tensor,
     pos: torch.Tensor,
     freq: torch.Tensor,
     config: GemmConfig,
 ) -> None:
-    epi_args = {
-        "mColVecBroadcast": R,
-        "mPos": pos,
-        "mFreq": freq,
-    }
-    _gemm_epilogue_tuned(
-        GemmCls=GemmScaleRoPE,
+    epilogue_launch(
+        epi_fn=rstd_rope_posfreq_epi,
         A=A,
         B=B,
         D=D,
-        C=None,
-        epi_args=epi_args,
-        epi_keys=make_epi_keys(GemmScaleRoPE, epi_args),
-        pin_tile_M=None,
-        pin_tile_N=None,
-        fp8_fast_accum=False,
-        batch_idx_permute=None,
-        add_to_output=False,
+        epi_args={
+            "rstd": rstd,
+            "pos": pos,
+            "freq": freq,
+        },
         config=config,
-    )
-
-
-@_kernel_op("coda::_gemm_rmsnorm_rope", mutates_args=("D",))
-def _gemm_rmsnorm_rope(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    D: torch.Tensor,
-    R: torch.Tensor,
-    pos: torch.Tensor,
-    freq: torch.Tensor,
-) -> None:
-    _gemm_rmsnorm_rope_tuned(
-        A=A,
-        B=B,
-        D=D,
-        R=R,
-        pos=pos,
-        freq=freq,
     )
 
 
@@ -978,26 +889,12 @@ def gemm_rmsnorm_rope(
     assert frequencies.dtype == torch.float32
     if out is None:
         out = torch.empty(M, N, dtype=A.dtype, device=A.device)
-    A, B, D, _ = _preprocess_gemm_operands(
+    _gemm_rmsnorm_rope_epi(
         A=A,
-        B=B,
+        B=B.mT,
         D=out,
-        C=None,
-    )
-    epi_args = preprocess_epi_args(
-        GemmCls=GemmScaleRoPE,
-        epi_args={
-            "mColVecBroadcast": rstd,
-            "mPos": positions,
-            "mFreq": frequencies,
-        },
-    )
-    _gemm_rmsnorm_rope(
-        A=A,
-        B=B,
-        D=D,
-        R=epi_args["mColVecBroadcast"],
-        pos=epi_args["mPos"],
-        freq=epi_args["mFreq"],
+        rstd=rstd,
+        pos=positions,
+        freq=frequencies,
     )
     return out
