@@ -432,76 +432,42 @@ def gemm_rmsnorm(
     return out
 
 
-@autotune(
-    configs=[AutotuneConfig(config=c) for c in GEMM_CONFIGS],
-    prune_configs_by={"early_config_prune": prune_gemm_configs},
-    cache_results=AUTOTUNE_CACHE_RESULTS,
+@_kernel_op(
+    name="coda::_gemm_residual_partial_rmsnorm_epi",
+    mutates_args=("D", "rstd", "O"),
 )
-def _gemm_residual_partial_rmsnorm_tuned(
+@epilogue_autotune()
+def _gemm_residual_partial_rmsnorm_epi(
     A: torch.Tensor,
     B: torch.Tensor,
     D: torch.Tensor,
     C: torch.Tensor,
-    W: torch.Tensor,
-    R: torch.Tensor,
+    weight: torch.Tensor,
+    rstd: torch.Tensor,
     O: torch.Tensor,
     eps: float,
     config: GemmConfig,
 ) -> None:
-    M, N, _ = D.shape
+    M, N = D.shape
     n_tiles = misc_utils.ceil_div(N, config.tile_n)
     partials = torch.empty(M, n_tiles, dtype=torch.float32, device=A.device)
-    epi_args = preprocess_epi_args(
-        GemmCls=GemmResidualSqSumScaledAux,
-        epi_args={
-            "mSqSumVec": partials,
-            "mRowVecScale": W,
-            "mAuxOut": O,
-            "mResidual": C,
-        },
-    )
-    _gemm_epilogue_tuned(
-        GemmCls=GemmResidualSqSumScaledAux,
-        A=A,
-        B=B,
-        D=D,
-        C=None,
-        epi_args=epi_args,
-        epi_keys=make_epi_keys(GemmResidualSqSumScaledAux, epi_args),
-        pin_tile_M=None,
-        pin_tile_N=None,
-        fp8_fast_accum=False,
-        batch_idx_permute=None,
-        add_to_output=False,
-        config=config,
-    )
-    _rms_final_reduce_out(
-        x=partials,
-        rstd=R,
-        scale=1.0 / N,
-        eps=eps,
-    )
-
-
-@_kernel_op("coda::_gemm_residual_partial_rmsnorm", mutates_args=("D", "R", "O"))
-def _gemm_residual_partial_rmsnorm(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    D: torch.Tensor,
-    C: torch.Tensor,
-    W: torch.Tensor,
-    R: torch.Tensor,
-    O: torch.Tensor,
-    eps: float,
-) -> None:
-    _gemm_residual_partial_rmsnorm_tuned(
+    epilogue_launch(
+        epi_fn=epilogues.residual_sqsum_scaled_epi,
         A=A,
         B=B,
         D=D,
         C=C,
-        W=W,
-        R=R,
-        O=O,
+        epi_args={
+            "weight": weight,
+            "scaled_out": O,
+            "sqsum": partials,
+        },
+        config=config,
+    )
+    _rms_final_reduce_out(
+        x=partials,
+        rstd=rstd,
+        scale=1.0 / N,
         eps=eps,
     )
 
@@ -526,19 +492,13 @@ def gemm_residual_partial_rmsnorm(
         post = torch.empty(M, N, dtype=A.dtype, device=A.device)
     if rstd is None:
         rstd = torch.empty(M, dtype=torch.float32, device=A.device)
-    A, B, D, _ = _preprocess_gemm_operands(
+    _gemm_residual_partial_rmsnorm_epi(
         A=A,
-        B=B,
+        B=B.mT,
         D=pre,
-        C=None,
-    )
-    _gemm_residual_partial_rmsnorm(
-        A=A,
-        B=B,
-        D=D,
         C=C,
-        W=W,
-        R=rstd,
+        weight=rearrange(W, "n -> 1 n"),
+        rstd=rstd,
         O=post,
         eps=eps,
     )
@@ -561,7 +521,7 @@ def _gemm_residual_partial_rmsnorm_bwd_epi_store(
     B: torch.Tensor,
     D: torch.Tensor,
     C: torch.Tensor,
-    W: torch.Tensor,
+    weight: torch.Tensor,
     rstd: torch.Tensor,
     ZdZ: torch.Tensor,
     dW: torch.Tensor,
@@ -576,7 +536,7 @@ def _gemm_residual_partial_rmsnorm_bwd_epi_store(
     epi_args = {
         "rstd": rstd,
         "zdz": ZdZ,
-        "weight": W,
+        "weight": weight,
         "pre": C,
         "normed": C_out,
         "dweight": partials,
@@ -614,7 +574,7 @@ def _gemm_residual_partial_rmsnorm_bwd_epi_accum(
     B: torch.Tensor,
     D: torch.Tensor,
     C: torch.Tensor,
-    W: torch.Tensor,
+    weight: torch.Tensor,
     rstd: torch.Tensor,
     ZdZ: torch.Tensor,
     dW: torch.Tensor,
@@ -629,7 +589,7 @@ def _gemm_residual_partial_rmsnorm_bwd_epi_accum(
     epi_args = {
         "rstd": rstd,
         "zdz": ZdZ,
-        "weight": W,
+        "weight": weight,
         "pre": C,
         "normed": C_out,
         "dweight": partials,
@@ -694,7 +654,7 @@ def gemm_residual_partial_rmsnorm_bwd(
             B=B,
             D=dX,
             C=pre,
-            W=rearrange(W, "n -> 1 n"),
+            weight=rearrange(W, "n -> 1 n"),
             rstd=rstd,
             ZdZ=ZdZ,
             dW=dW,
@@ -707,7 +667,7 @@ def gemm_residual_partial_rmsnorm_bwd(
             B=B,
             D=dX,
             C=pre,
-            W=rearrange(W, "n -> 1 n"),
+            weight=rearrange(W, "n -> 1 n"),
             rstd=rstd,
             ZdZ=ZdZ,
             dW=dW,
