@@ -1,4 +1,5 @@
 import torch
+from einops import rearrange
 from quack.autotuner import autotune, AutotuneConfig
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm_config import GemmConfig
@@ -550,12 +551,12 @@ def _sum_reduce_compiled(partials: torch.Tensor, out: torch.Tensor, dim: int) ->
     torch.sum(partials, dim=dim, out=out)
 
 
-@autotune(
-    configs=[AutotuneConfig(config=c) for c in GEMM_CONFIGS],
-    prune_configs_by={"early_config_prune": prune_gemm_configs},
-    cache_results=AUTOTUNE_CACHE_RESULTS,
+@_kernel_op(
+    name="coda::_gemm_residual_partial_rmsnorm_bwd_epi_store",
+    mutates_args=("D", "dW", "C_out"),
 )
-def _gemm_residual_partial_rmsnorm_bwd_tuned(
+@epilogue_autotune()
+def _gemm_residual_partial_rmsnorm_bwd_epi_store(
     A: torch.Tensor,
     B: torch.Tensor,
     D: torch.Tensor,
@@ -566,56 +567,49 @@ def _gemm_residual_partial_rmsnorm_bwd_tuned(
     ZdZ: torch.Tensor,
     C_out: torch.Tensor,
     alpha: torch.Tensor | None,
-    accumulate: bool,
     config: GemmConfig,
 ) -> None:
-    M, N, _ = D.shape
+    M, N = D.shape
     m_tiles = misc_utils.ceil_div(M, config.tile_m)
-    # Tile-major (N, m_tiles) so the finishing reduction runs down contiguous memory.
-    # The epilogue gets the .mT view and is unchanged.
-    partials_T = torch.empty(N, m_tiles, dtype=torch.float32, device=A.device)
+    # RowVecReduce requires N-contiguous partials
+    partials = torch.empty(m_tiles, N, dtype=torch.float32, device=A.device)
+    epi_args = {
+        "rstd": R,
+        "zdz": ZdZ,
+        "weight": W,
+        "pre": C,
+        "normed": C_out,
+        "dweight": partials,
+    }
+    # an absent `alpha` must be absent from the epilogue signature for its term to compile out
     if alpha is not None:
-        extra_epi_args = {"alpha": alpha}
+        epi_fn = epilogues.alpha_residual_rmsnorm_bwd_epi
+        epi_args["alpha"] = alpha
     else:
-        # for `ScalarScale` we need to omit `alpha` when it's None
-        # due to artifacts of our epi-lowering
-        extra_epi_args = {}
-    epi_args = preprocess_epi_args(
-        GemmCls=GemmScalarScaleResidualRMSNormBwd,
-        epi_args={
-            "mColVecR": R,
-            "mColVecZdZ": ZdZ,
-            "mRowVecW": W,
-            "mMatrixC": C,
-            "mAuxOut": C_out,
-            "mDWVec": partials_T.mT,
-            **extra_epi_args,
-        },
-    )
-    _gemm_epilogue_tuned(
-        GemmCls=GemmScalarScaleResidualRMSNormBwd,
+        epi_fn = epilogues.residual_rmsnorm_bwd_epi
+    epilogue_launch(
+        epi_fn=epi_fn,
         A=A,
         B=B,
         D=D,
         C=None,
         epi_args=epi_args,
-        epi_keys=make_epi_keys(GemmScalarScaleResidualRMSNormBwd, epi_args),
-        pin_tile_M=None,
-        pin_tile_N=None,
-        fp8_fast_accum=False,
-        batch_idx_permute=None,
-        add_to_output=accumulate,
         config=config,
+        add_to_output=False,
     )
     _sum_reduce_compiled(
-        partials=partials_T,
+        partials=partials,
         out=dW,
-        dim=-1,
+        dim=0,
     )
 
 
-@_kernel_op("coda::_gemm_residual_partial_rmsnorm_bwd", mutates_args=("D", "dW", "C_out"))
-def _gemm_residual_partial_rmsnorm_bwd(
+@_kernel_op(
+    name="coda::_gemm_residual_partial_rmsnorm_bwd_epi_accum",
+    mutates_args=("D", "dW", "C_out"),
+)
+@epilogue_autotune()
+def _gemm_residual_partial_rmsnorm_bwd_epi_accum(
     A: torch.Tensor,
     B: torch.Tensor,
     D: torch.Tensor,
@@ -626,20 +620,40 @@ def _gemm_residual_partial_rmsnorm_bwd(
     ZdZ: torch.Tensor,
     C_out: torch.Tensor,
     alpha: torch.Tensor | None,
-    accumulate: bool,
+    config: GemmConfig,
 ) -> None:
-    _gemm_residual_partial_rmsnorm_bwd_tuned(
+    M, N = D.shape
+    m_tiles = misc_utils.ceil_div(M, config.tile_m)
+    # RowVecReduce requires N-contiguous partials
+    partials = torch.empty(m_tiles, N, dtype=torch.float32, device=A.device)
+    epi_args = {
+        "rstd": R,
+        "zdz": ZdZ,
+        "weight": W,
+        "pre": C,
+        "normed": C_out,
+        "dweight": partials,
+    }
+    # an absent `alpha` must be absent from the epilogue signature for its term to compile out
+    if alpha is not None:
+        epi_fn = epilogues.alpha_residual_rmsnorm_bwd_epi
+        epi_args["alpha"] = alpha
+    else:
+        epi_fn = epilogues.residual_rmsnorm_bwd_epi
+    epilogue_launch(
+        epi_fn=epi_fn,
         A=A,
         B=B,
         D=D,
-        C=C,
-        W=W,
-        R=R,
-        dW=dW,
-        ZdZ=ZdZ,
-        C_out=C_out,
-        alpha=alpha,
-        accumulate=accumulate,
+        C=None,
+        epi_args=epi_args,
+        config=config,
+        add_to_output=True,
+    )
+    _sum_reduce_compiled(
+        partials=partials,
+        out=dW,
+        dim=0,
     )
 
 
@@ -673,29 +687,33 @@ def gemm_residual_partial_rmsnorm_bwd(
         dW = torch.empty(N, dtype=torch.float32, device=A.device)
     if post is None:
         post = torch.empty(M, N, dtype=A.dtype, device=A.device)
-
-    # Transpose B for GEMM (we want A @ B.T)
-    B_T = B.mT
-
-    A, B_T, D, _ = _preprocess_gemm_operands(
-        A=A,
-        B=B_T,
-        D=dX,
-        C=None,
-    )
-    _gemm_residual_partial_rmsnorm_bwd(
-        A=A,
-        B=B_T,
-        D=D,
-        C=pre,
-        W=W,
-        R=rstd,
-        dW=dW,
-        ZdZ=ZdZ,
-        C_out=post,
-        alpha=alpha,
-        accumulate=accumulate,
-    )
+    # B arrives (n, k), so no `.mT`
+    if accumulate:
+        _gemm_residual_partial_rmsnorm_bwd_epi_accum(
+            A=A,
+            B=B,
+            D=dX,
+            C=pre,
+            W=rearrange(W, "n -> 1 n"),
+            R=rstd,
+            dW=dW,
+            ZdZ=ZdZ,
+            C_out=post,
+            alpha=alpha,
+        )
+    else:
+        _gemm_residual_partial_rmsnorm_bwd_epi_store(
+            A=A,
+            B=B,
+            D=dX,
+            C=pre,
+            W=rearrange(W, "n -> 1 n"),
+            R=rstd,
+            dW=dW,
+            ZdZ=ZdZ,
+            C_out=post,
+            alpha=alpha,
+        )
     return dX, dW, post
 
 
