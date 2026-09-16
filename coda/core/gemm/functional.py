@@ -562,9 +562,9 @@ def _gemm_residual_partial_rmsnorm_bwd_epi_store(
     D: torch.Tensor,
     C: torch.Tensor,
     W: torch.Tensor,
-    R: torch.Tensor,
-    dW: torch.Tensor,
+    rstd: torch.Tensor,
     ZdZ: torch.Tensor,
+    dW: torch.Tensor,
     C_out: torch.Tensor,
     alpha: torch.Tensor | None,
     config: GemmConfig,
@@ -574,7 +574,7 @@ def _gemm_residual_partial_rmsnorm_bwd_epi_store(
     # RowVecReduce requires N-contiguous partials
     partials = torch.empty(m_tiles, N, dtype=torch.float32, device=A.device)
     epi_args = {
-        "rstd": R,
+        "rstd": rstd,
         "zdz": ZdZ,
         "weight": W,
         "pre": C,
@@ -615,9 +615,9 @@ def _gemm_residual_partial_rmsnorm_bwd_epi_accum(
     D: torch.Tensor,
     C: torch.Tensor,
     W: torch.Tensor,
-    R: torch.Tensor,
-    dW: torch.Tensor,
+    rstd: torch.Tensor,
     ZdZ: torch.Tensor,
+    dW: torch.Tensor,
     C_out: torch.Tensor,
     alpha: torch.Tensor | None,
     config: GemmConfig,
@@ -627,7 +627,7 @@ def _gemm_residual_partial_rmsnorm_bwd_epi_accum(
     # RowVecReduce requires N-contiguous partials
     partials = torch.empty(m_tiles, N, dtype=torch.float32, device=A.device)
     epi_args = {
-        "rstd": R,
+        "rstd": rstd,
         "zdz": ZdZ,
         "weight": W,
         "pre": C,
@@ -695,9 +695,9 @@ def gemm_residual_partial_rmsnorm_bwd(
             D=dX,
             C=pre,
             W=rearrange(W, "n -> 1 n"),
-            R=rstd,
-            dW=dW,
+            rstd=rstd,
             ZdZ=ZdZ,
+            dW=dW,
             C_out=post,
             alpha=alpha,
         )
@@ -708,9 +708,9 @@ def gemm_residual_partial_rmsnorm_bwd(
             D=dX,
             C=pre,
             W=rearrange(W, "n -> 1 n"),
-            R=rstd,
-            dW=dW,
+            rstd=rstd,
             ZdZ=ZdZ,
+            dW=dW,
             C_out=post,
             alpha=alpha,
         )
