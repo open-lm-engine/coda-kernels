@@ -699,46 +699,77 @@ def gemm_residual_partial_rmsnorm_bwd(
     return dX, dW, post
 
 
-@autotune(
-    configs=[AutotuneConfig(config=c) for c in GEMM_CONFIGS],
-    prune_configs_by={"early_config_prune": prune_gemm_configs},
-    cache_results=AUTOTUNE_CACHE_RESULTS,
+@_kernel_op(
+    name="coda::_gemm_swiglu_bwd_zdz_epi",
+    mutates_args=("D", "ZdZ", "dZ"),
 )
-def _gemm_swiglu_bwd_zdz_tuned(
+@epilogue_autotune()
+def _gemm_swiglu_bwd_zdz_epi(
     A: torch.Tensor,
     B: torch.Tensor,
     D: torch.Tensor,
     ZdZ: torch.Tensor,
-    Z_packed: torch.Tensor,
-    dZ_packed: torch.Tensor,
-    scale: float | None,
+    Z: torch.Tensor,
+    dZ: torch.Tensor,
     config: GemmConfig,
 ) -> None:
-    M, N, _ = D.shape
+    M, _ = A.shape
+    # B: (N, K), D: (M, N), Z and dZ: (M, 2N)
+    N, _ = B.shape
     n_tiles = misc_utils.ceil_div(N, config.tile_n)
     partials = torch.empty(M, n_tiles, dtype=torch.float32, device=A.device)
-    epi_args = preprocess_epi_args(
-        GemmCls=GemmSwiGLUBwdZdZ,
-        epi_args={
-            "mZPacked": Z_packed,
-            "mAuxOut": dZ_packed,
-            "mZdZVec": partials,
-            "scale": scale,
-        },
-    )
-    _gemm_epilogue_tuned(
-        GemmCls=GemmSwiGLUBwdZdZ,
+    # packed_cd_b16x2: dZ rides on D and the preact on C
+    epilogue_launch(
+        epi_fn=epilogues.dswiglu_preact_zdz_epi,
         A=A,
         B=B,
-        D=D,
-        C=None,
-        epi_args=epi_args,
-        epi_keys=make_epi_keys(GemmSwiGLUBwdZdZ, epi_args),
-        pin_tile_M=None,
-        pin_tile_N=None,
-        fp8_fast_accum=False,
-        batch_idx_permute=None,
-        add_to_output=False,
+        D=dZ,
+        C=Z,
+        epi_args={
+            "postact": D,
+            "zdz": partials,
+        },
+        config=config,
+    )
+    _sum_reduce_compiled(
+        partials=partials,
+        out=ZdZ,
+        dim=-1,
+    )
+
+
+@_kernel_op(
+    name="coda::_gemm_swiglu_bwd_zdz_epi_scaled",
+    mutates_args=("D", "ZdZ", "dZ"),
+)
+@epilogue_autotune()
+def _gemm_swiglu_bwd_zdz_epi_scaled(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    D: torch.Tensor,
+    ZdZ: torch.Tensor,
+    Z: torch.Tensor,
+    dZ: torch.Tensor,
+    scale: float,
+    config: GemmConfig,
+) -> None:
+    M, _ = A.shape
+    # B: (N, K), D: (M, N), Z and dZ: (M, 2N)
+    N, _ = B.shape
+    n_tiles = misc_utils.ceil_div(N, config.tile_n)
+    partials = torch.empty(M, n_tiles, dtype=torch.float32, device=A.device)
+    # packed_cd_b16x2: dZ rides on D and the preact on C
+    epilogue_launch(
+        epi_fn=epilogues.dswiglu_preact_zdz_scaled_epi,
+        A=A,
+        B=B,
+        D=dZ,
+        C=Z,
+        epi_args={
+            "postact": D,
+            "zdz": partials,
+            "scale": scale,
+        },
         config=config,
     )
     _sum_reduce_compiled(
