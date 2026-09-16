@@ -140,18 +140,18 @@ def _dswiglu_backward(X: torch.Tensor, Y: torch.Tensor, Z: torch.Tensor) -> None
 
 
 def dswiglu_backward(
-    pre_act: torch.Tensor,
+    preact: torch.Tensor,
     grad_out: torch.Tensor,
     grad_pre: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    assert pre_act.dtype in (torch.bfloat16, torch.float16)
-    assert grad_out.dtype == pre_act.dtype
-    assert pre_act.is_contiguous()
+    assert preact.dtype in (torch.bfloat16, torch.float16)
+    assert grad_out.dtype == preact.dtype
+    assert preact.is_contiguous()
     assert grad_out.is_contiguous()
     if grad_pre is None:
-        grad_pre = torch.empty_like(pre_act)
+        grad_pre = torch.empty_like(preact)
     _dswiglu_backward(
-        X=pre_act.view(dtype=torch.int32),
+        X=preact.view(dtype=torch.int32),
         Y=grad_out,
         Z=grad_pre.view(dtype=torch.int32),
     )
