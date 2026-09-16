@@ -91,7 +91,7 @@ def epilogue_launch(
     epi_fn: EpiMod,
     A: torch.Tensor,
     B: torch.Tensor,
-    D: torch.Tensor,
+    D: torch.Tensor | None,
     C: torch.Tensor | None = None,
     *,
     epi_args: dict,
