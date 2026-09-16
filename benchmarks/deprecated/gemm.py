@@ -18,9 +18,9 @@ from coda.kernels.tests import gpt as tests
 from coda.models import ops
 from coda.models import ops2
 
-from coda.kernels.benchmarks import quack_utils
-from coda.kernels.benchmarks import trainstation_utils
-from coda.kernels.benchmarks import bench_utils
+from benchmarks.deprecated import quack_utils
+from benchmarks.deprecated import trainstation_utils
+from benchmarks import bench_utils
 
 cache_utils.CACHE_ENABLED = False
 torch._dynamo.config.capture_scalar_outputs = True
