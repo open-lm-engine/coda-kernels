@@ -84,7 +84,7 @@ def block_pre_backward(
         # TODO: the function itself also transposes `B`
         # maybe we can directly pass in `BT` there
         B=w.mT,
-        W=wn,
+        weight=wn,
         pre=x,
         ZdZ=zdz,
         rstd=rstd,
@@ -183,7 +183,7 @@ def block_post_forward(
         A=y0,
         B=w0.mT,
         C=x0,
-        W=wn0,
+        weight=wn0,
         eps=eps,
     )
     z1, y1 = gemm_rmsnorm_swiglu(
@@ -195,7 +195,7 @@ def block_post_forward(
         A=y1,
         B=w2.mT,
         C=x1,
-        W=wn1,
+        weight=wn1,
         eps=eps,
     )
     logits, lses = gemm_rmsnorm_lse(
@@ -247,7 +247,7 @@ def block_post_backward(
     dx_out, dwn1, x_out2 = gemm_residual_partial_rmsnorm_bwd(
         A=dlogits,
         B=w3.mT,
-        W=wn1,
+        weight=wn1,
         pre=x2,
         ZdZ=zdz2 * (dloss / dim),
         rstd=rstd2,
@@ -269,7 +269,7 @@ def block_post_backward(
     dx_out, dwn0, x_out1 = gemm_residual_partial_rmsnorm_bwd(
         A=dz1,
         B=w1.mT,
-        W=wn0,
+        weight=wn0,
         pre=x1,
         ZdZ=zdz1,
         rstd=rstd1,
@@ -428,7 +428,7 @@ def block_forward(
         A=y0,
         B=w0.mT,
         C=x0,
-        W=wn0,
+        weight=wn0,
         eps=eps,
     )
     z1, y1 = gemm_rmsnorm_swiglu(
@@ -440,7 +440,7 @@ def block_forward(
         A=y1,
         B=w2.mT,
         C=x1,
-        W=wn1,
+        weight=wn1,
         eps=eps,
     )
     qkv = gemm_rmsnorm_rope(
@@ -488,7 +488,7 @@ def block_backward(
     dx_out, dwn1, x_out2 = gemm_residual_partial_rmsnorm_bwd(
         A=dz2,
         B=w3.mT,
-        W=wn1,
+        weight=wn1,
         pre=x2,
         # we don't need `/ dim` here because `rope_bwd_zdz` already does it
         ZdZ=zdz2,
@@ -506,7 +506,7 @@ def block_backward(
     dx_out, dwn0, x_out1 = gemm_residual_partial_rmsnorm_bwd(
         A=dz1,
         B=w1.mT,
-        W=wn0,
+        weight=wn0,
         pre=x1,
         ZdZ=zdz1,
         rstd=rstd1,
