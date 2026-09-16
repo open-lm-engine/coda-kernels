@@ -476,7 +476,7 @@ def gemm_residual_partial_rmsnorm(
     A: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
-    W: torch.Tensor,
+    weight: torch.Tensor,
     eps: float,
     pre: torch.Tensor | None = None,
     post: torch.Tensor | None = None,
@@ -485,7 +485,7 @@ def gemm_residual_partial_rmsnorm(
     M, _ = A.shape
     _, N = B.shape
     assert C.shape == (M, N)
-    assert W.shape == (N,)
+    assert weight.shape == (N,)
     if pre is None:
         pre = torch.empty(M, N, dtype=A.dtype, device=A.device)
     if post is None:
@@ -497,7 +497,7 @@ def gemm_residual_partial_rmsnorm(
         B=B.mT,
         D=pre,
         C=C,
-        weight=rearrange(W, "n -> 1 n"),
+        weight=rearrange(weight, "n -> 1 n"),
         rstd=rstd,
         O=post,
         eps=eps,
@@ -620,7 +620,7 @@ def _gemm_residual_partial_rmsnorm_bwd_epi_accum(
 def gemm_residual_partial_rmsnorm_bwd(
     A: torch.Tensor,
     B: torch.Tensor,
-    W: torch.Tensor,
+    weight: torch.Tensor,
     pre: torch.Tensor,
     ZdZ: torch.Tensor,
     rstd: torch.Tensor,
@@ -631,7 +631,7 @@ def gemm_residual_partial_rmsnorm_bwd(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     M, _ = A.shape
     N, _ = B.shape
-    assert W.shape == (N,)
+    assert weight.shape == (N,)
     assert pre.shape == (M, N)
     assert ZdZ.shape == (M,)
     assert ZdZ.dtype == torch.float32
@@ -654,7 +654,7 @@ def gemm_residual_partial_rmsnorm_bwd(
             B=B,
             D=dX,
             C=pre,
-            weight=rearrange(W, "n -> 1 n"),
+            weight=rearrange(weight, "n -> 1 n"),
             rstd=rstd,
             ZdZ=ZdZ,
             dW=dW,
@@ -667,7 +667,7 @@ def gemm_residual_partial_rmsnorm_bwd(
             B=B,
             D=dX,
             C=pre,
-            weight=rearrange(W, "n -> 1 n"),
+            weight=rearrange(weight, "n -> 1 n"),
             rstd=rstd,
             ZdZ=ZdZ,
             dW=dW,
