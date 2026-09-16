@@ -1,10 +1,11 @@
 import copy
 import torch
+import inspect
 import functools
 import dataclasses
 from typing import Callable
 
-from quack.autotuner import autotune, AutotuneConfig
+from quack.autotuner import autotune, Autotuner, AutotuneConfig
 from quack.epilogue.frontend import EpiMod
 from quack.gemm_config import GemmConfig, get_all_configs
 from quack.gemm_interface import prune_invalid_gemm_configs
@@ -130,18 +131,38 @@ def epilogue_launch(
     )
 
 
+def backend_autotune() -> Callable[[Callable], Autotuner]:
+
+    def decorator(fn: Callable) -> Autotuner:
+        return _tuned(
+            fn,
+            configs=[
+                AutotuneConfig(backend="quack"),
+                AutotuneConfig(backend="cublas"),
+            ],
+            cache_results=AUTOTUNE_CACHE_RESULTS,
+        )
+
+    return decorator
+
+
 def epilogue_autotune(
     gated: bool = False,
     configs: list[GemmConfig] | None = None,
-) -> Callable[[Callable], Callable]:
+) -> Callable[[Callable], Autotuner]:
     if configs is None:
         configs = GEMM_CONFIGS
     if gated:
         prune_fn = prune_gated_gemm_configs
     else:
         prune_fn = prune_gemm_configs
-    return autotune(
-        configs=[AutotuneConfig(config=c) for c in configs],
-        prune_configs_by={"early_config_prune": prune_fn},
-        cache_results=AUTOTUNE_CACHE_RESULTS,
-    )
+
+    def decorator(fn: Callable) -> Autotuner:
+        return _tuned(
+            fn,
+            configs=[AutotuneConfig(config=c) for c in configs],
+            prune_configs_by={"early_config_prune": prune_fn},
+            cache_results=AUTOTUNE_CACHE_RESULTS,
+        )
+
+    return decorator
