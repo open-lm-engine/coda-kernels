@@ -1,6 +1,5 @@
 import torch
 from einops import rearrange
-from quack.autotuner import autotune, AutotuneConfig
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm_config import GemmConfig
 from quack.gemm_interface import gemm as quack_gemm
@@ -11,9 +10,9 @@ from quack.epilogue.rotary import rope_posfreq_epi, rstd_rope_posfreq_epi
 
 from coda.core.gemm import epilogues
 from coda.core.ops import misc_utils
-from coda.core.ops.constants import AUTOTUNE_CACHE_RESULTS
 from coda.core.gemm.gemm_interface import (
     _kernel_op,
+    backend_autotune,
     epilogue_launch,
     epilogue_autotune,
 )
@@ -27,13 +26,7 @@ assert get_device_capacity()[0] == _DEVICE_CAPACITY
     name="coda::_gemm",
     mutates_args=("out",),
 )
-@autotune(
-    configs=[
-        AutotuneConfig(backend="quack"),
-        AutotuneConfig(backend="cublas"),
-    ],
-    cache_results=AUTOTUNE_CACHE_RESULTS,
-)
+@backend_autotune()
 def _gemm(
     A: torch.Tensor,
     B: torch.Tensor,
