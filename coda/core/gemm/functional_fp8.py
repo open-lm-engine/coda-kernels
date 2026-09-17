@@ -1,7 +1,6 @@
 import torch
 import dataclasses
 from quack.gemm_config import GemmConfig
-from quack.rms_final_reduce import _rms_final_reduce_out
 
 from coda.core.gemm import epilogues
 from coda.core.ops import misc_utils
@@ -17,53 +16,33 @@ from coda.core.gemm.gemm_interface import (
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
-@autotune(
-    configs=[AutotuneConfig(config=c) for c in GEMM_CONFIGS],
-    prune_configs_by={"early_config_prune": prune_gemm_configs},
-    cache_results=False,
+@_kernel_op(
+    name="coda::_gemm_swiglu_fp8_epi",
+    mutates_args=("D", "postact"),
 )
-def _gemm_swiglu_fp8_tuned(
+@epilogue_autotune(
+    gated=True,
+    configs=FP8_GEMM_CONFIGS,
+)
+def _gemm_swiglu_fp8_epi(
     A: torch.Tensor,
     B: torch.Tensor,
     D: torch.Tensor,
     alpha: torch.Tensor,
-    post_act: torch.Tensor,
+    postact: torch.Tensor,
     config: GemmConfig,
 ) -> None:
-    epi_args = {
-        "alpha": alpha,
-        "mAuxOut": post_act,
-    }
-    _gemm_epilogue_tuned(
-        GemmCls=GemmScalarScaleSwiGLU,
+    epilogue_launch(
+        epi_fn=epilogues.alpha_swiglu_preact_epi,
         A=A,
         B=B,
         D=D,
-        C=None,
-        epi_args=epi_args,
-        epi_keys=make_epi_keys(GemmScalarScaleSwiGLU, epi_args),
-        pin_tile_M=None,
-        pin_tile_N=None,
-        batch_idx_permute=None,
-        add_to_output=False,
+        epi_args={
+            "alpha": alpha,
+            "postact": postact,
+        },
         config=config,
-    )
-
-
-@_kernel_op("coda::_gemm_swiglu_fp8", mutates_args=("D", "post_act"))
-def _gemm_swiglu_fp8(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    D: torch.Tensor,
-    alpha: torch.Tensor,
-    post_act: torch.Tensor,
-) -> None:
-    _gemm_swiglu_fp8_tuned(
-        A=A,
-        B=B,
-        D=D,
-        alpha=alpha,
-        post_act=post_act,
+        fp8_fast_accum=True,
     )
 
 
@@ -71,8 +50,8 @@ def gemm_swiglu_fp8(
     A: torch.Tensor,
     B: torch.Tensor,
     scale: torch.Tensor,
-    pre_act: torch.Tensor | None = None,
-    post_act: torch.Tensor | None = None,
+    preact: torch.Tensor | None = None,
+    postact: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     M, _ = A.shape
@@ -84,39 +63,28 @@ def gemm_swiglu_fp8(
     assert scale.dtype == torch.float32
     if output_dtype is None:
         output_dtype = torch.bfloat16
-    if pre_act is None:
-        pre_act = torch.empty(M, N, dtype=output_dtype, device=A.device)
-    if post_act is None:
-        post_act = torch.empty(M, N // 2, dtype=output_dtype, device=A.device)
-    A, B, D, _ = _preprocess_gemm_operands(
+    if preact is None:
+        preact = torch.empty(M, N, dtype=output_dtype, device=A.device)
+    if postact is None:
+        postact = torch.empty(M, N // 2, dtype=output_dtype, device=A.device)
+    _gemm_swiglu_fp8_epi(
         A=A,
-        B=B,
-        D=pre_act,
-        C=None,
+        B=B.mT,
+        D=preact,
+        alpha=scale,
+        postact=postact,
     )
-    epi_args = preprocess_epi_args(
-        GemmCls=GemmScalarScaleSwiGLU,
-        epi_args={
-            "alpha": scale,
-            "mAuxOut": post_act,
-        },
-    )
-    _gemm_swiglu_fp8(
-        A=A,
-        B=B,
-        D=D,
-        alpha=epi_args["alpha"],
-        post_act=epi_args["mAuxOut"],
-    )
-    return pre_act, post_act
+    return preact, postact
 
 
-@autotune(
-    configs=[AutotuneConfig(config=c) for c in GEMM_CONFIGS],
-    prune_configs_by={"early_config_prune": prune_gemm_configs},
-    cache_results=False,
+@_kernel_op(
+    name="coda::_gemm_rope_fp8_epi",
+    mutates_args=("D",),
 )
-def _gemm_rope_fp8_tuned(
+@epilogue_autotune(
+    configs=FP8_GEMM_CONFIGS,
+)
+def _gemm_rope_fp8_epi(
     A: torch.Tensor,
     B: torch.Tensor,
     D: torch.Tensor,
@@ -125,43 +93,18 @@ def _gemm_rope_fp8_tuned(
     freq: torch.Tensor,
     config: GemmConfig,
 ) -> None:
-    epi_args = {
-        "alpha": alpha,
-        "mPos": pos,
-        "mFreq": freq,
-    }
-    _gemm_epilogue_tuned(
-        GemmCls=GemmScalarScaleRoPE,
+    epilogue_launch(
+        epi_fn=epilogues.alpha_rope_posfreq_epi,
         A=A,
         B=B,
         D=D,
-        C=None,
-        epi_args=epi_args,
-        epi_keys=make_epi_keys(GemmScalarScaleRoPE, epi_args),
-        pin_tile_M=None,
-        pin_tile_N=None,
-        batch_idx_permute=None,
-        add_to_output=False,
+        epi_args={
+            "alpha": alpha,
+            "pos": pos,
+            "freq": freq,
+        },
         config=config,
-    )
-
-
-@_kernel_op("coda::_gemm_rope_fp8", mutates_args=("D",))
-def _gemm_rope_fp8(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    D: torch.Tensor,
-    alpha: torch.Tensor,
-    pos: torch.Tensor,
-    freq: torch.Tensor,
-) -> None:
-    _gemm_rope_fp8_tuned(
-        A=A,
-        B=B,
-        D=D,
-        alpha=alpha,
-        pos=pos,
-        freq=freq,
+        fp8_fast_accum=True,
     )
 
 
@@ -187,26 +130,12 @@ def gemm_rope_fp8(
         output_dtype = torch.bfloat16
     if out is None:
         out = torch.empty(M, N, dtype=output_dtype, device=A.device)
-    A, B, D, _ = _preprocess_gemm_operands(
+    _gemm_rope_fp8_epi(
         A=A,
-        B=B,
+        B=B.mT,
         D=out,
-        C=None,
-    )
-    epi_args = preprocess_epi_args(
-        GemmCls=GemmScalarScaleRoPE,
-        epi_args={
-            "alpha": scale,
-            "mPos": positions,
-            "mFreq": frequencies,
-        },
-    )
-    _gemm_rope_fp8(
-        A=A,
-        B=B,
-        D=D,
-        alpha=epi_args["alpha"],
-        pos=epi_args["mPos"],
-        freq=epi_args["mFreq"],
+        alpha=scale,
+        pos=positions,
+        freq=frequencies,
     )
     return out
