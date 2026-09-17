@@ -1,19 +1,18 @@
 import torch
+import dataclasses
 from quack.gemm_config import GemmConfig
-from quack.autotuner import autotune, AutotuneConfig
+from quack.rms_final_reduce import _rms_final_reduce_out
 
-from coda.core.epilogue.utils import preprocess_epi_args, make_epi_keys
+from coda.core.gemm import epilogues
+from coda.core.ops import misc_utils
 from coda.core.gemm.gemm_interface import (
     _kernel_op,
-    _gemm_epilogue_tuned,
-    _preprocess_gemm_operands,
-    prune_gemm_configs,
+    _extend_configs,
+    epilogue_launch,
+    epilogue_autotune,
     GEMM_CONFIGS,
 )
-from coda.core.gemm.registry import (
-    GemmScalarScaleRoPE,
-    GemmScalarScaleSwiGLU,
-)
+
 
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
