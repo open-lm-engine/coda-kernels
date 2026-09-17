@@ -131,6 +131,13 @@ def epilogue_launch(
     )
 
 
+def _make_autotuner(fn: Callable, tunable: str, **kwargs) -> Autotuner:
+    # the custom-op dispatcher passes positionally, and the tuner reads `key=` names from kwargs only
+    assert "key" not in kwargs, f"{fn.__name__}: key= would be dropped, split the function instead"
+    tuner = autotune(**kwargs)(fn)
+    return tuner
+
+
 def backend_autotune() -> Callable[[Callable], Autotuner]:
 
     def _wrap(fn: Callable) -> Autotuner:
