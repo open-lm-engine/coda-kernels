@@ -67,17 +67,6 @@ def residual_sqsum_scaled_epi(acc: EpiValue, c: EpiValue, weight: EpiValue) -> E
 
 
 @gemm_epilogue(
-    outputs=("scaled_out",),
-    ops={"weight": RowVecLoad("weight"), "alpha": Scalar("alpha")},
-    reduces={"sqsum": ColVecReduce("sqsum", scaled=True)},
-)
-def alpha_residual_sqsum_scaled_epi(acc: EpiValue, c: EpiValue, weight: EpiValue, alpha: EpiValue) -> EpiOut:
-    y = acc * alpha + c
-    o = y * weight
-    return {"D": y, "scaled_out": o, "sqsum": (y, y)}
-
-
-@gemm_epilogue(
     ops={
         "pos": ColVecLoad("pos"),
         "freq": RowVecLoad("freq"),
