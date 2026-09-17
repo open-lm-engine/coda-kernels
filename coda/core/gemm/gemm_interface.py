@@ -68,7 +68,7 @@ def _kernel_op(
     mutates_args: tuple[str, ...],
 ) -> Callable[[Callable], Callable]:
 
-    def decorator(fn: Callable) -> Callable:
+    def _wrap(fn: Callable) -> Callable:
 
         @torch.library.custom_op(
             name,
@@ -85,7 +85,7 @@ def _kernel_op(
 
         return op
 
-    return decorator
+    return _wrap
 
 
 def epilogue_launch(
@@ -133,9 +133,10 @@ def epilogue_launch(
 
 def backend_autotune() -> Callable[[Callable], Autotuner]:
 
-    def decorator(fn: Callable) -> Autotuner:
-        return _tuned(
+    def _wrap(fn: Callable) -> Autotuner:
+        return _make_autotuner(
             fn,
+            tunable="backend",
             configs=[
                 AutotuneConfig(backend="quack"),
                 AutotuneConfig(backend="cublas"),
@@ -143,7 +144,7 @@ def backend_autotune() -> Callable[[Callable], Autotuner]:
             cache_results=AUTOTUNE_CACHE_RESULTS,
         )
 
-    return decorator
+    return _wrap
 
 
 def epilogue_autotune(
@@ -157,12 +158,13 @@ def epilogue_autotune(
     else:
         prune_fn = prune_gemm_configs
 
-    def decorator(fn: Callable) -> Autotuner:
-        return _tuned(
+    def _wrap(fn: Callable) -> Autotuner:
+        return _make_autotuner(
             fn,
+            tunable="config",
             configs=[AutotuneConfig(config=c) for c in configs],
             prune_configs_by={"early_config_prune": prune_fn},
             cache_results=AUTOTUNE_CACHE_RESULTS,
         )
 
-    return decorator
+    return _wrap
