@@ -135,6 +135,10 @@ def _make_autotuner(fn: Callable, tunable: str, **kwargs) -> Autotuner:
     # the custom-op dispatcher passes positionally, and the tuner reads `key=` names from kwargs only
     assert "key" not in kwargs, f"{fn.__name__}: key= would be dropped, split the function instead"
     tuner = autotune(**kwargs)(fn)
+    # callers pass everything except `tunable`; the tuner supplies it, so the tuner's signature is `fn`'s without it
+    signature = inspect.signature(fn)
+    assert list(signature.parameters.keys())[-1] == tunable, f"{fn.__name__}: `{tunable}` must be the last parameter"
+    tuner.__signature__ = signature.replace(parameters=list(signature.parameters.values())[:-1])
     return tuner
 
 
