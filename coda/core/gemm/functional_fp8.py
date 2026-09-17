@@ -1,12 +1,9 @@
 import torch
-import dataclasses
 from quack.gemm_config import GemmConfig
 
 from coda.core.gemm import epilogues
-from coda.core.ops import misc_utils
 from coda.core.gemm.gemm_interface import (
     _kernel_op,
-    _extend_configs,
     epilogue_launch,
     epilogue_autotune,
     GEMM_CONFIGS,
@@ -22,7 +19,7 @@ _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 )
 @epilogue_autotune(
     gated=True,
-    configs=FP8_GEMM_CONFIGS,
+    configs=GEMM_CONFIGS,
 )
 def _gemm_swiglu_fp8_epi(
     A: torch.Tensor,
@@ -82,7 +79,7 @@ def gemm_swiglu_fp8(
     mutates_args=("D",),
 )
 @epilogue_autotune(
-    configs=FP8_GEMM_CONFIGS,
+    configs=GEMM_CONFIGS,
 )
 def _gemm_rope_fp8_epi(
     A: torch.Tensor,
