@@ -8,6 +8,7 @@ from torchtitan.models.llama3 import Transformer, TransformerModelArgs
 
 from benchmarks import bench_utils
 from benchmarks.torchtitan import liger_utils
+from coda.kernels.blocks.llama3 import ALLOW_INPLACE_GRAD_OUTPUT
 
 
 _BATCH = 4
@@ -131,8 +132,12 @@ def main() -> None:
         print(f"{args.name:<6} trace -> {args.trace}")
         return
 
-    results = bench_utils.do_bench_count(
+    time_ms = bench_utils.do_bench_count(
         forward_backward,
         warmup=_NUM_WARMUP,
         rep=_NUM_ITERATIONS,
     )
+
+
+if __name__ == "__main__":
+    main()
