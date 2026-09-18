@@ -141,6 +141,33 @@ def main() -> None:
     loss = forward_backward()
     memory_gib = torch.cuda.max_memory_allocated() / (2 ** 30)
 
+    ntokens = _BATCH * _LENGTH
+    device = torch.cuda.current_device()
+    record = {
+        "name": args.name,
+        "gpu_name": torch.cuda.get_device_name(device),
+        "gpu_uuid": str(torch.cuda.get_device_properties(device).uuid),
+        "gpu_visible": os.environ.get("CUDA_VISIBLE_DEVICES", "all"),
+        "batch": _BATCH,
+        "length": _LENGTH,
+        "tokens": ntokens,
+        "vocab": vocab_size,
+        "compile": args.compile,
+        "inplace_grad": ALLOW_INPLACE_GRAD_OUTPUT if args.name == "coda" else None,
+        "time_ms": time_ms,
+        "memory_gib": memory_gib,
+        "tokens_per_s": ntokens / (time_ms / 1e3),
+        "loss_per_token": loss.item() / ntokens,
+    }
+    print(
+        f"{args.name:<6}",
+        f"{time_ms:9.3f} ms",
+        f"{memory_gib:6.2f} GiB",
+        f"{record['tokens_per_s'] / 1e3:8.2f} ktok/s",
+        f"loss/tok {record['loss_per_token']:.4f}",
+        sep="  ",
+    )
+
 
 if __name__ == "__main__":
     main()
