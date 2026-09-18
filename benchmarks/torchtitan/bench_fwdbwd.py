@@ -137,6 +137,9 @@ def main() -> None:
         warmup=_NUM_WARMUP,
         rep=_NUM_ITERATIONS,
     )
+    torch.cuda.reset_peak_memory_stats()
+    loss = forward_backward()
+    memory_gib = torch.cuda.max_memory_allocated() / (2 ** 30)
 
 
 if __name__ == "__main__":
