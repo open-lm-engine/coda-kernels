@@ -89,6 +89,13 @@ def make_forward_fn(
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--name", choices=("coda", "liger", "torch"), required=True)
+    parser.add_argument("--compile", choices=("default", "max-autotune-no-cudagraphs"), default=None)
+    parser.add_argument("--trace", type=str, default=None)
+    parser.add_argument("--json", type=str, default=None)
+    args = parser.parse_args()
+
     forward_fn = make_forward_fn(
         name=args.name,
         model=model,
