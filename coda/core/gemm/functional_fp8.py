@@ -7,6 +7,7 @@ from coda.core.gemm.gemm_interface import (
     epilogue_launch,
     epilogue_autotune,
     GEMM_CONFIGS,
+    GATED_TILE_N_MULTIPLE_OF,
 )
 
 
@@ -18,8 +19,8 @@ _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
     mutates_args=("D", "postact"),
 )
 @epilogue_autotune(
-    gated=True,
     configs=GEMM_CONFIGS,
+    tile_n_multiple_of=GATED_TILE_N_MULTIPLE_OF,
 )
 def _gemm_swiglu_fp8_epi(
     A: torch.Tensor,
