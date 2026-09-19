@@ -171,20 +171,17 @@ def epilogue_autotune(
     if configs is None:
         configs = GEMM_CONFIGS
 
-    def _prune(configs: list[AutotuneConfig], named_args: dict, **kwargs) -> list[AutotuneConfig]:
-        return prune_gemm_configs(
-            configs=configs,
-            named_args=named_args,
-            tile_n_multiple_of=tile_n_multiple_of,
-            **kwargs,
-        )
+    prune_fn = functools.partial(
+        prune_gemm_configs,
+        tile_n_multiple_of=tile_n_multiple_of,
+    )
 
     def _wrap(fn: Callable) -> Autotuner:
         return _make_autotuner(
             fn,
             tunable="config",
             configs=[AutotuneConfig(config=c) for c in configs],
-            prune_configs_by={"early_config_prune": _prune},
+            prune_configs_by={"early_config_prune": prune_fn},
             cache_results=AUTOTUNE_CACHE_RESULTS,
         )
 
