@@ -15,6 +15,7 @@ from coda.core.gemm.gemm_interface import (
     backend_autotune,
     epilogue_launch,
     epilogue_autotune,
+    GATED_TILE_N_MULTIPLE_OF,
 )
 
 
@@ -100,7 +101,7 @@ def gemm_scalar_scale(
     mutates_args=("D", "postact"),
 )
 @epilogue_autotune(
-    gated=True,
+    tile_n_multiple_of=GATED_TILE_N_MULTIPLE_OF,
 )
 def _gemm_swiglu_epi(
     A: torch.Tensor,
@@ -146,7 +147,7 @@ def gemm_swiglu(
     mutates_args=("D", "postact"),
 )
 @epilogue_autotune(
-    gated=True,
+    tile_n_multiple_of=GATED_TILE_N_MULTIPLE_OF,
 )
 def _gemm_rmsnorm_swiglu_epi(
     A: torch.Tensor,
@@ -900,3 +901,80 @@ def gemm_rmsnorm_rope(
         freq=frequencies,
     )
     return out
+
+
+@_kernel_op(
+    name="coda::_gemm_qknorm_rope_epi",
+    mutates_args=("D", "head_mean_sq"),
+)
+@epilogue_autotune(
+    tile_n_multiple_of="head_dim",
+)
+def _gemm_qknorm_rope_epi(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    D: torch.Tensor,
+    head_dim: int,
+    weight: torch.Tensor,
+    eps: float,
+    pos: torch.Tensor,
+    freq: torch.Tensor,
+    head_mean_sq: torch.Tensor,
+    config: GemmConfig,
+) -> None:
+    epilogue_launch(
+        epi_fn=epilogues.qknorm_rope_epi,
+        A=A,
+        B=B,
+        D=D,
+        epi_args={
+            # the statistic op only takes the group width: an int, or a tensor whose length it uses
+            "qk": head_dim,
+            "weight": weight,
+            "eps": eps,
+            "pos": pos,
+            "freq": freq,
+            "head_mean_sq_out": head_mean_sq,
+        },
+        config=config,
+    )
+
+
+def gemm_qknorm_rope(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    weight: torch.Tensor,
+    positions: torch.Tensor,
+    frequencies: torch.Tensor,
+    head_dim: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    eps: float,
+    out: torch.Tensor | None = None,
+    head_mean_sq: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    M, _ = A.shape
+    _, N = B.shape
+    num_heads = num_heads_q + num_heads_k
+    assert N == head_dim * num_heads
+    assert weight.shape == (2 * head_dim,)
+    assert positions.shape == (M,)
+    assert positions.dtype in (torch.float32, torch.int32)
+    assert frequencies.shape == (N,)
+    assert frequencies.dtype == torch.float32
+    if out is None:
+        out = torch.empty(M, N, dtype=A.dtype, device=A.device)
+    if head_mean_sq is None:
+        head_mean_sq = torch.empty(M, num_heads, dtype=torch.float32, device=A.device)
+    _gemm_qknorm_rope_epi(
+        A=A,
+        B=B.mT,
+        D=out,
+        head_dim=head_dim,
+        weight=weight,
+        eps=eps,
+        pos=positions,
+        freq=frequencies,
+        head_mean_sq=head_mean_sq,
+    )
+    return out, head_mean_sq
