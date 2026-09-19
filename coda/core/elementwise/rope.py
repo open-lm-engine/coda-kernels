@@ -23,14 +23,13 @@ def qknorm_rope_bwd_kernel(
     mDK_packed: cute.Tensor,
     mDGamma: cute.Tensor,
     mX_packed: cute.Tensor,
-    mSSq: cute.Tensor,
+    mHeadMeanSq: cute.Tensor,
     mGamma: cute.Tensor,
     mPos: cute.Tensor,
     mFreq: cute.Tensor,
     head_dim: cutlass.Constexpr[int],
     num_heads_q: cutlass.Constexpr[int],
     num_heads_k: cutlass.Constexpr[int],
-    num_segments: cutlass.Constexpr[int],
     eps: cutlass.Constexpr[float],
     dtype: type[cute.Numeric],
     tiler_mn: cute.Shape,
@@ -140,27 +139,27 @@ def qknorm_rope_bwd_kernel(
         row_coord, col_coord_begin = tXcX_packed[row_index * vector_size]
         if row_coord < mX_packed.shape[0]:
             head_idx = (2 * col_coord_begin) // head_dim
-            ssq = cute.Float32.zero
-            for i in cutlass.range_constexpr(num_segments):
-                ssq = ssq + mSSq[row_coord, head_idx * num_segments + i]
-            rms = cute.math.rsqrt(ssq / head_dim + eps, fastmath=True)
+            rms = cute.math.rsqrt(mHeadMeanSq[row_coord, head_idx] + eps, fastmath=True)
 
             drms = cute.Float32.zero
             for col_index in cutlass.range_constexpr(vector_size):
                 flat_index = row_index * vector_size + col_index
                 _, col_coord = tXcX_packed[flat_index]
-                col_coord_head = (2 * col_coord) % head_dim
-                a = mPos[row_coord].to(dtype=cute.Float32) * mFreq[col_coord].to(dtype=cute.Float32)
-                c = cute.math.cos(a, fastmath=True)
-                s = cute.math.sin(a, fastmath=True)
+                gamma_index = 2 * col_coord
+                freq_index = 2 * col_coord
+                s, c = math_utils.rope_pos_freq(
+                    pos=mPos[row_coord].to(dtype=cute.Float32),
+                    freq_hi=mFreq[freq_index].to(dtype=cute.Float32),
+                    freq_lo=mFreq[freq_index + 1].to(dtype=cute.Float32),
+                )
                 dy0 = tXrDY[2 * flat_index].to(dtype=cute.Float32)
                 dy1 = tXrDY[2 * flat_index + 1].to(dtype=cute.Float32)
-                dz0 = dy0 * c - dy1 * s
-                dz1 = dy1 * c + dy0 * s
+                dz0 = dy0 * c + dy1 * s
+                dz1 = dy1 * c - dy0 * s
                 x0 = tXrX[2 * flat_index].to(dtype=cute.Float32)
                 x1 = tXrX[2 * flat_index + 1].to(dtype=cute.Float32)
-                g0 = mGamma[col_coord_head].to(dtype=cute.Float32)
-                g1 = mGamma[col_coord_head + 1].to(dtype=cute.Float32)
+                g0 = mGamma[gamma_index].to(dtype=cute.Float32)
+                g1 = mGamma[gamma_index + 1].to(dtype=cute.Float32)
                 rDZ[2 * col_index] = dz0
                 rDZ[2 * col_index + 1] = dz1
                 drms = drms + dz0 * g0 * x0 + dz1 * g1 * x1
@@ -177,9 +176,9 @@ def qknorm_rope_bwd_kernel(
             for col_index in cutlass.range_constexpr(vector_size):
                 flat_index = row_index * vector_size + col_index
                 _, col_coord = tXcX_packed[flat_index]
-                col_coord_head = (2 * col_coord) % head_dim
-                g0 = mGamma[col_coord_head].to(dtype=cute.Float32)
-                g1 = mGamma[col_coord_head + 1].to(dtype=cute.Float32)
+                gamma_index = 2 * col_coord
+                g0 = mGamma[gamma_index].to(dtype=cute.Float32)
+                g1 = mGamma[gamma_index + 1].to(dtype=cute.Float32)
                 dz0 = rDZ[2 * col_index]
                 dz1 = rDZ[2 * col_index + 1]
                 x0 = tXrX[2 * flat_index].to(dtype=cute.Float32)
@@ -224,14 +223,13 @@ def _qknorm_rope_bwd(
     mDK: cute.Tensor,
     mDGamma: cute.Tensor,
     mX: cute.Tensor,
-    mSSq: cute.Tensor,
+    mHeadMeanSq: cute.Tensor,
     mGamma: cute.Tensor,
     mPos: cute.Tensor,
     mFreq: cute.Tensor,
     head_dim: cutlass.Constexpr[int],
     num_heads_q: cutlass.Constexpr[int],
     num_heads_k: cutlass.Constexpr[int],
-    num_segments: cutlass.Constexpr[int],
     eps: cutlass.Constexpr[float],
     thr_m: cutlass.Constexpr[int],
     thr_n: cutlass.Constexpr[int],
@@ -242,7 +240,7 @@ def _qknorm_rope_bwd(
     mDQ_packed = cute.recast_tensor(mDQ, dtype=cute.Int32)
     mDK_packed = cute.recast_tensor(mDK, dtype=cute.Int32)
     mX_packed = cute.recast_tensor(mX, dtype=cute.Int32)
-    vector_size = cutlass.const_expr(_NUM_BITS // mX_packed.element_type.width)
+    vector_size = cutlass.const_expr(constants.NUM_BITS_PER_COPY // mX_packed.element_type.width)
     num_heads_qk = cutlass.const_expr(num_heads_q + num_heads_k)
     lanes_per_head = cutlass.const_expr(head_dim // (2 * vector_size))
     misc_utils.static_assert(len(mDX_packed.shape) == 2)
@@ -250,7 +248,7 @@ def _qknorm_rope_bwd(
     misc_utils.static_assert(len(mDK_packed.shape) == 2)
     misc_utils.static_assert(len(mDGamma.shape) == 2)
     misc_utils.static_assert(len(mX_packed.shape) == 2)
-    misc_utils.static_assert(len(mSSq.shape) == 2)
+    misc_utils.static_assert(len(mHeadMeanSq.shape) == 2)
     misc_utils.static_assert(len(mGamma.shape) == 1)
     misc_utils.static_assert(len(mPos.shape) == 1)
     misc_utils.static_assert(len(mFreq.shape) == 1)
@@ -263,6 +261,9 @@ def _qknorm_rope_bwd(
     misc_utils.static_assert(mX_packed.shape[1] % (thr_n * vector_size) == 0)
     misc_utils.static_assert(mDQ_packed.shape[1] % (thr_n * vector_size) == 0)
     misc_utils.static_assert(mDK_packed.shape[1] % (thr_n * vector_size) == 0)
+    misc_utils.static_assert(mDGamma.shape[1] == mX.shape[1])
+    misc_utils.static_assert(mGamma.shape[0] == mX.shape[1])
+    misc_utils.static_assert(mFreq.shape[0] == mX.shape[1])
     misc_utils.static_assert((head_dim % (2 * vector_size)) == 0)
     misc_utils.static_assert(lanes_per_head <= 32)
     misc_utils.static_assert((thr_n % lanes_per_head) == 0)
@@ -285,14 +286,13 @@ def _qknorm_rope_bwd(
         mDK_packed=mDK_packed,
         mDGamma=mDGamma,
         mX_packed=mX_packed,
-        mSSq=mSSq,
+        mHeadMeanSq=mHeadMeanSq,
         mGamma=mGamma,
         mPos=mPos,
         mFreq=mFreq,
         head_dim=head_dim,
         num_heads_q=num_heads_q,
         num_heads_k=num_heads_k,
-        num_segments=num_segments,
         eps=eps,
         dtype=mX.element_type,
         tiler_mn=tiler_mn,
@@ -318,7 +318,6 @@ def _compile_qknorm_rope_bwd(
     head_dim: int,
     num_heads_q: int,
     num_heads_k: int,
-    num_segments: int,
     eps: float,
     dtype: type[cute.Numeric],
     pos_dtype: type[cute.Numeric],
@@ -331,7 +330,7 @@ def _compile_qknorm_rope_bwd(
     num_heads_qk = cutlass.const_expr(num_heads_q + num_heads_k)
     size_q = cutlass.const_expr(head_dim * num_heads_q)
     size_k = cutlass.const_expr(head_dim * num_heads_k)
-    vector_size = cutlass.const_expr(_NUM_BITS // dtype.width)
+    vector_size = cutlass.const_expr(constants.NUM_BITS_PER_COPY // dtype.width)
     misc_utils.static_assert(size == (head_dim * num_heads_qk))
     misc_utils.static_assert((vector_size % 2) == 0)
     mDX = cute.runtime.make_fake_tensor(
@@ -364,15 +363,15 @@ def _compile_qknorm_rope_bwd(
         stride=(cute.sym_int64(divisibility=vector_size), 1),
         assumed_align=16,
     )
-    mSSq = cute.runtime.make_fake_tensor(
+    mHeadMeanSq = cute.runtime.make_fake_tensor(
         dtype=cute.Float32,
-        shape=(m, (size // head_dim) * num_segments),
+        shape=(m, size // head_dim),
         stride=(cute.sym_int64(divisibility=1), 1),
         assumed_align=4,
     )
     mGamma = cute.runtime.make_fake_tensor(
         dtype=dtype,
-        shape=(head_dim,),
+        shape=(size,),
         stride=(1,),
         assumed_align=dtype.width // 8,
     )
@@ -384,7 +383,7 @@ def _compile_qknorm_rope_bwd(
     )
     mFreq = cute.runtime.make_fake_tensor(
         dtype=freq_dtype,
-        shape=(size // 2,),
+        shape=(size,),
         stride=(1,),
         assumed_align=freq_dtype.width // 8,
     )
@@ -396,14 +395,13 @@ def _compile_qknorm_rope_bwd(
         mDK=mDK,
         mDGamma=mDGamma,
         mX=mX,
-        mSSq=mSSq,
+        mHeadMeanSq=mHeadMeanSq,
         mGamma=mGamma,
         mPos=mPos,
         mFreq=mFreq,
         head_dim=head_dim,
         num_heads_q=num_heads_q,
         num_heads_k=num_heads_k,
-        num_segments=num_segments,
         eps=eps,
         thr_m=thr_m,
         thr_n=thr_n,
@@ -419,14 +417,13 @@ def qknorm_rope_bwd_(
     dk: torch.Tensor,
     dgamma: torch.Tensor,
     x: torch.Tensor,
-    ssq: torch.Tensor,
+    head_mean_sq: torch.Tensor,
     gamma: torch.Tensor,
     pos: torch.Tensor,
     freq: torch.Tensor,
     head_dim: int,
     num_heads_q: int,
     num_heads_k: int,
-    num_segments: int,
     eps: float,
     thr_m: int,
     thr_n: int,
@@ -437,7 +434,6 @@ def qknorm_rope_bwd_(
         head_dim=head_dim,
         num_heads_q=num_heads_q,
         num_heads_k=num_heads_k,
-        num_segments=num_segments,
         eps=eps,
         dtype=torch2cute_dtype_map[x.dtype],
         pos_dtype=torch2cute_dtype_map[pos.dtype],
@@ -446,4 +442,4 @@ def qknorm_rope_bwd_(
         thr_n=thr_n,
         val_m=val_m,
     )
-    fn(dx, dq, dk, dgamma, x, ssq, gamma, pos, freq)
+    fn(dx, dq, dk, dgamma, x, head_mean_sq, gamma, pos, freq)
