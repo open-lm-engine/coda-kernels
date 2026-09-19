@@ -13,6 +13,10 @@ from quack.gemm_interface import prune_invalid_gemm_configs
 from coda.core.ops.constants import AUTOTUNE_CACHE_RESULTS
 
 
+# https://github.com/Dao-AILab/quack/blob/v0.6.5/quack/epilogue/ops.py#L930
+GATED_TILE_N_MULTIPLE_OF = 32
+
+
 def _extend_configs(
     configs: list[GemmConfig],
     fn: Callable[[GemmConfig], GemmConfig],
@@ -42,24 +46,26 @@ GEMM_CONFIGS = _extend_configs(GEMM_CONFIGS, lambda config: dataclasses.replace(
 GEMM_CONFIGS = [config for config in GEMM_CONFIGS if _cooperative_compatible(config)]
 
 
-def prune_gemm_configs(configs: list[AutotuneConfig], named_args: dict, **kwargs) -> list[AutotuneConfig]:
+def prune_gemm_configs(
+    configs: list[AutotuneConfig],
+    named_args: dict,
+    tile_n_multiple_of: int | str | None,
+    **kwargs,
+) -> list[AutotuneConfig]:
     configs = prune_invalid_gemm_configs(
         configs=configs,
         named_args=named_args,
         **kwargs,
     )
     configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
-    return configs
-
-
-def prune_gated_gemm_configs(configs: list[AutotuneConfig], named_args: dict, **kwargs) -> list[AutotuneConfig]:
-    configs = prune_gemm_configs(
-        configs=configs,
-        named_args=named_args,
-        **kwargs,
-    )
-    # https://github.com/Dao-AILab/quack/blob/v0.6.4/quack/epilogue/ops.py#L928
-    configs = [conf for conf in configs if conf.kwargs["config"].tile_n % 32 == 0]
+    # an int, or the name of the op argument that holds it
+    if isinstance(tile_n_multiple_of, str):
+        tile_n_multiple_of = named_args[tile_n_multiple_of]
+    if tile_n_multiple_of is not None:
+        configs = [
+            conf for conf in configs
+            if conf.kwargs["config"].tile_n % tile_n_multiple_of == 0
+        ]
     return configs
 
 
@@ -159,22 +165,26 @@ def backend_autotune() -> Callable[[Callable], Autotuner]:
 
 
 def epilogue_autotune(
-    gated: bool = False,
     configs: list[GemmConfig] | None = None,
+    tile_n_multiple_of: int | str | None = None,
 ) -> Callable[[Callable], Autotuner]:
     if configs is None:
         configs = GEMM_CONFIGS
-    if gated:
-        prune_fn = prune_gated_gemm_configs
-    else:
-        prune_fn = prune_gemm_configs
+
+    def _prune(configs: list[AutotuneConfig], named_args: dict, **kwargs) -> list[AutotuneConfig]:
+        return prune_gemm_configs(
+            configs=configs,
+            named_args=named_args,
+            tile_n_multiple_of=tile_n_multiple_of,
+            **kwargs,
+        )
 
     def _wrap(fn: Callable) -> Autotuner:
         return _make_autotuner(
             fn,
             tunable="config",
             configs=[AutotuneConfig(config=c) for c in configs],
-            prune_configs_by={"early_config_prune": prune_fn},
+            prune_configs_by={"early_config_prune": _prune},
             cache_results=AUTOTUNE_CACHE_RESULTS,
         )
 
