@@ -150,7 +150,7 @@ def alpha_residual_rmsnorm_bwd_epi(acc: EpiValue, rstd: EpiValue, zdz: EpiValue,
 
 class HeadMeanSq(GroupedColStatsBase):
     @cute.jit
-    def stat_value(self, total, group_cols):
+    def stat_value(self, total: cute.Float32, group_cols: cutlass.Constexpr[int]) -> cute.Float32:
         return total * cutlass.const_expr(1.0 / group_cols)
 
 
@@ -170,7 +170,7 @@ _head_mean_sq_op = HeadMeanSq("qk")
     extra_ops=(_head_mean_sq_op.out("head_mean_sq_out"),),
     mode="acc_pair",
 )
-def qknorm_rope_epi(acc: EpiValue, qk: EpiValue, eps: EpiValue, weight: EpiValue, pos: EpiValue, freq: EpiValue) -> EpiOut:
+def qknorm_rope_epi(acc: EpiValue, qk: EpiValue, weight: EpiValue, eps: EpiValue, pos: EpiValue, freq: EpiValue) -> EpiOut:
     rstd = cute.math.rsqrt(head_mean_sq + eps, fastmath=True)
     x1, x2 = unpack(acc * weight)
     s, c = _sincos_turns(*_angle_turns(pos, freq))
