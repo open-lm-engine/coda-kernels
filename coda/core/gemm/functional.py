@@ -957,7 +957,8 @@ def gemm_qknorm_rope(
     _, N = B.shape
     num_heads = num_heads_q + num_heads_k
     assert N == head_dim * num_heads
-    assert weight.shape == (2 * head_dim,)
+    # the head weight repeated per head, one entry per column
+    assert weight.shape == (N,)
     assert positions.shape == (M,)
     assert positions.dtype in (torch.float32, torch.int32)
     assert frequencies.shape == (N,)
