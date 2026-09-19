@@ -1,5 +1,7 @@
+import cutlass
 import cutlass.cute as cute
 from quack.activation import dswiglu, swiglu
+from quack.epilogue.library import _sq_prepass
 from quack.epilogue.rotary import _angle_turns, _sincos_turns
 from quack.epilogue.math import F2, Pair, pack, unpack
 from quack.epilogue.frontend import gemm_epilogue
@@ -7,6 +9,7 @@ from quack.epilogue.ops import (
     Scalar,
     ColVecLoad,
     ColVecReduce,
+    GroupedColStatsBase,
     RowVecLoad,
     RowVecReduce,
     TileLoad,
@@ -143,3 +146,34 @@ def alpha_residual_rmsnorm_bwd_epi(acc: EpiValue, rstd: EpiValue, zdz: EpiValue,
         "normed": c_norm * weight,
         "dweight": (y, c_norm),
     }
+
+
+class HeadMeanSq(GroupedColStatsBase):
+    @cute.jit
+    def stat_value(self, total, group_cols):
+        return total * cutlass.const_expr(1.0 / group_cols)
+
+
+_head_mean_sq_op = HeadMeanSq("qk")
+
+
+@gemm_epilogue(
+    ops={
+        "qk": _head_mean_sq_op,
+        "weight": RowVecLoad("weight"),
+        "eps": Scalar("eps"),
+        "pos": ColVecLoad("pos"),
+        "freq": RowVecLoad("freq"),
+    },
+    prepass=_sq_prepass,
+    prepass_outs=("qk",),
+    extra_ops=(_head_mean_sq_op.out("head_mean_sq_out"),),
+    mode="acc_pair",
+)
+def qknorm_rope_epi(acc: EpiValue, qk: EpiValue, eps: EpiValue, weight: EpiValue, pos: EpiValue, freq: EpiValue) -> EpiOut:
+    rstd = cute.math.rsqrt(head_mean_sq + eps, fastmath=True)
+    x1, x2 = unpack(acc * weight)
+    s, c = _sincos_turns(*_angle_turns(pos, freq))
+    x1 = x1 * rstd
+    x2 = x2 * rstd
+    return {"D": pack(x1 * c - x2 * s, x1 * s + x2 * c)}
