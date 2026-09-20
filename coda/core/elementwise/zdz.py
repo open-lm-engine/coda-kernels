@@ -37,7 +37,39 @@ def rope_bwd_zdz_kernel(
     bidx, _, _ = cute.arch.block_idx()
     allocator = cutlass.utils.SmemAllocator()
 
-    idY = cute.make_identity_tensor(mY_packed.shape)
+    idY_packed = cute.make_identity_tensor(mY_packed.shape)
+    config = memory_utils.MemoryCopyConfig(
+        op="universal",
+        dtype=mY_packed.element_type,
+        num_bits_per_copy=mY_packed.element_type.width * vector_size,
+        tiler_mn=tiler_mn,
+        layout_tv=tv_layout,
+    )
+
+    misc_utils.static_assert(mY_packed.shape[1] % tiler_mn[1] == 0)
+    for tile_index in cutlass.range_constexpr(mY_packed.shape[1] // tiler_mn[1]):
+        gY_packed = cute.local_tile(mY_packed, tiler_mn, (bidx, tile_index))
+        gDY_packed = cute.local_tile(mDY_packed, tiler_mn, (bidx, tile_index))
+        gDZ_packed = cute.local_tile(mDZ_packed, tiler_mn, (bidx, tile_index))
+        cY_packed = cute.local_tile(idY_packed, tiler_mn, (bidx, tile_index))
+        copy_outputs_Y = memory_utils.copy(
+            src=gY_packed,
+            dst="rmem",
+            crd=cY_packed,
+            shape=mY_packed.shape,
+            config=config,
+            thread_index=tidx,
+            smem_allocator=allocator,
+        )
+        copy_outputs_DY = memory_utils.copy(
+            src=gDY_packed,
+            dst="rmem",
+            crd=cY_packed,
+            shape=mDY_packed.shape,
+            config=config,
+            thread_index=tidx,
+            smem_allocator=allocator,
+        )
 
 
 @cute.jit
