@@ -65,7 +65,7 @@ def rope_bwd_zdz_kernel(
         memspace="rmem",
     )
     misc_utils.static_assert(mY_packed.shape[1] % tiler_mn[1] == 0)
-    for tile_index in cutlass.range_constexpr(mY_packed.shape[1] // tiler_mn[1]):
+    for tile_index in cutlass.range_constexpr(misc_utils.ceil_div(mY_packed.shape[1], tiler_mn[1])):
         gY_packed = cute.local_tile(mY_packed, tiler_mn, (bidx, tile_index))
         gDY_packed = cute.local_tile(mDY_packed, tiler_mn, (bidx, tile_index))
         gDZ_packed = cute.local_tile(mDZ_packed, tiler_mn, (bidx, tile_index))
