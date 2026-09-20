@@ -15,7 +15,6 @@ from coda.core.ops import memory_utils
 from coda.core.ops import creation_utils
 
 
-
 @cute.kernel
 def qknorm_rope_bwd_kernel(
     mDX_packed: cute.Tensor,
@@ -137,54 +136,58 @@ def qknorm_rope_bwd_kernel(
 
     for row_index in cutlass.range_constexpr(val_m):
         row_coord, col_coord_begin = tXcX_packed[row_index * vector_size]
-        if row_coord < mX_packed.shape[0]:
-            head_idx = (2 * col_coord_begin) // head_dim
-            rms = cute.math.rsqrt(mHeadMeanSq[row_coord, head_idx] + eps, fastmath=True)
+        row_in_bound = row_coord < mX_packed.shape[0]
+        head_idx = (2 * col_coord_begin) // head_dim
+        rms = cute.math.rsqrt(mHeadMeanSq[row_coord, head_idx] + eps, fastmath=True)
 
-            drms = cute.Float32.zero
-            for col_index in cutlass.range_constexpr(vector_size):
-                flat_index = row_index * vector_size + col_index
-                _, col_coord = tXcX_packed[flat_index]
-                gamma_index = 2 * col_coord
-                freq_index = 2 * col_coord
-                s, c = math_utils.rope_pos_freq(
-                    pos=mPos[row_coord].to(dtype=cute.Float32),
-                    freq_hi=mFreq[freq_index].to(dtype=cute.Float32),
-                    freq_lo=mFreq[freq_index + 1].to(dtype=cute.Float32),
-                )
-                dy0 = tXrDY[2 * flat_index].to(dtype=cute.Float32)
-                dy1 = tXrDY[2 * flat_index + 1].to(dtype=cute.Float32)
-                dz0 = dy0 * c + dy1 * s
-                dz1 = dy1 * c - dy0 * s
-                x0 = tXrX[2 * flat_index].to(dtype=cute.Float32)
-                x1 = tXrX[2 * flat_index + 1].to(dtype=cute.Float32)
-                g0 = mGamma[gamma_index].to(dtype=cute.Float32)
-                g1 = mGamma[gamma_index + 1].to(dtype=cute.Float32)
-                rDZ[2 * col_index] = dz0
-                rDZ[2 * col_index + 1] = dz1
+        drms = cute.Float32.zero
+        for col_index in cutlass.range_constexpr(vector_size):
+            flat_index = row_index * vector_size + col_index
+            _, col_coord = tXcX_packed[flat_index]
+            gamma_index = (2 * col_coord) % head_dim
+            freq_index = 2 * col_coord
+            s, c = math_utils.rope_pos_freq(
+                pos=mPos[row_coord].to(dtype=cute.Float32),
+                freq_hi=mFreq[freq_index].to(dtype=cute.Float32),
+                freq_lo=mFreq[freq_index + 1].to(dtype=cute.Float32),
+            )
+            dy0 = tXrDY[2 * flat_index].to(dtype=cute.Float32)
+            dy1 = tXrDY[2 * flat_index + 1].to(dtype=cute.Float32)
+            dz0 = dy0 * c + dy1 * s
+            dz1 = dy1 * c - dy0 * s
+            x0 = tXrX[2 * flat_index].to(dtype=cute.Float32)
+            x1 = tXrX[2 * flat_index + 1].to(dtype=cute.Float32)
+            g0 = mGamma[gamma_offset + gamma_index].to(dtype=cute.Float32)
+            g1 = mGamma[gamma_offset + gamma_index + 1].to(dtype=cute.Float32)
+            rDZ[2 * col_index] = dz0
+            rDZ[2 * col_index + 1] = dz1
+
+            if row_in_bound:
                 drms = drms + dz0 * g0 * x0 + dz1 * g1 * x1
 
-            if cutlass.const_expr(lanes_per_head > 1):
-                drms = cute.arch.warp_reduction(
-                    drms,
-                    op=operator.add,
-                    threads_in_group=lanes_per_head,
-                )
+        if cutlass.const_expr(lanes_per_head > 1):
+            drms = cute.arch.warp_reduction(
+                drms,
+                op=operator.add,
+                threads_in_group=lanes_per_head,
+            )
 
-            # dssq2 = 2 * dL/dssq
-            dssq2 = -drms * rms * rms * rms / head_dim
-            for col_index in cutlass.range_constexpr(vector_size):
-                flat_index = row_index * vector_size + col_index
-                _, col_coord = tXcX_packed[flat_index]
-                gamma_index = 2 * col_coord
-                g0 = mGamma[gamma_index].to(dtype=cute.Float32)
-                g1 = mGamma[gamma_index + 1].to(dtype=cute.Float32)
-                dz0 = rDZ[2 * col_index]
-                dz1 = rDZ[2 * col_index + 1]
-                x0 = tXrX[2 * flat_index].to(dtype=cute.Float32)
-                x1 = tXrX[2 * flat_index + 1].to(dtype=cute.Float32)
-                tXrDX[2 * flat_index] = (rms * g0 * dz0 + x0 * dssq2).to(dtype=tXrDX.element_type)
-                tXrDX[2 * flat_index + 1] = (rms * g1 * dz1 + x1 * dssq2).to(dtype=tXrDX.element_type)
+        # dssq2 = 2 * dL/dssq
+        dssq2 = -drms * rms * rms * rms / head_dim
+        for col_index in cutlass.range_constexpr(vector_size):
+            flat_index = row_index * vector_size + col_index
+            _, col_coord = tXcX_packed[flat_index]
+            gamma_index = (2 * col_coord) % head_dim
+            g0 = mGamma[gamma_offset + gamma_index].to(dtype=cute.Float32)
+            g1 = mGamma[gamma_offset + gamma_index + 1].to(dtype=cute.Float32)
+            dz0 = rDZ[2 * col_index]
+            dz1 = rDZ[2 * col_index + 1]
+            x0 = tXrX[2 * flat_index].to(dtype=cute.Float32)
+            x1 = tXrX[2 * flat_index + 1].to(dtype=cute.Float32)
+            tXrDX[2 * flat_index] = (rms * g0 * dz0 + x0 * dssq2).to(dtype=tXrDX.element_type)
+            tXrDX[2 * flat_index + 1] = (rms * g1 * dz1 + x1 * dssq2).to(dtype=tXrDX.element_type)
+
+            if row_in_bound:
                 rDGamma[2 * col_index] = rDGamma[2 * col_index] + dz0 * x0 * rms
                 rDGamma[2 * col_index + 1] = rDGamma[2 * col_index + 1] + dz1 * x1 * rms
 
@@ -262,7 +265,7 @@ def _qknorm_rope_bwd(
     misc_utils.static_assert(mDQ_packed.shape[1] % (thr_n * vector_size) == 0)
     misc_utils.static_assert(mDK_packed.shape[1] % (thr_n * vector_size) == 0)
     misc_utils.static_assert(mDGamma.shape[1] == mX.shape[1])
-    misc_utils.static_assert(mGamma.shape[0] == mX.shape[1])
+    misc_utils.static_assert(mGamma.shape[0] == (2 * head_dim))
     misc_utils.static_assert(mFreq.shape[0] == mX.shape[1])
     misc_utils.static_assert((head_dim % (2 * vector_size)) == 0)
     misc_utils.static_assert(lanes_per_head <= 32)
@@ -371,7 +374,7 @@ def _compile_qknorm_rope_bwd(
     )
     mGamma = cute.runtime.make_fake_tensor(
         dtype=dtype,
-        shape=(size,),
+        shape=(2 * head_dim,),
         stride=(1,),
         assumed_align=dtype.width // 8,
     )
