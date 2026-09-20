@@ -16,6 +16,74 @@ from coda.core.ops import memory_utils
 from coda.core.ops import creation_utils
 
 
+@cute.jit
+def _rope_bwd_zdz(
+    mY: cute.Tensor,
+    mDY: cute.Tensor,
+    mDZ: cute.Tensor,
+    mZdZ: cute.Tensor,
+    mPos: cute.Tensor,
+    mFreq: cute.Tensor,
+    scale: cutlass.Constexpr[float],
+    thr_m: cutlass.Constexpr[int],
+    thr_n: cutlass.Constexpr[int],
+    val_m: cutlass.Constexpr[int],
+    stream: cuda.CUstream,
+) -> int:
+    mY_packed = layout_utils.recast_tensor(mY, dtype=cute.Int32)
+    mDY_packed = layout_utils.recast_tensor(mDY, dtype=cute.Int32)
+    mDZ_packed = layout_utils.recast_tensor(mDZ, dtype=cute.Int32)
+    vector_size = cutlass.const_expr(constants.NUM_BITS_PER_COPY // mY_packed.element_type.width)
+    misc_utils.static_assert(len(mY_packed.shape) == 2)
+    misc_utils.static_assert(len(mDY_packed.shape) == 2)
+    misc_utils.static_assert(len(mDZ_packed.shape) == 2)
+    misc_utils.static_assert(len(mZdZ.shape) == 1)
+    misc_utils.static_assert(len(mPos.shape) == 1)
+    misc_utils.static_assert(len(mFreq.shape) == 1)
+    misc_utils.static_assert(mY_packed.shape[1] == mDY_packed.shape[1])
+    misc_utils.static_assert(mY_packed.shape[1] == mDZ_packed.shape[1])
+    misc_utils.static_assert(mY_packed.shape[1] % (thr_n * vector_size) == 0)
+    misc_utils.static_assert(mDY_packed.shape[1] % (thr_n * vector_size) == 0)
+    misc_utils.static_assert(mDZ_packed.shape[1] % (thr_n * vector_size) == 0)
+    misc_utils.static_assert(mFreq.shape[0] == mY.shape[1])
+    tiler_mn, tv_layout = layout_utils.make_layout_tv_from_shape(
+        thread_shape=(thr_m, thr_n),
+        thread_order="row",
+        value_shape=(val_m, vector_size),
+        value_order="row",
+    )
+
+    # ((TileM, TileN), (RestM, RestN))
+    gY_packed = cute.zipped_divide(mY_packed, tiler_mn)
+    num_blocks = gY_packed.shape[1]
+    num_threads = cute.size(tv_layout, mode=[0])
+    misc_utils.static_assert(len(num_blocks) == 2)
+    kernel = rope_bwd_zdz_kernel(
+        mY_packed=mY_packed,
+        mDY_packed=mDY_packed,
+        mDZ_packed=mDZ_packed,
+        mZdZ=mZdZ,
+        mPos=mPos,
+        mFreq=mFreq,
+        scale=scale,
+        dtype=mY.element_type,
+        tiler_mn=tiler_mn,
+        tv_layout=tv_layout,
+        thr_m=thr_m,
+        thr_n=thr_n,
+        val_m=val_m,
+        vector_size=vector_size,
+    )
+    kernel.launch(
+        grid=[*num_blocks, 1],
+        block=[num_threads, 1, 1],
+        cluster=None,
+        smem=None,
+        stream=stream,
+    )
+    return kernel.smem_usage()
+
+
 @jit_cache
 def _compile_rope_bwd_zdz(
     size: int,
