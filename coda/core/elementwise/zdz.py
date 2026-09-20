@@ -1,4 +1,3 @@
-import operator
 import torch
 import cutlass
 import cutlass.cute as cute
@@ -14,6 +13,31 @@ from coda.core.ops import constants
 from coda.core.ops import layout_utils
 from coda.core.ops import memory_utils
 from coda.core.ops import creation_utils
+from coda.core.ops import reduction_utils
+
+
+@cute.kernel
+def rope_bwd_zdz_kernel(
+    mY_packed: cute.Tensor,
+    mDY_packed: cute.Tensor,
+    mDZ_packed: cute.Tensor,
+    mZdZ: cute.Tensor,
+    mPos: cute.Tensor,
+    mFreq: cute.Tensor,
+    scale: cutlass.Constexpr[float],
+    dtype: type[cute.Numeric],
+    tiler_mn: cute.Shape,
+    tv_layout: cute.Layout,
+    thr_m: cutlass.Constexpr[int],
+    thr_n: cutlass.Constexpr[int],
+    val_m: cutlass.Constexpr[int],
+    vector_size: cutlass.Constexpr[int],
+) -> None:
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    allocator = cutlass.utils.SmemAllocator()
+
+    idY = cute.make_identity_tensor(mY_packed.shape)
 
 
 @cute.jit
@@ -53,11 +77,8 @@ def _rope_bwd_zdz(
         value_order="row",
     )
 
-    # ((TileM, TileN), (RestM, RestN))
-    gY_packed = cute.zipped_divide(mY_packed, tiler_mn)
-    num_blocks = gY_packed.shape[1]
+    num_blocks = cute.ceil_div(mY_packed.shape[0], tiler_mn[0])
     num_threads = cute.size(tv_layout, mode=[0])
-    misc_utils.static_assert(len(num_blocks) == 2)
     kernel = rope_bwd_zdz_kernel(
         mY_packed=mY_packed,
         mDY_packed=mDY_packed,
@@ -75,7 +96,7 @@ def _rope_bwd_zdz(
         vector_size=vector_size,
     )
     kernel.launch(
-        grid=[*num_blocks, 1],
+        grid=[num_blocks, 1, 1],
         block=[num_threads, 1, 1],
         cluster=None,
         smem=None,
