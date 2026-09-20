@@ -222,6 +222,19 @@ def recast_tensor(tensor: cute.Tensor, dtype: type[cute.Numeric]) -> cute.Tensor
     src_width = tensor.element_type.width
     dst_width = dtype.width
 
+    # refuse what would round: only the unit-stride dimension may convert its length instead of its stride
+    for length, stride in zip(tensor.shape, tensor.stride):
+        # a length-1 dimension never uses its stride
+        if cutlass.const_expr(cute.is_static(length) and length == 1 and cute.is_static(stride)):
+            continue
+        length_num_bits = cute.get_divisibility(length) * src_width
+        stride_num_bits = cute.get_divisibility(stride) * src_width
+        if cutlass.const_expr(stride_num_bits % dst_width != 0):
+            # a stride that does not convert exactly must be the unit stride
+            static_assert(cute.is_static(stride) and stride == 1)
+            # and its length must convert exactly instead
+            static_assert(length_num_bits % dst_width == 0)
+
     tensor_recast = cute.recast_tensor(tensor, dtype=dtype)
     new_stride = []
     for stride, stride_recast in zip(tensor.stride, tensor_recast.stride):
@@ -231,6 +244,7 @@ def recast_tensor(tensor: cute.Tensor, dtype: type[cute.Numeric]) -> cute.Tensor
         else:
             divisibility = cute.get_divisibility(stride) * src_width // dst_width
             new_stride.append(cute.assume(stride_recast, divby=divisibility))
+
     new_layout = cute.make_layout(
         shape=tensor_recast.shape,
         stride=tuple(new_stride),
