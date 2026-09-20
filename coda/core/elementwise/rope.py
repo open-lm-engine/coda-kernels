@@ -236,10 +236,10 @@ def _qknorm_rope_bwd(
     val_m: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ) -> int:
-    mDX_packed = cute.recast_tensor(mDX, dtype=cute.Int32)
-    mDQ_packed = cute.recast_tensor(mDQ, dtype=cute.Int32)
-    mDK_packed = cute.recast_tensor(mDK, dtype=cute.Int32)
-    mX_packed = cute.recast_tensor(mX, dtype=cute.Int32)
+    mDX_packed = layout_utils.recast_tensor(mDX, dtype=cute.Int32)
+    mDQ_packed = layout_utils.recast_tensor(mDQ, dtype=cute.Int32)
+    mDK_packed = layout_utils.recast_tensor(mDK, dtype=cute.Int32)
+    mX_packed = layout_utils.recast_tensor(mX, dtype=cute.Int32)
     vector_size = cutlass.const_expr(constants.NUM_BITS_PER_COPY // mX_packed.element_type.width)
     num_heads_qk = cutlass.const_expr(num_heads_q + num_heads_k)
     lanes_per_head = cutlass.const_expr(head_dim // (2 * vector_size))
