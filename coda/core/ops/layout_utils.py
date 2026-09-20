@@ -216,17 +216,27 @@ def recast_tensor(tensor: cute.Tensor, dtype: type[cute.Numeric]) -> cute.Tensor
     # `cute.recast_tensor` rounds lengths and strides that do not convert exactly, and drops the divisibility of
     # dynamic strides, which vector copies need to prove their alignment
     # https://github.com/Dao-AILab/quack/blob/v0.6.5/quack/gemm_base.py#L117
+    # a boolean has a width of 1 bit but is stored in 8, so the widths below would be wrong
     static_assert(tensor.element_type is not cute.Boolean)
     static_assert(dtype is not cute.Boolean)
     src_width = tensor.element_type.width
     dst_width = dtype.width
 
+    tensor_recast = cute.recast_tensor(tensor, dtype=dtype)
+    new_stride = []
+    for stride, stride_recast in zip(tensor.stride, tensor_recast.stride):
+        if cutlass.const_expr(cute.is_static(stride)):
+            static_assert(cute.is_static(stride_recast))
+            new_stride.append(stride_recast)
+        else:
+            divisibility = cute.get_divisibility(stride) * src_width // dst_width
+            new_stride.append(cute.assume(stride_recast, divby=divisibility))
     new_layout = cute.make_layout(
-        shape=recast_tensor.shape,
+        shape=tensor_recast.shape,
         stride=tuple(new_stride),
     )
     new_tensor = cute.make_tensor(
-        iterator=recast_tensor.iterator,
+        iterator=tensor_recast.iterator,
         layout=new_layout,
     )
     # the pointer type is signless, so a rebuilt tensor cannot be e.g. Uint32
