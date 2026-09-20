@@ -46,10 +46,14 @@ GEMM_CONFIGS = _extend_configs(GEMM_CONFIGS, lambda config: dataclasses.replace(
 GEMM_CONFIGS = [config for config in GEMM_CONFIGS if _cooperative_compatible(config)]
 
 
+def gated_prune_fn(config: GemmConfig, named_args: dict) -> bool:
+    return config.tile_n % GATED_TILE_N_MULTIPLE_OF == 0
+
+
 def prune_gemm_configs(
     configs: list[AutotuneConfig],
     named_args: dict,
-    tile_n_multiple_of: int | str | None,
+    prune_fn: Callable[[GemmConfig, dict], bool] | None,
     **kwargs,
 ) -> list[AutotuneConfig]:
     configs = prune_invalid_gemm_configs(
@@ -58,13 +62,11 @@ def prune_gemm_configs(
         **kwargs,
     )
     configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
-    # an int, or the name of the op argument that holds it
-    if isinstance(tile_n_multiple_of, str):
-        tile_n_multiple_of = named_args[tile_n_multiple_of]
-    if tile_n_multiple_of is not None:
+    # an op-specific rule over the config and the call's arguments: it returns whether to keep the config
+    if prune_fn is not None:
         configs = [
             conf for conf in configs
-            if conf.kwargs["config"].tile_n % tile_n_multiple_of == 0
+            if prune_fn(conf.kwargs["config"], named_args)
         ]
     return configs
 
@@ -166,14 +168,14 @@ def backend_autotune() -> Callable[[Callable], Autotuner]:
 
 def epilogue_autotune(
     configs: list[GemmConfig] | None = None,
-    tile_n_multiple_of: int | str | None = None,
+    prune_fn: Callable[[GemmConfig, dict], bool] | None = None,
 ) -> Callable[[Callable], Autotuner]:
     if configs is None:
         configs = GEMM_CONFIGS
 
-    prune_fn = functools.partial(
+    _prune_fn = functools.partial(
         prune_gemm_configs,
-        tile_n_multiple_of=tile_n_multiple_of,
+        prune_fn=prune_fn,
     )
 
     def _wrap(fn: Callable) -> Autotuner:
@@ -181,7 +183,7 @@ def epilogue_autotune(
             fn,
             tunable="config",
             configs=[AutotuneConfig(config=c) for c in configs],
-            prune_configs_by={"early_config_prune": prune_fn},
+            prune_configs_by={"early_config_prune": _prune_fn},
             cache_results=AUTOTUNE_CACHE_RESULTS,
         )
 
