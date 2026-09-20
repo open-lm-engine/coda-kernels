@@ -19,24 +19,25 @@ _NUM_ITERATIONS = 30
 _NUM_TRACE_WARMUP = 3
 _NUM_TRACE_ITERATIONS = 5
 
+_MODEL_ARGS = TransformerModelArgs(
+    dim=2048,
+    n_layers=16,
+    n_heads=32,
+    # llama3 1B ships GQA: 32 query heads over 8 KV heads
+    n_kv_heads=8,
+    ffn_dim_multiplier=1.5,
+    multiple_of=1024,
+    rope_theta=500000,
+    max_seq_len=_LENGTH,
+    attn_type="fa3",
+)
+
 
 @torch.no_grad()
-def build(seed: int) -> Transformer:
+def build(name: str, seed: int) -> Transformer:
     torch.manual_seed(seed)
-    model_args = TransformerModelArgs(
-        dim=2048,
-        n_layers=16,
-        n_heads=32,
-        # llama3 1B ships GQA: 32 query heads over 8 KV heads
-        n_kv_heads=8,
-        ffn_dim_multiplier=1.5,
-        multiple_of=1024,
-        rope_theta=500000,
-        max_seq_len=_LENGTH,
-        attn_type="fa3",
-    )
     with torch.device("cuda"):
-        model = Transformer(model_args)
+        model = Transformer(_MODEL_ARGS)
         model.init_weights()
     # parameters only: model.to(bf16) would also cast the complex freqs_cis buffer
     # and silently throw away its imaginary part
@@ -97,6 +98,20 @@ def main() -> None:
     parser.add_argument("--json", type=str, default=None)
     args = parser.parse_args()
 
+    if args.json is not None:
+        assert not os.path.exists(args.json), f"{args.json} exists"
+
+    torch.manual_seed(1)
+    shape = (_BATCH, _LENGTH)
+    vocab_size = _MODEL_ARGS.vocab_size
+    tokens = torch.randint(0, vocab_size, shape, device="cuda")
+    targets = torch.randint(0, vocab_size, shape, device="cuda")
+    positions = None
+    if args.name == "coda":
+        # coda takes int32 targets and explicit positions, both made once outside the timed region
+        targets = targets.to(dtype=torch.int32)
+
+    model = build(name=args.name, seed=0)
     forward_fn = make_forward_fn(
         name=args.name,
         model=model,
@@ -167,6 +182,9 @@ def main() -> None:
         f"loss/tok {record['loss_per_token']:.4f}",
         sep="  ",
     )
+    if args.json is not None:
+        with open(args.json, "x") as handle:
+            handle.write(json.dumps(record) + "\n")
 
 
 if __name__ == "__main__":
