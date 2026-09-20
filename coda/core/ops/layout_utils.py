@@ -212,6 +212,18 @@ def assumed_align_stride(
     )
 
 
+def recast_tensor(tensor: cute.Tensor, dtype: type[cute.Numeric]) -> cute.Tensor:
+    # `cute.recast_tensor` rounds lengths and strides that do not convert exactly, and drops the divisibility of
+    # dynamic strides, which vector copies need to prove their alignment, while integer arithmetic keeps it
+    # https://github.com/Dao-AILab/quack/blob/v0.6.5/quack/gemm_base.py#L117
+    src_width = tensor.element_type.width
+    dst_width = dtype.width
+    new_shape = []
+    new_stride = []
+    for length, stride in zip(tensor.shape, tensor.stride):
+        pass
+
+
 def select_nonzero_stride_modes(
     tensor: cute.Tensor,
     layout_ref: cute.Layout,
