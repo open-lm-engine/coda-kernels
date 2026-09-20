@@ -136,13 +136,14 @@ def qknorm_rope_bwd_kernel(
 
     for row_index in cutlass.range_constexpr(val_m):
         row_coord, col_coord_begin = tXcX_packed[row_index * vector_size]
-        row_in_bound = row_coord < mX_packed.shape[0]
         row_coord_clamped = cutlass.min(row_coord, mX_packed.shape[0] - 1)
-        head_idx = (2 * col_coord_begin) // head_dim
-        # gamma is [gamma_q | gamma_k]
-        gamma_offset = head_dim if head_idx >= num_heads_q else 0
-        rms = cute.math.rsqrt(mHeadMeanSq[row_coord_clamped, head_idx] + eps, fastmath=True)
+        row_in_bound = row_coord < mX_packed.shape[0]
 
+        # gamma is [gamma_q | gamma_k]
+        head_idx = (2 * col_coord_begin) // head_dim
+        gamma_offset = head_dim if head_idx >= num_heads_q else 0
+
+        rms = cute.math.rsqrt(mHeadMeanSq[row_coord_clamped, head_idx] + eps, fastmath=True)
         drms = cute.Float32.zero
         for col_index in cutlass.range_constexpr(vector_size):
             flat_index = row_index * vector_size + col_index
