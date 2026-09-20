@@ -15,7 +15,7 @@ from coda.core.gemm.gemm_interface import (
     backend_autotune,
     epilogue_launch,
     epilogue_autotune,
-    GATED_TILE_N_MULTIPLE_OF,
+    gated_prune_fn,
 )
 
 
@@ -101,7 +101,7 @@ def gemm_scalar_scale(
     mutates_args=("D", "postact"),
 )
 @epilogue_autotune(
-    tile_n_multiple_of=GATED_TILE_N_MULTIPLE_OF,
+    prune_fn=gated_prune_fn,
 )
 def _gemm_swiglu_epi(
     A: torch.Tensor,
@@ -147,7 +147,7 @@ def gemm_swiglu(
     mutates_args=("D", "postact"),
 )
 @epilogue_autotune(
-    tile_n_multiple_of=GATED_TILE_N_MULTIPLE_OF,
+    prune_fn=gated_prune_fn,
 )
 def _gemm_rmsnorm_swiglu_epi(
     A: torch.Tensor,
@@ -908,7 +908,7 @@ def gemm_rmsnorm_rope(
     mutates_args=("D", "head_mean_sq"),
 )
 @epilogue_autotune(
-    tile_n_multiple_of="head_dim",
+    prune_fn=_qknorm_rope_prune_fn,
 )
 def _gemm_qknorm_rope_epi(
     A: torch.Tensor,
@@ -957,8 +957,8 @@ def gemm_qknorm_rope(
     _, N = B.shape
     num_heads = num_heads_q + num_heads_k
     assert N == head_dim * num_heads
-    # the head weight repeated per head, one entry per column
-    assert weight.shape == (N,)
+    # weight is [weight_q | weight_k]; the epilogue broadcasts each half over its heads through a stride-0 view
+    assert weight.shape == (2 * head_dim,)
     assert positions.shape == (M,)
     assert positions.dtype in (torch.float32, torch.int32)
     assert frequencies.shape == (N,)
