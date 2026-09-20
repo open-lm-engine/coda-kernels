@@ -46,6 +46,24 @@ def rope_bwd_zdz_kernel(
         layout_tv=tv_layout,
     )
 
+    rZdZ = creation_utils.allocate_tensor_from_shape(
+        shape=(val_m, 2),
+        order="row",
+        dtype=cute.Float32,
+        memspace="rmem",
+    )
+    rRow = creation_utils.allocate_tensor_from_shape(
+        shape=(val_m,),
+        order="row",
+        dtype=None,
+        memspace="rmem",
+    )
+    rPos = creation_utils.allocate_tensor_from_shape(
+        shape=(val_m,),
+        order="row",
+        dtype=None,
+        memspace="rmem",
+    )
     misc_utils.static_assert(mY_packed.shape[1] % tiler_mn[1] == 0)
     for tile_index in cutlass.range_constexpr(mY_packed.shape[1] // tiler_mn[1]):
         gY_packed = cute.local_tile(mY_packed, tiler_mn, (bidx, tile_index))
@@ -66,6 +84,29 @@ def rope_bwd_zdz_kernel(
             dst="rmem",
             crd=cY_packed,
             shape=mDY_packed.shape,
+            config=config,
+            thread_index=tidx,
+            smem_allocator=allocator,
+        )
+        tYrY_packed = copy_outputs_Y.dst_thread
+        tYrDY_packed = copy_outputs_DY.dst_thread
+        tYcY_packed = copy_outputs_Y.crd_thread
+
+        tYrDZ_packed = creation_utils.allocate_tensor_like(
+            tensor=tYrDY_packed,
+            memspace="rmem",
+            smem_allocator=allocator,
+            dtype=mDZ_packed.element_type,
+        )
+        tYrY = cute.recast_tensor(tYrY_packed, dtype=dtype)
+        tYrDY = cute.recast_tensor(tYrDY_packed, dtype=dtype)
+        tYrDZ = cute.recast_tensor(tYrDZ_packed, dtype=dtype)
+
+        _ = memory_utils.copy(
+            src=tYrDZ_packed,
+            dst=gDZ_packed,
+            crd=tYcY_packed,
+            shape=mDZ_packed.shape,
             config=config,
             thread_index=tidx,
             smem_allocator=allocator,
