@@ -143,7 +143,10 @@ def qknorm_rope_bwd_kernel(
         head_idx = (2 * col_coord_begin) // head_dim
         gamma_offset = head_dim if head_idx >= num_heads_q else 0
 
-        rms = cute.math.rsqrt(mHeadMeanSq[row_coord_clamped, head_idx] + eps, fastmath=True)
+        rms = cute.math.rsqrt(
+            mHeadMeanSq[row_coord_clamped, head_idx] + eps,
+            fastmath=True,
+        )
         drms = cute.Float32.zero
         for col_index in cutlass.range_constexpr(vector_size):
             flat_index = row_index * vector_size + col_index
