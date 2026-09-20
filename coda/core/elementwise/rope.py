@@ -136,6 +136,7 @@ def qknorm_rope_bwd_kernel(
 
     for row_index in cutlass.range_constexpr(val_m):
         row_coord, col_coord_begin = tXcX_packed[row_index * vector_size]
+        # a row past M clamps its reads to the last row and is left out of drms and dgamma
         row_coord_clamped = cutlass.min(row_coord, mX_packed.shape[0] - 1)
         row_in_bound = row_coord < mX_packed.shape[0]
 
