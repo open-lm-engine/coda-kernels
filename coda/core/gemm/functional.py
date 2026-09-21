@@ -911,12 +911,7 @@ def gemm_rmsnorm_rope(
 def _qknorm_rope_prune_fn(config: GemmConfig, named_args: dict) -> bool:
     head_dim = named_args["head_dim"]
     size_q = head_dim * named_args["num_heads_q"]
-    size_k = head_dim * named_args["num_heads_k"]
-    return (
-        (config.tile_n % head_dim == 0) and
-        (size_q % config.tile_n == 0) and
-        (size_k % config.tile_n == 0)
-    )
+    return (config.tile_n % head_dim == 0) and (size_q % config.tile_n == 0)
 
 
 _prune_qknorm_rope_configs = functools.partial(
