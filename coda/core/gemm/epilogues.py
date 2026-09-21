@@ -1,11 +1,12 @@
 import cutlass
 import cutlass.cute as cute
-from quack.activation import dswiglu, swiglu
+from quack.activation import dswiglu, sigmoid, swiglu
 from quack.epilogue.library import _sq_prepass
 from quack.epilogue.rotary import _angle_turns, _sincos_turns
 from quack.epilogue.math import F2, Pair, pack, unpack
 from quack.epilogue.frontend import gemm_epilogue
 from quack.epilogue.ops import (
+    EpiOp,
     Scalar,
     ColVecLoad,
     ColVecReduce,
@@ -28,6 +29,11 @@ def rstd_epi(acc: EpiValue, rstd: EpiValue) -> EpiOut:
 @gemm_epilogue(ops={"alpha": Scalar("alpha")})
 def alpha_epi(acc: EpiValue, alpha: EpiValue) -> EpiOut:
     return {"D": acc * alpha}
+
+
+@gemm_epilogue()
+def sigmoid_epi(acc: EpiValue) -> EpiOut:
+    return {"D": sigmoid(acc)}
 
 
 @gemm_epilogue(outputs=("postact",), mode="acc_pair")
