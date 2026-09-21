@@ -52,12 +52,6 @@ def rope_bwd_zdz_kernel(
         dtype=cute.Float32,
         memspace="rmem",
     )
-    rRow = creation_utils.allocate_tensor_from_shape(
-        shape=(val_m,),
-        order="row",
-        dtype=None,
-        memspace="rmem",
-    )
     rPos = creation_utils.allocate_tensor_from_shape(
         shape=(val_m,),
         order="row",
@@ -124,8 +118,9 @@ def rope_bwd_zdz_kernel(
         smem_allocator=allocator,
         reduction_buffer=None,
     )
+    # the norm's backward wants zdz / hidden, so scale rides the store
     for row_index in cutlass.range_constexpr(val_m):
-        row_coord = rRow[row_index]
+        row_coord, _ = tYcY_packed[row_index * vector_size]
         row_in_bound = row_coord < mY_packed.shape[0]
         if ((tidx % thr_n) == 0) and row_in_bound:
             mZdZ[row_coord] = zdzs_reduced[row_index] * scale
