@@ -46,18 +46,21 @@ def rope_bwd_zdz_kernel(
         layout_tv=tv_layout,
     )
 
+    # the row's running sum of y * dy, in two slots: even tiles add to one, odd tiles to the other
     rZdZ = creation_utils.allocate_tensor_from_shape(
         shape=(val_m, 2),
         order="row",
         dtype=cute.Float32,
         memspace="rmem",
     )
+    rZdZ.fill(value=0.0)
     rPos = creation_utils.allocate_tensor_from_shape(
         shape=(val_m,),
         order="row",
-        dtype=None,
+        dtype=cute.Float32,
         memspace="rmem",
     )
+    # per tile: dz = R^T dy, and the tile's share of sum(y * dy)
     misc_utils.static_assert(mY_packed.shape[1] % tiler_mn[1] == 0)
     for tile_index in cutlass.range_constexpr(misc_utils.ceil_div(mY_packed.shape[1], tiler_mn[1])):
         gY_packed = cute.local_tile(mY_packed, tiler_mn, (bidx, tile_index))
@@ -85,7 +88,12 @@ def rope_bwd_zdz_kernel(
         tYrY_packed = copy_outputs_Y.dst_thread
         tYrDY_packed = copy_outputs_DY.dst_thread
         tYcY_packed = copy_outputs_Y.crd_thread
-
+        if cutlass.const_expr(tile_index == 0):
+            for row_index in cutlass.range_constexpr(val_m):
+                row_coord, _ = tYcY_packed[row_index * vector_size]
+                # a row past M is never stored, but its pos read must stay in bounds
+                row_coord_clamped = cutlass.min(row_coord, mY_packed.shape[0] - 1)
+                rPos[row_index] = mPos[row_coord_clamped].to(dtype=cute.Float32)
         tYrDZ_packed = creation_utils.allocate_tensor_like(
             tensor=tYrDY_packed,
             memspace="rmem",
