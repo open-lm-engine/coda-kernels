@@ -66,7 +66,10 @@ def prune_gemm_configs(
     if prune_fn is not None:
         configs = [
             conf for conf in configs
-            if prune_fn(conf.kwargs["config"], named_args)
+            if prune_fn(
+                conf.kwargs["config"],
+                named_args | kwargs,
+            )
         ]
     return configs
 
