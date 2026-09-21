@@ -64,6 +64,7 @@ def prune_gemm_configs(
     configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
     # an op-specific rule over the config and the call's arguments: it returns whether to keep the config
     if prune_fn is not None:
+        # a positional call names its arguments in named_args, a keyword call leaves them in kwargs
         configs = [
             conf for conf in configs
             if prune_fn(
