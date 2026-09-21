@@ -103,7 +103,22 @@ def rope_bwd_zdz_kernel(
         tYrY = cute.recast_tensor(tYrY_packed, dtype=dtype)
         tYrDY = cute.recast_tensor(tYrDY_packed, dtype=dtype)
         tYrDZ = cute.recast_tensor(tYrDZ_packed, dtype=dtype)
-
+        for row_index in cutlass.range_constexpr(val_m):
+            for col_index in cutlass.range_constexpr(vector_size):
+                flat_index = row_index * vector_size + col_index
+                _, col_coord = tYcY_packed[flat_index]
+                freq_index = 2 * col_coord
+                s, c = math_utils.rope_pos_freq(
+                    pos=rPos[row_index],
+                    freq_hi=mFreq[freq_index].to(dtype=cute.Float32),
+                    freq_lo=mFreq[freq_index + 1].to(dtype=cute.Float32),
+                )
+                dy0 = tYrDY[2 * flat_index].to(dtype=cute.Float32)
+                dy1 = tYrDY[2 * flat_index + 1].to(dtype=cute.Float32)
+                dz0 = dy0 * c + dy1 * s
+                dz1 = dy1 * c - dy0 * s
+                y0 = tYrY[2 * flat_index].to(dtype=cute.Float32)
+                y1 = tYrY[2 * flat_index + 1].to(dtype=cute.Float32)
         _ = memory_utils.copy(
             src=tYrDZ_packed,
             dst=gDZ_packed,
