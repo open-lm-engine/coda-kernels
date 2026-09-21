@@ -2,6 +2,7 @@ import os
 import json
 import torch
 import argparse
+from einops import repeat
 from typing import Callable
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.models.llama3 import Transformer, TransformerModelArgs
@@ -97,7 +98,6 @@ def main() -> None:
     parser.add_argument("--trace", type=str, default=None)
     parser.add_argument("--json", type=str, default=None)
     args = parser.parse_args()
-
     if args.json is not None:
         assert not os.path.exists(args.json), f"{args.json} exists"
 
@@ -110,6 +110,8 @@ def main() -> None:
     if args.name == "coda":
         # coda takes int32 targets and explicit positions, both made once outside the timed region
         targets = targets.to(dtype=torch.int32)
+        positions = torch.arange(_LENGTH, dtype=torch.int32, device="cuda")
+        positions = repeat(positions, "t -> (b t)", b=_BATCH)
 
     model = build(name=args.name, seed=0)
     forward_fn = make_forward_fn(
