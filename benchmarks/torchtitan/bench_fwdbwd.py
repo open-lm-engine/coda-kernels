@@ -111,7 +111,7 @@ def main() -> None:
         # coda takes int32 targets and explicit positions, both made once outside the timed region
         targets = targets.to(dtype=torch.int32)
         positions = torch.arange(_LENGTH, dtype=torch.int32, device="cuda")
-        positions = repeat(positions, "t -> (b t)", b=_BATCH)
+        positions = repeat(positions, "t -> (b t)", b=_BATCH).contiguous()
 
     model = build(name=args.name, seed=0)
     forward_fn = make_forward_fn(
