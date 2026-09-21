@@ -119,6 +119,10 @@ def rope_bwd_zdz_kernel(
                 dz1 = dy1 * c - dy0 * s
                 y0 = tYrY[2 * flat_index].to(dtype=cute.Float32)
                 y1 = tYrY[2 * flat_index + 1].to(dtype=cute.Float32)
+                tYrDZ[2 * flat_index] = dz0.to(dtype=dtype)
+                tYrDZ[2 * flat_index + 1] = dz1.to(dtype=dtype)
+                # rope is orthogonal, so sum(y * dy) == sum(z * dz): the caller keeps only the rotated y
+                rZdZ[row_index, tile_index % 2] = rZdZ[row_index, tile_index % 2] + y0 * dy0 + y1 * dy1
         _ = memory_utils.copy(
             src=tYrDZ_packed,
             dst=gDZ_packed,
