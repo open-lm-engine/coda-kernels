@@ -1,5 +1,7 @@
 import torch
+import functools
 from einops import rearrange
+from quack.autotuner import autotune, AutotuneConfig
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm_config import GemmConfig
 from quack.gemm_interface import gemm as quack_gemm
@@ -10,12 +12,15 @@ from quack.epilogue.rotary import rope_posfreq_epi, rstd_rope_posfreq_epi
 
 from coda.core.gemm import epilogues
 from coda.core.ops import misc_utils
+from coda.core.ops.constants import AUTOTUNE_CACHE_RESULTS
 from coda.core.gemm.gemm_interface import (
+    GEMM_CONFIGS,
     _kernel_op,
     backend_autotune,
     epilogue_launch,
     epilogue_autotune,
     gated_prune_fn,
+    prune_gemm_configs,
 )
 
 
@@ -903,18 +908,29 @@ def gemm_rmsnorm_rope(
     return out
 
 
-@_kernel_op(
-    name="coda::_gemm_qknorm_rope_epi",
-    mutates_args=("D", "head_mean_sq"),
-)
-@epilogue_autotune(
+def _qknorm_rope_prune_fn(config: GemmConfig, named_args: dict) -> bool:
+    pass
+
+
+_prune_qknorm_rope_configs = functools.partial(
+    prune_gemm_configs,
     prune_fn=_qknorm_rope_prune_fn,
 )
-def _gemm_qknorm_rope_epi(
+
+
+@autotune(
+    configs=[AutotuneConfig(config=c) for c in GEMM_CONFIGS],
+    key=["head_dim", "num_heads_q", "num_heads_k"],
+    prune_configs_by={"early_config_prune": _prune_qknorm_rope_configs},
+    cache_results=AUTOTUNE_CACHE_RESULTS,
+)
+def _gemm_qknorm_rope_epi_tuned(
     A: torch.Tensor,
     B: torch.Tensor,
     D: torch.Tensor,
     head_dim: int,
+    num_heads_q: int,
+    num_heads_k: int,
     weight: torch.Tensor,
     eps: float,
     pos: torch.Tensor,
@@ -931,12 +947,46 @@ def _gemm_qknorm_rope_epi(
             # the statistic op only takes the group width: an int, or a tensor whose length it uses
             "qk": head_dim,
             "weight": weight,
+            "num_heads_q": num_heads_q,
+            "num_heads_k": num_heads_k,
             "eps": eps,
             "pos": pos,
             "freq": freq,
             "head_mean_sq_out": head_mean_sq,
         },
         config=config,
+    )
+
+
+@_kernel_op(
+    name="coda::_gemm_qknorm_rope_epi",
+    mutates_args=("D", "head_mean_sq"),
+)
+def _gemm_qknorm_rope_epi(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    D: torch.Tensor,
+    head_dim: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    weight: torch.Tensor,
+    eps: float,
+    pos: torch.Tensor,
+    freq: torch.Tensor,
+    head_mean_sq: torch.Tensor,
+) -> None:
+    return _gemm_qknorm_rope_epi_tuned(
+        A=A,
+        B=B,
+        D=D,
+        head_dim=head_dim,
+        num_heads_q=num_heads_q,
+        num_heads_k=num_heads_k,
+        weight=weight,
+        eps=eps,
+        pos=pos,
+        freq=freq,
+        head_mean_sq=head_mean_sq,
     )
 
 
@@ -957,7 +1007,7 @@ def gemm_qknorm_rope(
     _, N = B.shape
     num_heads = num_heads_q + num_heads_k
     assert N == head_dim * num_heads
-    # weight is [weight_q | weight_k]; the epilogue broadcasts each half over its heads through a stride-0 view
+    # weight is [weight_q | weight_k]
     assert weight.shape == (2 * head_dim,)
     assert positions.shape == (M,)
     assert positions.dtype in (torch.float32, torch.int32)
@@ -972,6 +1022,8 @@ def gemm_qknorm_rope(
         B=B.mT,
         D=out,
         head_dim=head_dim,
+        num_heads_q=num_heads_q,
+        num_heads_k=num_heads_k,
         weight=weight,
         eps=eps,
         pos=positions,
