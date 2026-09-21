@@ -102,6 +102,44 @@ def gemm_scalar_scale(
 
 
 @_kernel_op(
+    name="coda::_gemm_sigmoid_epi",
+    mutates_args=("D",),
+)
+@epilogue_autotune()
+def _gemm_sigmoid_epi(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    D: torch.Tensor,
+    config: GemmConfig,
+) -> None:
+    epilogue_launch(
+        epi_fn=epilogues.sigmoid_epi,
+        A=A,
+        B=B,
+        D=D,
+        epi_args={},
+        config=config,
+    )
+
+
+def gemm_sigmoid(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    M, _ = A.shape
+    _, N = B.shape
+    if out is None:
+        out = torch.empty(M, N, dtype=A.dtype, device=A.device)
+    _gemm_sigmoid_epi(
+        A=A,
+        B=B.mT,
+        D=out,
+    )
+    return out
+
+
+@_kernel_op(
     name="coda::_gemm_swiglu_epi",
     mutates_args=("D", "postact"),
 )
