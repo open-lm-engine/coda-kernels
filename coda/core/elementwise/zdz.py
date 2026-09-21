@@ -46,9 +46,9 @@ def rope_bwd_zdz_kernel(
         layout_tv=tv_layout,
     )
 
-    # the row's running sum of y * dy, in two slots: even tiles add to one, odd tiles to the other
+    # the row's running sum of y * dy
     rZdZ = creation_utils.allocate_tensor_from_shape(
-        shape=(val_m, 2),
+        shape=(val_m,),
         order="row",
         dtype=cute.Float32,
         memspace="rmem",
@@ -122,7 +122,7 @@ def rope_bwd_zdz_kernel(
                 tYrDZ[2 * flat_index] = dz0.to(dtype=dtype)
                 tYrDZ[2 * flat_index + 1] = dz1.to(dtype=dtype)
                 # rope is orthogonal, so sum(y * dy) == sum(z * dz): the caller keeps only the rotated y
-                rZdZ[row_index, tile_index % 2] = rZdZ[row_index, tile_index % 2] + y0 * dy0 + y1 * dy1
+                rZdZ[row_index] = rZdZ[row_index] + y0 * dy0 + y1 * dy1
         _ = memory_utils.copy(
             src=tYrDZ_packed,
             dst=gDZ_packed,
@@ -136,7 +136,7 @@ def rope_bwd_zdz_kernel(
     zdzs = []
     for row_index in cutlass.range_constexpr(val_m):
         zdz = cute.make_rmem_tensor((1,), cute.Float32)
-        zdz[0] = rZdZ[row_index, 0] + rZdZ[row_index, 1]
+        zdz[0] = rZdZ[row_index]
         zdzs.append(zdz.load())
     zdzs_reduced, _ = reduction_utils.reduce(
         zdzs,
