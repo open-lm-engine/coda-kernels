@@ -909,6 +909,8 @@ def gemm_rmsnorm_rope(
 
 
 def _qknorm_rope_prune_fn(config: GemmConfig, named_args: dict) -> bool:
+    # the epilogue picks one head weight per tile: a tile holds whole heads, and never mixes q and k;
+    # k needs no rule, since it ends at the last column, where a tile is only cut short (and predicated)
     head_dim = named_args["head_dim"]
     size_q = head_dim * named_args["num_heads_q"]
     return (config.tile_n % head_dim == 0) and (size_q % config.tile_n == 0)
