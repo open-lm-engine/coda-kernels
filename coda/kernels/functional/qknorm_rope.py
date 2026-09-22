@@ -1,5 +1,9 @@
 import torch
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+from quack.gemm_interface import (
+    gemm as quack_gemm,
+    gemm_add as quack_gemm_add,
+)
 
 from coda.core.elementwise.functional import qknorm_rope_bwd
 from coda.core.gemm.functional import gemm, gemm_qknorm_rope
@@ -37,6 +41,8 @@ class LinearQKNormRope(torch.autograd.Function):
             eps=eps,
         )
         v = gemm(x, weight[size_qk:, :].mT)
+        # q and k are views: the backward takes their gradients apart anyway, so splitting here costs nothing and
+        # saves the concatenation that the caller's own split would need
         q, k = qk.split((size_q, size_qk - size_q), dim=-1)
 
         ctx.head_dim = head_dim
