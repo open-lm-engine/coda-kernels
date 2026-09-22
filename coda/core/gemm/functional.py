@@ -1067,10 +1067,11 @@ def gemm_qknorm_rope(
     assert frequencies.dtype == torch.float32
     if out is None:
         out = torch.empty(M, N, dtype=A.dtype, device=A.device)
+    if preact is None:
+        # the pre-norm activation, one half per lane of the rotation pair: [first lanes | second lanes]
+        preact = torch.empty(M, N, dtype=A.dtype, device=A.device)
     if head_mean_sq is None:
         head_mean_sq = torch.empty(M, num_heads, dtype=torch.float32, device=A.device)
-    if preact is None:
-        preact = torch.empty(M, N, dtype=A.dtype, device=A.device)
     _gemm_qknorm_rope_epi(
         A=A,
         B=B.mT,
