@@ -977,6 +977,8 @@ def _gemm_qknorm_rope_epi_tuned(
     eps: float,
     pos: torch.Tensor,
     freq: torch.Tensor,
+    preact_0: torch.Tensor,
+    preact_1: torch.Tensor,
     head_mean_sq: torch.Tensor,
     config: GemmConfig,
 ) -> None:
@@ -994,6 +996,8 @@ def _gemm_qknorm_rope_epi_tuned(
             "eps": eps,
             "pos": pos,
             "freq": freq,
+            "preact_0": preact_0,
+            "preact_1": preact_1,
             "head_mean_sq_out": head_mean_sq,
         },
         config=config,
@@ -1002,7 +1006,7 @@ def _gemm_qknorm_rope_epi_tuned(
 
 @_kernel_op(
     name="coda::_gemm_qknorm_rope_epi",
-    mutates_args=("D", "head_mean_sq"),
+    mutates_args=("D", "preact_0", "preact_1", "head_mean_sq"),
 )
 def _gemm_qknorm_rope_epi(
     A: torch.Tensor,
@@ -1015,6 +1019,8 @@ def _gemm_qknorm_rope_epi(
     eps: float,
     pos: torch.Tensor,
     freq: torch.Tensor,
+    preact_0: torch.Tensor,
+    preact_1: torch.Tensor,
     head_mean_sq: torch.Tensor,
 ) -> None:
     return _gemm_qknorm_rope_epi_tuned(
@@ -1028,6 +1034,8 @@ def _gemm_qknorm_rope_epi(
         eps=eps,
         pos=pos,
         freq=freq,
+        preact_0=preact_0,
+        preact_1=preact_1,
         head_mean_sq=head_mean_sq,
     )
 
@@ -1043,12 +1051,14 @@ def gemm_qknorm_rope(
     num_heads_k: int,
     eps: float,
     out: torch.Tensor | None = None,
+    preact: torch.Tensor | None = None,
     head_mean_sq: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     M, _ = A.shape
     _, N = B.shape
     num_heads = num_heads_q + num_heads_k
     assert N == head_dim * num_heads
+    assert N % 2 == 0
     # weight is [weight_q | weight_k]
     assert weight.shape == (2 * head_dim,)
     assert positions.shape == (M,)
@@ -1059,6 +1069,8 @@ def gemm_qknorm_rope(
         out = torch.empty(M, N, dtype=A.dtype, device=A.device)
     if head_mean_sq is None:
         head_mean_sq = torch.empty(M, num_heads, dtype=torch.float32, device=A.device)
+    if preact is None:
+        preact = torch.empty(M, N, dtype=A.dtype, device=A.device)
     _gemm_qknorm_rope_epi(
         A=A,
         B=B.mT,
@@ -1070,6 +1082,8 @@ def gemm_qknorm_rope(
         eps=eps,
         pos=positions,
         freq=frequencies,
+        preact_0=preact[:, : N // 2],
+        preact_1=preact[:, N // 2 :],
         head_mean_sq=head_mean_sq,
     )
-    return out, head_mean_sq
+    return out, preact, head_mean_sq
