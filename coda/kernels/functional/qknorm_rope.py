@@ -14,7 +14,7 @@ class LinearQKNormRope(torch.autograd.Function):
         ctx,
         x: torch.Tensor,
         weight: torch.Tensor,
-        weight_norm: torch.Tensor,
+        gamma: torch.Tensor,
         positions: torch.Tensor,
         frequencies: torch.Tensor,
         head_dim: int,
@@ -28,7 +28,7 @@ class LinearQKNormRope(torch.autograd.Function):
         qk, preact, head_mean_sq = gemm_qknorm_rope(
             x,
             weight[:size_qk, :].mT,
-            weight=weight_norm,
+            weight=gamma,
             positions=positions,
             frequencies=frequencies,
             head_dim=head_dim,
@@ -48,7 +48,7 @@ class LinearQKNormRope(torch.autograd.Function):
         ctx.save_for_backward(
             x,
             weight,
-            weight_norm,
+            gamma,
             positions,
             frequencies,
             preact,
@@ -68,19 +68,19 @@ class LinearQKNormRope(torch.autograd.Function):
         (
             x,
             weight,
-            weight_norm,
+            gamma,
             positions,
             frequencies,
             preact,
             head_mean_sq,
         ) = ctx.saved_tensors
         size_qk = preact.shape[1]
-        grad_pre, dweight_norm = qknorm_rope_bwd(
+        grad_pre, dgamma = qknorm_rope_bwd(
             dq=dq,
             dk=dk,
             x=preact,
             head_mean_sq=head_mean_sq,
-            weight=weight_norm,
+            gamma=gamma,
             pos=positions,
             freq=frequencies,
             head_dim=ctx.head_dim,
@@ -98,11 +98,11 @@ class LinearQKNormRope(torch.autograd.Function):
         gemm(grad_pre.mT, x, out=dweight[:size_qk, :])
         gemm(dv.mT, x, out=dweight[size_qk:, :])
 
-        dweight_norm = dweight_norm.to(dtype=weight_norm.dtype)
+        dgamma = dgamma.to(dtype=gamma.dtype)
         return (
             dx,
             dweight,
-            dweight_norm,
+            dgamma,
             None,
             None,
             None,
@@ -115,7 +115,7 @@ class LinearQKNormRope(torch.autograd.Function):
 def linear_qknorm_rope(
     x: torch.Tensor,
     weight: torch.Tensor,
-    weight_norm: torch.Tensor,
+    gamma: torch.Tensor,
     positions: torch.Tensor,
     frequencies: torch.Tensor,
     head_dim: int,
@@ -126,7 +126,7 @@ def linear_qknorm_rope(
     return LinearQKNormRope.apply(
         x,
         weight,
-        weight_norm,
+        gamma,
         positions,
         frequencies,
         head_dim,
