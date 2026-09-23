@@ -4,11 +4,14 @@ from einops import rearrange
 from quack.autotuner import autotune, AutotuneConfig
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm_config import GemmConfig
-from quack.gemm_interface import gemm as quack_gemm
 from quack.cross_entropy import cross_entropy_fwd_out
 from quack.rms_final_reduce import _rms_final_reduce_out
 from quack.epilogue.library import lse_epi, lse_target_epi, rstd_lse_epi
 from quack.epilogue.rotary import rope_posfreq_epi, rstd_rope_posfreq_epi
+from quack.gemm_interface import (
+    gemm as quack_gemm,
+    gemm_add as quack_gemm_add,
+)
 
 from coda.core.gemm import epilogues
 from coda.core.ops import misc_utils
@@ -30,19 +33,23 @@ assert get_device_capacity()[0] == _DEVICE_CAPACITY
 
 @_kernel_op(
     name="coda::_gemm",
-    mutates_args=("out",),
+    mutates_args=("D",),
 )
 @backend_autotune()
 def _gemm(
     A: torch.Tensor,
     B: torch.Tensor,
-    out: torch.Tensor,
+    D: torch.Tensor,
+    C: torch.Tensor | None,
     backend: str,
 ) -> None:
     if backend == "quack":
         # setting `split_k=None` so the autotuner adds split-K candidates
         # only for occupancy-starved shapes (fewer tiles than SMs)
-        quack_gemm(A=A, B=B, out=out, tuned=True, split_k=None)
+        if C is None:
+            quack_gemm(A=A, B=B, out=D, tuned=True, split_k=None)
+        else:
+            quack_gemm_add(A=A, B=B, C=C, out=D, tuned=True, split_k=None)
     else:
         torch.matmul(A, B, out=out)
 
@@ -51,12 +58,13 @@ def gemm(
     A: torch.Tensor,
     B: torch.Tensor,
     out: torch.Tensor | None = None,
+    C: torch.Tensor | None = None,
 ) -> torch.Tensor:
     M, _ = A.shape
     _, N = B.shape
     if out is None:
         out = torch.empty(M, N, dtype=A.dtype, device=A.device)
-    _gemm(A=A, B=B, out=out)
+    _gemm(A=A, B=B, D=out, C=C)
     return out
 
 
