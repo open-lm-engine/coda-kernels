@@ -40,18 +40,14 @@ def _gemm(
     A: torch.Tensor,
     B: torch.Tensor,
     D: torch.Tensor,
-    C: torch.Tensor | None,
     backend: str,
 ) -> None:
     if backend == "quack":
         # setting `split_k=None` so the autotuner adds split-K candidates
         # only for occupancy-starved shapes (fewer tiles than SMs)
-        if C is None:
-            quack_gemm(A=A, B=B, out=D, tuned=True, split_k=None)
-        else:
-            quack_gemm_add(A=A, B=B, C=C, out=D, tuned=True, split_k=None)
+        quack_gemm(A=A, B=B, out=D, tuned=True, split_k=None)
     else:
-        torch.matmul(A, B, out=out)
+        torch.mm(A, B, out_dtype=D.dtype, out=D)
 
 
 def gemm(
