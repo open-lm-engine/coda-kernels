@@ -173,6 +173,7 @@ def backend_autotune() -> Callable[[Callable], Autotuner]:
 def epilogue_autotune(
     configs: list[GemmConfig] | None = None,
     prune_fn: Callable[[GemmConfig, dict], bool] | None = None,
+    restore_value: tuple[str, ...] | None = None,
 ) -> Callable[[Callable], Autotuner]:
     if configs is None:
         configs = GEMM_CONFIGS
@@ -188,6 +189,7 @@ def epilogue_autotune(
             tunable="config",
             configs=[AutotuneConfig(config=c) for c in configs],
             prune_configs_by={"early_config_prune": _prune_fn},
+            restore_value=restore_value,
             cache_results=AUTOTUNE_CACHE_RESULTS,
         )
 
