@@ -9,8 +9,9 @@ from quack.autotuner import autotune, AutotuneConfig
 from coda.core.ops.constants import AUTOTUNE_CACHE_RESULTS, NUM_BITS_PER_COPY
 from coda.core.ops.misc_utils import static_assert, ceil_div
 from coda.core.gemm.gemm_interface import _kernel_op
-from coda.core.elementwise.rope import qknorm_rope_, qknorm_rope_bwd_
+from coda.core.elementwise.rope import qknorm_rope_bwd_
 from coda.core.elementwise.zdz import rope_bwd_zdz_
+from coda.core.elementwise.short_conv import short_conv_fwd_, short_conv_bwd_
 from coda.core.elementwise.cross_entropy import cross_entropy_fwd_bwd_
 from coda.core.elementwise.templates import ElementwiseConfig, _elementwise_op_tuned
 
@@ -90,16 +91,13 @@ def _prune_rope_configs(configs: list[AutotuneConfig], named_args: dict, **kwarg
         if packed_cols % (c.kwargs["config"].thr_n * vector_size) == 0
     ]
 
-    # bwd only (fwd passes no dq)
-    dq = kwargs.get("dq", None)
-    interleaved = kwargs["interleaved"]
-    if dq is not None and not interleaved:
-        assert dq.ndim == 2
-        packed_cols_dq = dq.shape[1] // 2
-        configs_pruned = [
-            c for c in configs_pruned
-            if packed_cols_dq % (c.kwargs["config"].thr_n * vector_size) == 0
-        ]
+    dq = kwargs["dq"]
+    assert dq.ndim == 2
+    packed_cols_dq = dq.shape[1] // 2
+    configs_pruned = [
+        c for c in configs_pruned
+        if packed_cols_dq % (c.kwargs["config"].thr_n * vector_size) == 0
+    ]
 
     return configs_pruned
 
@@ -161,6 +159,8 @@ def dswiglu_backward(
 @autotune(
     configs=[AutotuneConfig(config=c) for c in _CE_ELEMENTWISE_CONFIGS],
     key=["ignore_index"],
+    # the kernel overwrites the logits with their gradient
+    restore_value=("logits",),
     cache_results=AUTOTUNE_CACHE_RESULTS,
 )
 def _cross_entropy_fwd_bwd_tuned(
@@ -249,116 +249,7 @@ def cross_entropy_fwd_bwd(
 
 @autotune(
     configs=[AutotuneConfig(config=c) for c in _ELEMENTWISE_CONFIGS],
-    key=["head_dim", "num_heads_q", "num_heads_k", "num_segments", "eps", "interleaved"],
-    prune_configs_by={"early_config_prune": _prune_rope_configs},
-    cache_results=AUTOTUNE_CACHE_RESULTS,
-)
-def _qknorm_rope_fwd_tuned(
-    x: torch.Tensor,
-    y: torch.Tensor,
-    ssq: torch.Tensor,
-    gamma: torch.Tensor,
-    pos: torch.Tensor,
-    freq: torch.Tensor,
-    head_dim: int,
-    num_heads_q: int,
-    num_heads_k: int,
-    num_segments: int,
-    eps: float,
-    interleaved: bool,
-    config: ElementwiseConfig | None,
-) -> None:
-    if config is None:
-        config = ElementwiseConfig(thr_m=4, thr_n=32, val_m=4)
-
-    qknorm_rope_(
-        x=x,
-        y=y,
-        ssq=ssq,
-        gamma=gamma,
-        pos=pos,
-        freq=freq,
-        head_dim=head_dim,
-        num_heads_q=num_heads_q,
-        num_heads_k=num_heads_k,
-        num_segments=num_segments,
-        eps=eps,
-        interleaved=interleaved,
-        thr_m=config.thr_m,
-        thr_n=config.thr_n,
-        val_m=config.val_m,
-    )
-
-
-@_kernel_op("coda::_qknorm_rope_fwd", mutates_args=("y",))
-def _qknorm_rope_fwd(
-    x: torch.Tensor,
-    y: torch.Tensor,
-    ssq: torch.Tensor,
-    gamma: torch.Tensor,
-    pos: torch.Tensor,
-    freq: torch.Tensor,
-    head_dim: int,
-    num_heads_q: int,
-    num_heads_k: int,
-    num_segments: int,
-    eps: float,
-    interleaved: bool,
-) -> None:
-    _qknorm_rope_fwd_tuned(
-        x=x,
-        y=y,
-        ssq=ssq,
-        gamma=gamma,
-        pos=pos,
-        freq=freq,
-        head_dim=head_dim,
-        num_heads_q=num_heads_q,
-        num_heads_k=num_heads_k,
-        num_segments=num_segments,
-        eps=eps,
-        interleaved=interleaved,
-    )
-
-
-def qknorm_rope_fwd(
-    x: torch.Tensor,
-    ssq: torch.Tensor,
-    gamma: torch.Tensor,
-    pos: torch.Tensor,
-    freq: torch.Tensor,
-    head_dim: int,
-    num_heads_q: int,
-    num_heads_k: int,
-    num_segments: int,
-    eps: float,
-    interleaved: bool,
-    y: torch.Tensor | None = None,
-) -> torch.Tensor:
-    if interleaved:
-        assert (num_heads_q % num_heads_k) == 0
-    if y is None:
-        y = torch.empty_like(x)
-    _qknorm_rope_fwd(
-        x=x,
-        y=y,
-        ssq=ssq,
-        gamma=gamma,
-        pos=pos,
-        freq=freq,
-        head_dim=head_dim,
-        num_heads_q=num_heads_q,
-        num_heads_k=num_heads_k,
-        num_segments=num_segments,
-        eps=eps,
-        interleaved=interleaved,
-    )
-    return y
-
-
-@autotune(
-    configs=[AutotuneConfig(config=c) for c in _ELEMENTWISE_CONFIGS],
-    key=["head_dim", "num_heads_q", "num_heads_k", "num_segments", "eps", "interleaved"],
+    key=["head_dim", "num_heads_q", "num_heads_k", "eps"],
     prune_configs_by={"early_config_prune": _prune_rope_configs},
     cache_results=AUTOTUNE_CACHE_RESULTS,
 )
@@ -366,19 +257,16 @@ def _qknorm_rope_bwd_tuned(
     dx: torch.Tensor,
     dq: torch.Tensor,
     dk: torch.Tensor,
-    dv: torch.Tensor | None,
     dgamma: torch.Tensor,
     x: torch.Tensor,
-    ssq: torch.Tensor,
+    head_mean_sq: torch.Tensor,
     gamma: torch.Tensor,
     pos: torch.Tensor,
     freq: torch.Tensor,
     head_dim: int,
     num_heads_q: int,
     num_heads_k: int,
-    num_segments: int,
     eps: float,
-    interleaved: bool,
     config: ElementwiseConfig | None,
 ) -> None:
     if config is None:
@@ -386,7 +274,6 @@ def _qknorm_rope_bwd_tuned(
 
     tile_m = config.thr_m * config.val_m
     num_m_tiles = ceil_div(x.shape[0], tile_m)
-    num_heads_qk = num_heads_q + num_heads_k
     dgamma_partials = torch.empty(
         num_m_tiles,
         x.shape[1],
@@ -397,63 +284,37 @@ def _qknorm_rope_bwd_tuned(
         dx=dx,
         dq=dq,
         dk=dk,
-        dv=dv,
         dgamma=dgamma_partials,
         x=x,
-        ssq=ssq,
+        head_mean_sq=head_mean_sq,
         gamma=gamma,
         pos=pos,
         freq=freq,
         head_dim=head_dim,
         num_heads_q=num_heads_q,
         num_heads_k=num_heads_k,
-        num_segments=num_segments,
         eps=eps,
-        interleaved=interleaved,
         thr_m=config.thr_m,
         thr_n=config.thr_n,
         val_m=config.val_m,
     )
-    if interleaved:
-        num_groups = num_heads_k
-        num_heads_per_group_q = (num_heads_q // num_heads_k)
-        num_heads_per_group_qkv = num_heads_per_group_q + 2
-        dgamma_partials = rearrange(
-            dgamma_partials,
-            "nt (g h d) -> nt g h d",
-            nt=num_m_tiles,
-            g=num_groups,
-            h=num_heads_per_group_qkv,
-            d=head_dim,
-        )
-        _sum_reduce(
-            partials=dgamma_partials[:, :, :num_heads_per_group_q, :],
-            out=dgamma[:head_dim],
-            dim=(0, 1, 2),
-        )
-        _sum_reduce(
-            partials=dgamma_partials[:, :, num_heads_per_group_q, :],
-            out=dgamma[head_dim:],
-            dim=(0, 1),
-        )
-    else:
-        dgamma_partials = rearrange(
-            dgamma_partials,
-            "nt (h d) -> nt h d",
-            nt=num_m_tiles,
-            h=num_heads_qk,
-            d=head_dim,
-        )
-        _sum_reduce(
-            partials=dgamma_partials[:, :num_heads_q, :],
-            out=dgamma[:head_dim],
-            dim=(0, 1),
-        )
-        _sum_reduce(
-            partials=dgamma_partials[:, num_heads_q:, :],
-            out=dgamma[head_dim:],
-            dim=(0, 1),
-        )
+    dgamma_partials = rearrange(
+        dgamma_partials,
+        "nt (h d) -> nt h d",
+        nt=num_m_tiles,
+        h=num_heads_q + num_heads_k,
+        d=head_dim,
+    )
+    _sum_reduce(
+        partials=dgamma_partials[:, :num_heads_q, :],
+        out=dgamma[:head_dim],
+        dim=(0, 1),
+    )
+    _sum_reduce(
+        partials=dgamma_partials[:, num_heads_q:, :],
+        out=dgamma[head_dim:],
+        dim=(0, 1),
+    )
 
 
 @_kernel_op("coda::_qknorm_rope_bwd", mutates_args=("dx", "dgamma"))
@@ -461,101 +322,71 @@ def _qknorm_rope_bwd(
     dx: torch.Tensor,
     dq: torch.Tensor,
     dk: torch.Tensor,
-    dv: torch.Tensor | None,
     dgamma: torch.Tensor,
     x: torch.Tensor,
-    ssq: torch.Tensor,
+    head_mean_sq: torch.Tensor,
     gamma: torch.Tensor,
     pos: torch.Tensor,
     freq: torch.Tensor,
     head_dim: int,
     num_heads_q: int,
     num_heads_k: int,
-    num_segments: int,
     eps: float,
-    interleaved: bool,
 ) -> None:
     _qknorm_rope_bwd_tuned(
         dx=dx,
         dq=dq,
         dk=dk,
-        dv=dv,
         dgamma=dgamma,
         x=x,
-        ssq=ssq,
+        head_mean_sq=head_mean_sq,
         gamma=gamma,
         pos=pos,
         freq=freq,
         head_dim=head_dim,
         num_heads_q=num_heads_q,
         num_heads_k=num_heads_k,
-        num_segments=num_segments,
         eps=eps,
-        interleaved=interleaved,
     )
 
 
 def qknorm_rope_bwd(
     dq: torch.Tensor,
     dk: torch.Tensor,
-    dv: torch.Tensor,
     x: torch.Tensor,
-    ssq: torch.Tensor,
+    head_mean_sq: torch.Tensor,
     gamma: torch.Tensor,
     pos: torch.Tensor,
     freq: torch.Tensor,
     head_dim: int,
     num_heads_q: int,
     num_heads_k: int,
-    num_segments: int,
     eps: float,
-    interleaved: bool,
     dx: torch.Tensor | None = None,
     dgamma: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if interleaved:
-        assert (num_heads_q % num_heads_k) == 0
-        # x = [q, k, v]
-        if dx is None:
-            dx = torch.empty_like(x)
-        kernel_dx = dx
-        kernel_dv = dv
-    else:
-        # x = [q, k]
-        size_qk = x.shape[1]
-        if dx is None:
-            dx = torch.empty(
-                x.shape[0],
-                size_qk + dv.shape[1],
-                dtype=x.dtype,
-                device=x.device,
-            )
-        dx[:, size_qk:].copy_(dv)
-        kernel_dx = dx[:, :size_qk]
-        kernel_dv = None
+    # x = [q, k]
+    if dx is None:
+        dx = torch.empty_like(x)
     if dgamma is None:
-        dgamma = torch.empty(
-            gamma.shape,
+        dgamma = torch.empty_like(
+            gamma,
             dtype=torch.float32,
-            device=gamma.device,
         )
     _qknorm_rope_bwd(
-        dx=kernel_dx,
+        dx=dx,
         dq=dq,
         dk=dk,
-        dv=kernel_dv,
         dgamma=dgamma,
         x=x,
-        ssq=ssq,
+        head_mean_sq=head_mean_sq,
         gamma=gamma,
         pos=pos,
         freq=freq,
         head_dim=head_dim,
         num_heads_q=num_heads_q,
         num_heads_k=num_heads_k,
-        num_segments=num_segments,
         eps=eps,
-        interleaved=interleaved,
     )
     return dx, dgamma
 
