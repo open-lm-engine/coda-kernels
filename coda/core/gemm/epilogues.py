@@ -1,7 +1,6 @@
 import torch
 import cutlass
 import cutlass.cute as cute
-from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.compile_utils import make_fake_tensor
 from quack.gemm_base import GemmBase
 from quack.gemm_runtime.host import FakeArgCtx
@@ -190,7 +189,9 @@ class ConstInt(EpiOp):
 
 
 class HeadRowVecLoad(RowVecLoad):
-    pass
+    def host_arg_key(self, value: torch.Tensor) -> tuple[type[cute.Numeric], int, int]:
+        assert value.ndim == 1
+        return (*super().host_arg_key(value), value.shape[0])
 
 
 _head_mean_sq_op = HeadMeanSq("qk")
