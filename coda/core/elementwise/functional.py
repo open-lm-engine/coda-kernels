@@ -274,6 +274,7 @@ def _qknorm_rope_bwd_tuned(
 
     tile_m = config.thr_m * config.val_m
     num_m_tiles = ceil_div(x.shape[0], tile_m)
+    num_heads_qk = num_heads_q + num_heads_k
     dgamma_partials = torch.empty(
         num_m_tiles,
         x.shape[1],
@@ -298,11 +299,12 @@ def _qknorm_rope_bwd_tuned(
         thr_n=config.thr_n,
         val_m=config.val_m,
     )
+    # fold the per-column partials into the two head gammas
     dgamma_partials = rearrange(
         dgamma_partials,
         "nt (h d) -> nt h d",
         nt=num_m_tiles,
-        h=num_heads_q + num_heads_k,
+        h=num_heads_qk,
         d=head_dim,
     )
     _sum_reduce(
@@ -369,10 +371,7 @@ def qknorm_rope_bwd(
     if dx is None:
         dx = torch.empty_like(x)
     if dgamma is None:
-        dgamma = torch.empty_like(
-            gamma,
-            dtype=torch.float32,
-        )
+        dgamma = torch.empty_like(gamma, dtype=torch.float32)
     _qknorm_rope_bwd(
         dx=dx,
         dq=dq,
