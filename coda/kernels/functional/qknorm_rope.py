@@ -93,6 +93,7 @@ class LinearQKNormRope(torch.autograd.Function):
         gemm(grad_pre, weight[:size_qk, :], out=partial)
         dx = gemm(dv, weight[size_qk:, :], C=partial)
 
+        # dW = [grad_pre.T @ x ; dv.T @ x]: one GEMM per row block
         dweight = torch.empty_like(weight)
         gemm(grad_pre.mT, x, out=dweight[:size_qk, :])
         gemm(dv.mT, x, out=dweight[size_qk:, :])
