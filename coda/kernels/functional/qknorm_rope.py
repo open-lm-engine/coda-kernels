@@ -1,9 +1,5 @@
 import torch
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
-from quack.gemm_interface import (
-    gemm as quack_gemm,
-    gemm_add as quack_gemm_add,
-)
 
 from coda.core.elementwise.functional import qknorm_rope_bwd
 from coda.core.gemm.functional import gemm, gemm_qknorm_rope
@@ -78,10 +74,10 @@ class LinearQKNormRope(torch.autograd.Function):
             preact,
             head_mean_sq,
         ) = ctx.saved_tensors
+        size_qk = preact.shape[1]
         grad_pre, dweight_norm = qknorm_rope_bwd(
             dq=dq,
             dk=dk,
-            dv=dv,
             x=preact,
             head_mean_sq=head_mean_sq,
             weight=weight_norm,
@@ -92,8 +88,15 @@ class LinearQKNormRope(torch.autograd.Function):
             num_heads_k=ctx.num_heads_k,
             eps=ctx.eps,
         )
-        dx = gemm(grad_pre, weight)
-        dweight = gemm(grad_pre.mT, x)
+
+        partial = torch.empty_like(x, dtype=torch.float32)
+        gemm(grad_pre, weight[:size_qk, :], out=partial)
+        dx = gemm(dv, weight[size_qk:, :], C=partial)
+
+        dweight = torch.empty_like(weight)
+        gemm(grad_pre.mT, x, out=dweight[:size_qk, :])
+        gemm(dv.mT, x, out=dweight[size_qk:, :])
+
         dweight_norm = dweight_norm.to(dtype=weight_norm.dtype)
         return (
             dx,
