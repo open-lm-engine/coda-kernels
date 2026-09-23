@@ -168,7 +168,6 @@ class HeadMeanSq(GroupedColStatsBase):
 
 
 class ConstInt(EpiOp):
-
     def host_arg_key(self, value: int) -> tuple[type, int]:
         assert isinstance(value, int)
         return (int, value)
