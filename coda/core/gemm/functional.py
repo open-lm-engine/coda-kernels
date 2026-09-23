@@ -64,7 +64,7 @@ def gemm(
         _gemm(A=A, B=B, D=out)
     else:
         assert C.shape == (M, N)
-        _gemm_add(A=A, B=B, D=out, C=C)
+        quack_gemm_add(A=A, B=B, out=D, tuned=True, split_k=None)
     return out
 
 
