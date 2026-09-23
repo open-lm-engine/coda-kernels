@@ -1,13 +1,17 @@
+import torch
 import cutlass
 import cutlass.cute as cute
 from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.compile_utils import make_fake_tensor
+from quack.gemm_base import GemmBase
+from quack.gemm_runtime.host import FakeArgCtx
 from quack.activation import dswiglu, sigmoid, swiglu
 from quack.epilogue.library import _sq_prepass
 from quack.epilogue.rotary import _angle_turns, _sincos_turns
 from quack.epilogue.math import F2, Pair, pack, unpack
 from quack.epilogue.frontend import gemm_epilogue
 from quack.epilogue.ops import (
+    EpiContext,
     EpiOp,
     Scalar,
     ColVecLoad,
@@ -164,7 +168,16 @@ class HeadMeanSq(GroupedColStatsBase):
 
 
 class ConstInt(EpiOp):
-    pass
+
+    def host_fake_arg(self, key: tuple[str, type, int], fctx: FakeArgCtx) -> int:
+        _, _, value = key
+        return value
+
+    def param_fields(self) -> list[tuple[str, type, None]]:
+        return [(self.name, object, None)]
+
+    def to_params(self, gemm: GemmBase, args: object) -> dict[str, int]:
+        return {self.name: getattr(args, self.name)}
 
 
 class HeadRowVecLoad(RowVecLoad):
