@@ -605,7 +605,9 @@ def _gemm_residual_partial_rmsnorm_bwd_epi_store(
     name="coda::_gemm_residual_partial_rmsnorm_bwd_epi_accum",
     mutates_args=("D", "dW", "C_out"),
 )
-@epilogue_autotune()
+@epilogue_autotune(
+    restore_value=("D",),
+)
 def _gemm_residual_partial_rmsnorm_bwd_epi_accum(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -977,8 +979,7 @@ def _gemm_qknorm_rope_epi_tuned(
     eps: float,
     pos: torch.Tensor,
     freq: torch.Tensor,
-    preact_0: torch.Tensor,
-    preact_1: torch.Tensor,
+    preact: torch.Tensor,
     head_mean_sq: torch.Tensor,
     config: GemmConfig,
 ) -> None:
@@ -996,8 +997,7 @@ def _gemm_qknorm_rope_epi_tuned(
             "eps": eps,
             "pos": pos,
             "freq": freq,
-            "preact_0": preact_0,
-            "preact_1": preact_1,
+            "preact": preact,
             "head_mean_sq_out": head_mean_sq,
         },
         config=config,
@@ -1006,7 +1006,7 @@ def _gemm_qknorm_rope_epi_tuned(
 
 @_kernel_op(
     name="coda::_gemm_qknorm_rope_epi",
-    mutates_args=("D", "preact_0", "preact_1", "head_mean_sq"),
+    mutates_args=("D", "preact", "head_mean_sq"),
 )
 def _gemm_qknorm_rope_epi(
     A: torch.Tensor,
@@ -1019,8 +1019,7 @@ def _gemm_qknorm_rope_epi(
     eps: float,
     pos: torch.Tensor,
     freq: torch.Tensor,
-    preact_0: torch.Tensor,
-    preact_1: torch.Tensor,
+    preact: torch.Tensor,
     head_mean_sq: torch.Tensor,
 ) -> None:
     return _gemm_qknorm_rope_epi_tuned(
@@ -1034,8 +1033,7 @@ def _gemm_qknorm_rope_epi(
         eps=eps,
         pos=pos,
         freq=freq,
-        preact_0=preact_0,
-        preact_1=preact_1,
+        preact=preact,
         head_mean_sq=head_mean_sq,
     )
 
@@ -1068,7 +1066,6 @@ def gemm_qknorm_rope(
     if out is None:
         out = torch.empty(M, N, dtype=A.dtype, device=A.device)
     if preact is None:
-        # the pre-norm activation, one half per lane of the rotation pair: [first lanes | second lanes]
         preact = torch.empty(M, N, dtype=A.dtype, device=A.device)
     if head_mean_sq is None:
         head_mean_sq = torch.empty(M, num_heads, dtype=torch.float32, device=A.device)
@@ -1083,8 +1080,7 @@ def gemm_qknorm_rope(
         eps=eps,
         pos=positions,
         freq=frequencies,
-        preact_0=preact[:, : N // 2],
-        preact_1=preact[:, N // 2 :],
+        preact=preact,
         head_mean_sq=head_mean_sq,
     )
     return out, preact, head_mean_sq
