@@ -64,7 +64,11 @@ def gemm(
     _, N = B.shape
     if out is None:
         out = torch.empty(M, N, dtype=A.dtype, device=A.device)
-    _gemm(A=A, B=B, D=out, C=C)
+    if C is None:
+        _gemm(A=A, B=B, D=out)
+    else:
+        assert C.shape == (M, N)
+        _gemm_add(A=A, B=B, D=out, C=C)
     return out
 
 
