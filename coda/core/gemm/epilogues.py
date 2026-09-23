@@ -169,9 +169,19 @@ class HeadMeanSq(GroupedColStatsBase):
 
 class ConstInt(EpiOp):
 
-    def host_fake_arg(self, key: tuple[str, type, int], fctx: FakeArgCtx) -> int:
-        _, _, value = key
+    def host_arg_key(self, value: int) -> tuple[type, int]:
+        assert isinstance(value, int)
+        return (int, value)
+
+    def host_fake_arg(self, key: tuple[type, int], fctx: FakeArgCtx) -> int:
+        _, value = key
         return value
+
+    def host_call_arg(self, value: int, key: tuple[type, int]) -> None:
+        return None
+
+    def arg_spec_type(self, const: bool = False) -> object:
+        return cutlass.Constexpr[int]
 
     def param_fields(self) -> list[tuple[str, type, None]]:
         return [(self.name, object, None)]
