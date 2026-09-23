@@ -1,5 +1,7 @@
 import cutlass
 import cutlass.cute as cute
+from quack.cute_dsl_utils import torch2cute_dtype_map
+from quack.compile_utils import make_fake_tensor
 from quack.activation import dswiglu, sigmoid, swiglu
 from quack.epilogue.library import _sq_prepass
 from quack.epilogue.rotary import _angle_turns, _sincos_turns
@@ -14,6 +16,7 @@ from quack.epilogue.ops import (
     RowVecLoad,
     RowVecReduce,
     TileLoad,
+    TileStore,
 )
 
 
@@ -160,20 +163,34 @@ class HeadMeanSq(GroupedColStatsBase):
         return total * cutlass.const_expr(1.0 / group_cols)
 
 
+class ConstInt(EpiOp):
+    pass
+
+
+class HeadRowVecLoad(RowVecLoad):
+    pass
+
+
 _head_mean_sq_op = HeadMeanSq("qk")
 
 
 @gemm_epilogue(
+    # declared as a plain store op, so it keeps the full width: paired mode's default outputs are half width
+    outputs=(TileStore("preact"),),
     ops={
         "qk": _head_mean_sq_op,
-        "weight": RowVecLoad("weight"),
+        "weight": HeadRowVecLoad("weight"),
         "eps": Scalar("eps"),
         "pos": ColVecLoad("pos"),
         "freq": RowVecLoad("freq"),
     },
     prepass=_sq_prepass,
     prepass_outs=("qk",),
-    extra_ops=(_head_mean_sq_op.out("head_mean_sq_out"),),
+    extra_ops=(
+        _head_mean_sq_op.out("head_mean_sq_out"),
+        ConstInt("num_heads_q"),
+        ConstInt("num_heads_k"),
+    ),
     mode="acc_pair",
 )
 def qknorm_rope_epi(acc: EpiValue, qk: EpiValue, weight: EpiValue, eps: EpiValue, pos: EpiValue, freq: EpiValue) -> EpiOut:
@@ -184,4 +201,4 @@ def qknorm_rope_epi(acc: EpiValue, qk: EpiValue, weight: EpiValue, eps: EpiValue
     s, c = _sincos_turns(*_angle_turns(pos, freq))
     x1 = x1 * rstd
     x2 = x2 * rstd
-    return {"D": pack(x1 * c - x2 * s, x1 * s + x2 * c)}
+    return {"D": pack(x1 * c - x2 * s, x1 * s + x2 * c), "preact": acc}
