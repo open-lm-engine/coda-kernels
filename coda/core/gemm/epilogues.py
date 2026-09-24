@@ -191,16 +191,16 @@ class ConstInt(EpiOp):
 class HeadRowVecLoad(RowVecLoad):
     def host_arg_key(self, value: torch.Tensor) -> tuple[type[cute.Numeric], int, int]:
         assert value.ndim == 1
-        return (*super().host_arg_key(value), value.shape[0])
+        return (*super().host_arg_key(value), value.shape[-1])
 
     def host_fake_arg(self, key: tuple[type[cute.Numeric], int, int], fctx: FakeArgCtx) -> cute.Tensor:
-        dtype, ndim, size = key
+        dtype, ndim, vec_dim = key
         assert ndim == 1
-        return make_fake_tensor(dtype, (size,), leading_dim=ndim - 1, divisibility=4)
+        return make_fake_tensor(dtype, (vec_dim,), leading_dim=ndim - 1, divisibility=4)
 
     def to_params(self, gemm: GemmBase, args: object) -> dict[str, cute.Tensor]:
         tensor = getattr(args, self.name)
-        # weight = [ gamma_q (head_dim) | gamma_k (head_dim) ]
+        # the q and k norm weights back to back, (2 * head_dim,)
         assert tensor.shape[0] % 2 == 0
         head_dim = tensor.shape[0] // 2
         layout = cute.make_layout(
