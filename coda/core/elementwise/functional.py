@@ -588,6 +588,23 @@ def _short_conv_fwd(
     )
 
 
+def short_conv_fwd(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    activation: str | None,
+    initial_states: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    _short_conv_fwd(
+        x=x,
+        y=out,
+        state=initial_states,
+        weight=weight,
+        activation=activation,
+    )
+    return out
+
+
 @autotune(
     configs=[AutotuneConfig(config=c) for c in _SHORT_CONV_BWD_CONFIGS],
     key=["activation"],
@@ -669,3 +686,30 @@ def _short_conv_bwd(
         weight=weight,
         activation=activation,
     )
+
+
+def short_conv_bwd(
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    activation: str | None,
+    initial_states: torch.Tensor | None = None,
+    dx: torch.Tensor | None = None,
+    dweight: torch.Tensor | None = None,
+    dinitial_states: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    _short_conv_bwd(
+        dx=dx,
+        dy=dy,
+        dstate=dinitial_states,
+        dweight=dweight,
+        x=x,
+        state=initial_states,
+        weight=weight,
+        activation=activation,
+    )
+    if not has_initial_state:
+        # the kernel always writes a state gradient
+        # for the zero state when none was given
+        dinitial_states = None
+    return dx, dweight, dinitial_states
