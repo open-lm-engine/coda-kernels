@@ -66,7 +66,7 @@ _ZDZ_CONFIGS = tuple(
         (1, 128, 2),
         (2, 128, 2),
         (1, 256, 2),
-        # one column block per thread is fastest
+        # a CTA that covers the whole row is fastest
         *((1, thr_n, 1) for thr_n in range(128, 1024 + 1, 32)),
     )
 )
@@ -82,7 +82,7 @@ class ShortConvConfig(object):
 
 
 # both pools come from a wide sweep: each stays within 1% of the best config on every measured shape
-_SHORT_CONV_CONFIGS = tuple(
+_SHORT_CONV_FWD_CONFIGS = tuple(
     ShortConvConfig(
         thr_m=thr_m,
         thr_n=thr_n,
