@@ -218,8 +218,8 @@ def dswiglu_backward(
 @autotune(
     configs=[AutotuneConfig(config=c) for c in _CE_ELEMENTWISE_CONFIGS],
     key=["ignore_index"],
-    # the kernel overwrites the logits with their gradient
-    restore_value=("logits",),
+    # the kernel overwrites the logits with their gradient; `zdz` may be `lses` itself, and may be None
+    restore_value=("logits", "lses"),
     cache_results=AUTOTUNE_CACHE_RESULTS,
 )
 def _cross_entropy_fwd_bwd_tuned(
@@ -292,6 +292,8 @@ def cross_entropy_fwd_bwd(
     if losses is None:
         # zero-init as the kernel never writes ignored rows' losses
         losses = torch.zeros(logits.shape[0], dtype=torch.float32, device=logits.device)
+    else:
+        losses.zero_()
     if return_zdz and zdz is None:
         # no zero-init: the kernel writes per-tile partials and the reduce overwrites every row
         zdz = torch.empty(logits.shape[0], dtype=torch.float32, device=logits.device)
