@@ -66,8 +66,8 @@ _ZDZ_CONFIGS = tuple(
         (1, 128, 2),
         (2, 128, 2),
         (1, 256, 2),
-        # one column block per thread is the fastest, so offer every width: the pruner keeps the ones that fit
-        *((1, thr_n, 1) for thr_n in range(128, 1025, 32)),
+        # one column block per thread is fastest
+        *((1, thr_n, 1) for thr_n in range(128, 1024 + 1, 32)),
     )
 )
 
