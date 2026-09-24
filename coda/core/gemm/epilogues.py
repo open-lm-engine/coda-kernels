@@ -10,7 +10,6 @@ from quack.epilogue.rotary import _angle_turns, _sincos_turns
 from quack.epilogue.math import F2, Pair, pack, unpack
 from quack.epilogue.frontend import gemm_epilogue
 from quack.epilogue.ops import (
-    EpiContext,
     EpiOp,
     Scalar,
     ColVecLoad,
@@ -202,20 +201,15 @@ class HeadRowVecLoad(RowVecLoad):
         tensor = getattr(args, self.name)
         # the q and k norm weights back to back, (2 * head_dim,)
         assert tensor.shape[0] % 2 == 0
+        # TODO: num_heads_q > num_heads_k works too
+        # the view then runs past N, into columns that are never stored
+        assert args.num_heads_q == args.num_heads_k
         head_dim = tensor.shape[0] // 2
+        num_heads = args.num_heads_q
+        # CuTe uses column major layout
         layout = cute.make_layout(
-            shape=(
-                2,
-                args.num_heads_q,
-                args.num_heads_k,
-                head_dim,
-            ),
-            stride=(
-                head_dim,
-                0,
-                0,
-                1,
-            ),
+            shape=((head_dim, num_heads, 2),),
+            stride=((1, 0, head_dim),),
         )
         return {self.name: cute.make_tensor(iterator=tensor.iterator, layout=layout)}
 
