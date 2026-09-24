@@ -81,6 +81,53 @@ class ShortConvConfig(object):
     raster_order: RasterOrder
 
 
+# both pools come from a wide sweep: each stays within 1% of the best config on every measured shape
+_SHORT_CONV_CONFIGS = tuple(
+    ShortConvConfig(
+        thr_m=thr_m,
+        thr_n=thr_n,
+        val_m=val_m,
+        num_bits_per_copy=num_bits_per_copy,
+        raster_order=raster_order,
+    )
+    for thr_m, thr_n, val_m, num_bits_per_copy, raster_order in (
+        (2, 32, 16, 64, RasterOrder.AlongN),
+        (2, 32, 8, 64, RasterOrder.AlongN),
+        (4, 32, 8, 64, RasterOrder.AlongN),
+        (4, 32, 4, 64, RasterOrder.AlongN),
+        (8, 32, 8, 64, RasterOrder.AlongN),
+        (4, 16, 8, 64, RasterOrder.AlongN),
+        (4, 16, 8, 128, RasterOrder.AlongN),
+        (8, 16, 8, 128, RasterOrder.AlongN),
+        (8, 16, 8, 128, RasterOrder.AlongM),
+        (8, 8, 8, 128, RasterOrder.AlongN),
+    )
+)
+
+
+_SHORT_CONV_BWD_CONFIGS = tuple(
+    ShortConvConfig(
+        thr_m=thr_m,
+        thr_n=thr_n,
+        val_m=val_m,
+        num_bits_per_copy=num_bits_per_copy,
+        raster_order=raster_order,
+    )
+    for thr_m, thr_n, val_m, num_bits_per_copy, raster_order in (
+        (16, 8, 16, 128, RasterOrder.AlongN),
+        (16, 16, 16, 128, RasterOrder.AlongN),
+        (8, 16, 16, 64, RasterOrder.AlongN),
+        (16, 16, 8, 64, RasterOrder.AlongN),
+        (8, 16, 8, 64, RasterOrder.AlongN),
+        (8, 16, 8, 64, RasterOrder.AlongM),
+        (4, 32, 16, 64, RasterOrder.AlongN),
+        (8, 32, 8, 64, RasterOrder.AlongN),
+        (4, 32, 8, 64, RasterOrder.AlongN),
+        (16, 8, 8, 128, RasterOrder.AlongN),
+    )
+)
+
+
 def _sum_reduce(partials: torch.Tensor, out: torch.Tensor, dim: int | tuple[int, ...]) -> None:
     assert out.dtype == partials.dtype
     torch.sum(partials, dim=dim, out=out)
