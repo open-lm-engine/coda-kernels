@@ -481,7 +481,10 @@ def gemm_rmsnorm(
     name="coda::_gemm_residual_partial_rmsnorm_epi",
     mutates_args=("D", "rstd", "O"),
 )
-@epilogue_autotune()
+@epilogue_autotune(
+    # `pre` or `post` may be `C` itself
+    restore_value=("D", "O"),
+)
 def _gemm_residual_partial_rmsnorm_epi(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -560,7 +563,10 @@ def _sum_reduce_compiled(partials: torch.Tensor, out: torch.Tensor, dim: int) ->
     name="coda::_gemm_residual_partial_rmsnorm_bwd_epi_store",
     mutates_args=("D", "dW", "C_out"),
 )
-@epilogue_autotune()
+@epilogue_autotune(
+    # `dX` or `post` may be `pre` itself
+    restore_value=("D", "C_out"),
+)
 def _gemm_residual_partial_rmsnorm_bwd_epi_store(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -614,7 +620,8 @@ def _gemm_residual_partial_rmsnorm_bwd_epi_store(
     mutates_args=("D", "dW", "C_out"),
 )
 @epilogue_autotune(
-    restore_value=("D",),
+    # `dX` is accumulated into, and `post` may be `pre` itself
+    restore_value=("D", "C_out"),
 )
 def _gemm_residual_partial_rmsnorm_bwd_epi_accum(
     A: torch.Tensor,
@@ -728,7 +735,10 @@ def gemm_residual_partial_rmsnorm_bwd(
     name="coda::_gemm_swiglu_bwd_zdz_epi",
     mutates_args=("D", "ZdZ", "dZ"),
 )
-@epilogue_autotune()
+@epilogue_autotune(
+    # `dZ` may be `Z` itself
+    restore_value=("dZ",),
+)
 def _gemm_swiglu_bwd_zdz_epi(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -767,7 +777,10 @@ def _gemm_swiglu_bwd_zdz_epi(
     name="coda::_gemm_swiglu_bwd_zdz_epi_scaled",
     mutates_args=("D", "ZdZ", "dZ"),
 )
-@epilogue_autotune()
+@epilogue_autotune(
+    # `dZ` may be `Z` itself
+    restore_value=("dZ",),
+)
 def _gemm_swiglu_bwd_zdz_epi_scaled(
     A: torch.Tensor,
     B: torch.Tensor,
