@@ -266,6 +266,8 @@ def _elementwise_op(
         )
     ],
     key=["op"],
+    # `Z` may be `X` or `Y` itself
+    restore_value=("Z",),
     cache_results=AUTOTUNE_CACHE_RESULTS,
 )
 def _elementwise_op_tuned(
