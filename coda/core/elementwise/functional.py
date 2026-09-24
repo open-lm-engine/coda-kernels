@@ -538,3 +538,133 @@ def rope_bwd_zdz(
         scale=scale,
     )
     return dz, zdz
+
+
+@autotune(
+    configs=[AutotuneConfig(config=c) for c in _SHORT_CONV_FWD_CONFIGS],
+    key=["activation"],
+    prune_configs_by={"early_config_prune": _prune_short_conv_configs},
+    cache_results=AUTOTUNE_CACHE_RESULTS,
+)
+def _short_conv_fwd_tuned(
+    y: torch.Tensor,
+    x: torch.Tensor,
+    state: torch.Tensor,
+    weight: torch.Tensor,
+    activation: str | None,
+    config: ShortConvConfig | None,
+) -> None:
+    if config is None:
+        config = ShortConvConfig(thr_m=2, thr_n=32, val_m=16, num_bits_per_copy=64, raster_order=RasterOrder.AlongN)
+
+    short_conv_fwd_(
+        y=y,
+        x=x,
+        state=state,
+        weight=weight,
+        activation=activation,
+        thr_m=config.thr_m,
+        thr_n=config.thr_n,
+        val_m=config.val_m,
+        num_bits_per_copy=config.num_bits_per_copy,
+        raster_order=config.raster_order,
+    )
+
+
+@_kernel_op("coda::_short_conv_fwd", mutates_args=("y",))
+def _short_conv_fwd(
+    y: torch.Tensor,
+    x: torch.Tensor,
+    state: torch.Tensor,
+    weight: torch.Tensor,
+    activation: str | None,
+) -> None:
+    _short_conv_fwd_tuned(
+        y=y,
+        x=x,
+        state=state,
+        weight=weight,
+        activation=activation,
+    )
+
+
+@autotune(
+    configs=[AutotuneConfig(config=c) for c in _SHORT_CONV_BWD_CONFIGS],
+    key=["activation"],
+    prune_configs_by={"early_config_prune": _prune_short_conv_configs},
+    cache_results=AUTOTUNE_CACHE_RESULTS,
+)
+def _short_conv_bwd_tuned(
+    dx: torch.Tensor,
+    dweight: torch.Tensor,
+    dstate: torch.Tensor,
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    state: torch.Tensor,
+    weight: torch.Tensor,
+    activation: str | None,
+    config: ShortConvConfig | None,
+) -> None:
+    if config is None:
+        config = ShortConvConfig(thr_m=16, thr_n=8, val_m=16, num_bits_per_copy=128, raster_order=RasterOrder.AlongN)
+
+    width = weight.shape[1]
+    tile_m = config.thr_m * config.val_m
+    # one row of weight-gradient partials per row tile, and one for the head rows
+    num_m_tiles = ceil_div(dx.shape[0] - (width - 1), tile_m) + 1
+    dweight_partials = torch.empty(
+        num_m_tiles,
+        dx.shape[1] * width,
+        dtype=torch.float32,
+        device=dx.device,
+    )
+    short_conv_bwd_(
+        dx=dx,
+        dweight=dweight_partials,
+        dstate=dstate,
+        x=x,
+        dy=dy,
+        state=state,
+        weight=weight,
+        activation=activation,
+        thr_m=config.thr_m,
+        thr_n=config.thr_n,
+        val_m=config.val_m,
+        num_bits_per_copy=config.num_bits_per_copy,
+        raster_order=config.raster_order,
+    )
+    dweight_partials = rearrange(
+        dweight_partials,
+        "nt (d w) -> nt d w",
+        nt=num_m_tiles,
+        d=dx.shape[1],
+        w=width,
+    )
+    _sum_reduce(
+        partials=dweight_partials,
+        out=dweight,
+        dim=0,
+    )
+
+
+@_kernel_op("coda::_short_conv_bwd", mutates_args=("dx", "dweight", "dstate"))
+def _short_conv_bwd(
+    dx: torch.Tensor,
+    dweight: torch.Tensor,
+    dstate: torch.Tensor,
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    state: torch.Tensor,
+    weight: torch.Tensor,
+    activation: str | None,
+) -> None:
+    _short_conv_bwd_tuned(
+        dx=dx,
+        dweight=dweight,
+        dstate=dstate,
+        dy=dy,
+        x=x,
+        state=state,
+        weight=weight,
+        activation=activation,
+    )
