@@ -193,6 +193,11 @@ class HeadRowVecLoad(RowVecLoad):
         assert value.ndim == 1
         return (*super().host_arg_key(value), value.shape[0])
 
+    def host_fake_arg(self, key: tuple[type[cute.Numeric], int, int], fctx: FakeArgCtx) -> cute.Tensor:
+        dtype, ndim, size = key
+        assert ndim == 1
+        return make_fake_tensor(dtype, (size,), leading_dim=ndim - 1, divisibility=4)
+
 
 _head_mean_sq_op = HeadMeanSq("qk")
 
