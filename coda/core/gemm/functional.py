@@ -420,8 +420,10 @@ def gemm_lse_select_logits(
     if losses is None:
         losses = torch.empty(M, dtype=torch.float32, device=A.device)
     if target_logits is None:
-        # zeros: the select never writes the rows whose target is ignored
+        # zero-init as the select never writes the rows whose target is ignored
         target_logits = torch.zeros(M, dtype=torch.float32, device=A.device)
+    else:
+        target_logits.zero_()
     if return_lse:
         lses = torch.empty(M, dtype=torch.float32, device=A.device)
     else:
