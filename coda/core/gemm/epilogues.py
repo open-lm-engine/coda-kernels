@@ -198,6 +198,27 @@ class HeadRowVecLoad(RowVecLoad):
         assert ndim == 1
         return make_fake_tensor(dtype, (size,), leading_dim=ndim - 1, divisibility=4)
 
+    def to_params(self, gemm: GemmBase, args: object) -> dict[str, cute.Tensor]:
+        tensor = getattr(args, self.name)
+        # weight = [ gamma_q (head_dim) | gamma_k (head_dim) ]
+        assert tensor.shape[0] % 2 == 0
+        head_dim = tensor.shape[0] // 2
+        layout = cute.make_layout(
+            shape=(
+                2,
+                args.num_heads_q,
+                args.num_heads_k,
+                head_dim,
+            ),
+            stride=(
+                head_dim,
+                0,
+                0,
+                1,
+            ),
+        )
+        return {self.name: cute.make_tensor(iterator=tensor.iterator, layout=layout)}
+
 
 _head_mean_sq_op = HeadMeanSq("qk")
 
