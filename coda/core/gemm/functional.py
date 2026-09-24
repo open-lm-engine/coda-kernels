@@ -306,7 +306,10 @@ def gemm_lse(
     name="coda::_gemm_rmsnorm_lse_epi",
     mutates_args=("logits", "lses"),
 )
-@epilogue_autotune()
+@epilogue_autotune(
+    # `lses` may be `rstd` itself
+    restore_value=("lses",),
+)
 def _gemm_rmsnorm_lse_epi(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -417,7 +420,8 @@ def gemm_lse_select_logits(
     if losses is None:
         losses = torch.empty(M, dtype=torch.float32, device=A.device)
     if target_logits is None:
-        target_logits = torch.empty(M, dtype=torch.float32, device=A.device)
+        # zeros: the select never writes the rows whose target is ignored
+        target_logits = torch.zeros(M, dtype=torch.float32, device=A.device)
     if return_lse:
         lses = torch.empty(M, dtype=torch.float32, device=A.device)
     else:
@@ -564,8 +568,8 @@ def _sum_reduce_compiled(partials: torch.Tensor, out: torch.Tensor, dim: int) ->
     mutates_args=("D", "dW", "C_out"),
 )
 @epilogue_autotune(
-    # `dX` or `post` may be `pre` itself
-    restore_value=("D", "C_out"),
+    # `post` may be `pre` itself
+    restore_value=("C_out",),
 )
 def _gemm_residual_partial_rmsnorm_bwd_epi_store(
     A: torch.Tensor,
