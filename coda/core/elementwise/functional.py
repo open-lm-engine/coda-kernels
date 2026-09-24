@@ -1,10 +1,12 @@
 import torch
+import dataclasses
 import cutlass
 import cutlass.cute as cute
 
 from einops import rearrange
 from quack.activation import dswiglu
 from quack.autotuner import autotune, AutotuneConfig
+from quack.tile_scheduler import RasterOrder
 
 from coda.core.ops.constants import AUTOTUNE_CACHE_RESULTS, NUM_BITS_PER_COPY
 from coda.core.ops.misc_utils import static_assert, ceil_div
@@ -26,6 +28,7 @@ _ELEMENTWISE_CONFIGS = tuple(
         (4, 32, 4),
         (8, 64, 4),
         (16, 16, 4),
+        (16, 16, 8),
         (1, 128, 4),
         (8, 128, 4),
         (4, 256, 4),
@@ -60,13 +63,22 @@ _ZDZ_CONFIGS = tuple(
         (4, 32, 4),
         (2, 64, 2),
         (4, 64, 2),
-        (1, 128, 1),
         (1, 128, 2),
         (2, 128, 2),
-        (1, 256, 1),
         (1, 256, 2),
+        # one column block per thread is the fastest, so offer every width: the pruner keeps the ones that fit
+        *((1, thr_n, 1) for thr_n in range(128, 1025, 32)),
     )
 )
+
+
+@dataclasses.dataclass(frozen=True)
+class ShortConvConfig(object):
+    thr_m: int
+    thr_n: int
+    val_m: int
+    num_bits_per_copy: int
+    raster_order: RasterOrder
 
 
 def _sum_reduce(partials: torch.Tensor, out: torch.Tensor, dim: int | tuple[int, ...]) -> None:
@@ -250,6 +262,8 @@ def cross_entropy_fwd_bwd(
 @autotune(
     configs=[AutotuneConfig(config=c) for c in _ELEMENTWISE_CONFIGS],
     key=["head_dim", "num_heads_q", "num_heads_k", "eps"],
+    # `dx` may be `x` itself, or the buffer behind `dq` and `dk`
+    restore_value=("dx",),
     prune_configs_by={"early_config_prune": _prune_rope_configs},
     cache_results=AUTOTUNE_CACHE_RESULTS,
 )
@@ -393,6 +407,8 @@ def qknorm_rope_bwd(
 @autotune(
     configs=[AutotuneConfig(config=c) for c in _ZDZ_CONFIGS],
     prune_configs_by={"early_config_prune": _prune_rope_bwd_zdz_configs},
+    # `dz` may be `y` or `dy` itself
+    restore_value=("dz",),
     cache_results=AUTOTUNE_CACHE_RESULTS,
 )
 def _rope_bwd_zdz_tuned(
