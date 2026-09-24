@@ -206,6 +206,9 @@ class HeadRowVecLoad(RowVecLoad):
         assert args.num_heads_q == args.num_heads_k
         head_dim = tensor.shape[0] // 2
         num_heads = args.num_heads_q
+        # a tile must hold whole heads and never mix q and k
+        tile_N = gemm.cta_tile_shape_mnk[1]
+        assert tile_N % head_dim == 0 and (head_dim * num_heads) % tile_N == 0
         # CuTe uses column major layout
         layout = cute.make_layout(
             shape=((head_dim, num_heads, 2),),
