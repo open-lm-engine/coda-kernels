@@ -17,7 +17,6 @@ class LinearSigmoid(torch.autograd.Function):
     ) -> torch.Tensor:
         if out_dtype is None:
             out_dtype = x.dtype
-        # the kernel accumulates in float32 and writes the gate in `out_dtype`
         out = torch.empty(
             x.shape[0],
             weight.shape[0],
@@ -33,7 +32,7 @@ class LinearSigmoid(torch.autograd.Function):
     @autocast_custom_bwd
     def backward(ctx, dout: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None]:
         x, weight, out = ctx.saved_tensors
-        grad_pre = torch.ops.aten.sigmoid_backward(dout, out).to(dtype=x.dtype)
+        grad_pre = torch.ops.aten.sigmoid_backward(grad_output=dout, output=out).to(dtype=x.dtype)
         dx = gemm(grad_pre, weight)
         dweight = gemm(grad_pre.mT, x)
         return dx, dweight, None
