@@ -592,13 +592,13 @@ def short_conv_fwd(
     x: torch.Tensor,
     weight: torch.Tensor,
     activation: str | None,
-    initial_states: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     _short_conv_fwd(
         x=x,
         y=out,
-        state=initial_states,
+        state=initial_state,
         weight=weight,
         activation=activation,
     )
@@ -625,12 +625,13 @@ def _short_conv_bwd_tuned(
     if config is None:
         config = ShortConvConfig(thr_m=16, thr_n=8, val_m=16, num_bits_per_copy=128, raster_order=RasterOrder.AlongN)
 
-    M, N = dx.shape
+    B, M, N = dx.shape
     width = weight.shape[1]
     tile_m = config.thr_m * config.val_m
-    # one row of weight-gradient partials per row tile, and one for the head rows
+    # per sequence, one row of weight-gradient partials per row tile, and one for the head rows
     num_m_tiles = ceil_div(M - (width - 1), tile_m) + 1
     dweight_partials = torch.empty(
+        B,
         num_m_tiles,
         N * width,
         dtype=torch.float32,
@@ -653,7 +654,8 @@ def _short_conv_bwd_tuned(
     )
     dweight_partials = rearrange(
         dweight_partials,
-        "nt (d w) -> nt d w",
+        "b nt (d w) -> (b nt) d w",
+        b=B,
         nt=num_m_tiles,
         d=N,
         w=width,
@@ -693,23 +695,23 @@ def short_conv_bwd(
     x: torch.Tensor,
     weight: torch.Tensor,
     activation: str | None,
-    initial_states: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
     dx: torch.Tensor | None = None,
     dweight: torch.Tensor | None = None,
-    dinitial_states: torch.Tensor | None = None,
+    dinitial_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     _short_conv_bwd(
         dx=dx,
         dy=dy,
-        dstate=dinitial_states,
+        dstate=dinitial_state,
         dweight=dweight,
         x=x,
-        state=initial_states,
+        state=initial_state,
         weight=weight,
         activation=activation,
     )
     if not has_initial_state:
         # the kernel always writes a state gradient
         # for the zero state when none was given
-        dinitial_states = None
-    return dx, dweight, dinitial_states
+        dinitial_state = None
+    return dx, dweight, dinitial_state
