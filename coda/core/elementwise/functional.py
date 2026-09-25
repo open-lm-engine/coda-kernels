@@ -595,6 +595,15 @@ def short_conv_fwd(
     initial_state: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    width = weight.shape[1]
+    assert activation in (None, "silu")
+    assert x.ndim == 3
+    assert weight.ndim == 2
+    assert weight.shape[0] == x.shape[2]
+    assert weight.dtype == x.dtype
+    assert x.shape[1] >= width
+    if out is None:
+        out = torch.empty_like(x)
     _short_conv_fwd(
         x=x,
         y=out,
@@ -700,6 +709,15 @@ def short_conv_bwd(
     dweight: torch.Tensor | None = None,
     dinitial_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    width = weight.shape[1]
+    assert activation in (None, "silu")
+    assert dy.shape == x.shape
+    assert dy.dtype == x.dtype
+    assert x.shape[1] >= 2 * (width - 1)
+    if dx is None:
+        dx = torch.empty_like(x)
+    if dweight is None:
+        dweight = torch.empty_like(weight, dtype=torch.float32)
     _short_conv_bwd(
         dx=dx,
         dy=dy,
@@ -711,7 +729,5 @@ def short_conv_bwd(
         activation=activation,
     )
     if not has_initial_state:
-        # the kernel always writes a state gradient
-        # for the zero state when none was given
         dinitial_state = None
     return dx, dweight, dinitial_state
