@@ -549,7 +549,7 @@ def rope_bwd_zdz(
 def _short_conv_fwd_tuned(
     x: torch.Tensor,
     y: torch.Tensor,
-    state: torch.Tensor,
+    state: torch.Tensor | None,
     weight: torch.Tensor,
     activation: str | None,
     config: ShortConvConfig | None,
@@ -575,7 +575,7 @@ def _short_conv_fwd_tuned(
 def _short_conv_fwd(
     x: torch.Tensor,
     y: torch.Tensor,
-    state: torch.Tensor,
+    state: torch.Tensor | None,
     weight: torch.Tensor,
     activation: str | None,
 ) -> None:
@@ -623,10 +623,10 @@ def short_conv_fwd(
 def _short_conv_bwd_tuned(
     dx: torch.Tensor,
     dy: torch.Tensor,
-    dstate: torch.Tensor,
+    dstate: torch.Tensor | None,
     dweight: torch.Tensor,
     x: torch.Tensor,
-    state: torch.Tensor,
+    state: torch.Tensor | None,
     weight: torch.Tensor,
     activation: str | None,
     config: ShortConvConfig | None,
@@ -680,10 +680,10 @@ def _short_conv_bwd_tuned(
 def _short_conv_bwd(
     dx: torch.Tensor,
     dy: torch.Tensor,
-    dstate: torch.Tensor,
+    dstate: torch.Tensor | None,
     dweight: torch.Tensor,
     x: torch.Tensor,
-    state: torch.Tensor,
+    state: torch.Tensor | None,
     weight: torch.Tensor,
     activation: str | None,
 ) -> None:
@@ -728,6 +728,4 @@ def short_conv_bwd(
         weight=weight,
         activation=activation,
     )
-    if not has_initial_state:
-        dinitial_state = None
     return dx, dweight, dinitial_state
