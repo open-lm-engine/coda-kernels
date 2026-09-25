@@ -13,7 +13,7 @@ from coda.core.ops.misc_utils import static_assert, ceil_div
 from coda.core.gemm.gemm_interface import _kernel_op
 from coda.core.elementwise.rope import qknorm_rope_bwd_
 from coda.core.elementwise.zdz import rope_bwd_zdz_
-from coda.core.elementwise.short_conv import short_conv_fwd_, short_conv_bwd_
+from coda.core.elementwise.short_conv import short_conv_fwd_, short_conv_bwd_, short_conv_dweight_
 from coda.core.elementwise.cross_entropy import cross_entropy_fwd_bwd_
 from coda.core.elementwise.templates import ElementwiseConfig, _elementwise_op_tuned
 
@@ -81,7 +81,6 @@ class ShortConvConfig(object):
     raster_order: RasterOrder
 
 
-# both pools come from a wide sweep: each stays within 1% of the best config on every measured shape
 _SHORT_CONV_FWD_CONFIGS = tuple(
     ShortConvConfig(
         thr_m=thr_m,
@@ -91,16 +90,7 @@ _SHORT_CONV_FWD_CONFIGS = tuple(
         raster_order=raster_order,
     )
     for thr_m, thr_n, val_m, num_bits_per_copy, raster_order in (
-        (2, 32, 16, 64, RasterOrder.AlongN),
-        (2, 32, 8, 64, RasterOrder.AlongN),
-        (4, 32, 8, 64, RasterOrder.AlongN),
-        (4, 32, 4, 64, RasterOrder.AlongN),
-        (8, 32, 8, 64, RasterOrder.AlongN),
-        (4, 16, 8, 64, RasterOrder.AlongN),
-        (4, 16, 8, 128, RasterOrder.AlongN),
-        (8, 16, 8, 128, RasterOrder.AlongN),
-        (8, 16, 8, 128, RasterOrder.AlongM),
-        (8, 8, 8, 128, RasterOrder.AlongN),
+        (8, 16, 8, 64, RasterOrder.AlongN),
     )
 )
 
@@ -114,16 +104,11 @@ _SHORT_CONV_BWD_CONFIGS = tuple(
         raster_order=raster_order,
     )
     for thr_m, thr_n, val_m, num_bits_per_copy, raster_order in (
-        (16, 8, 16, 128, RasterOrder.AlongN),
-        (16, 16, 16, 128, RasterOrder.AlongN),
         (8, 16, 16, 64, RasterOrder.AlongN),
-        (16, 16, 8, 64, RasterOrder.AlongN),
-        (8, 16, 8, 64, RasterOrder.AlongN),
-        (8, 16, 8, 64, RasterOrder.AlongM),
-        (4, 32, 16, 64, RasterOrder.AlongN),
-        (8, 32, 8, 64, RasterOrder.AlongN),
-        (4, 32, 8, 64, RasterOrder.AlongN),
         (16, 8, 8, 128, RasterOrder.AlongN),
+        (16, 16, 8, 64, RasterOrder.AlongN),
+        (16, 16, 16, 64, RasterOrder.AlongN),
+        (32, 16, 16, 64, RasterOrder.AlongN),
     )
 )
 
@@ -555,7 +540,7 @@ def _short_conv_fwd_tuned(
     config: ShortConvConfig | None,
 ) -> None:
     if config is None:
-        config = ShortConvConfig(thr_m=2, thr_n=32, val_m=16, num_bits_per_copy=64, raster_order=RasterOrder.AlongN)
+        config = ShortConvConfig(thr_m=8, thr_n=16, val_m=8, num_bits_per_copy=64, raster_order=RasterOrder.AlongN)
 
     short_conv_fwd_(
         x=x,
@@ -632,7 +617,7 @@ def _short_conv_bwd_tuned(
     config: ShortConvConfig | None,
 ) -> None:
     if config is None:
-        config = ShortConvConfig(thr_m=16, thr_n=8, val_m=16, num_bits_per_copy=128, raster_order=RasterOrder.AlongN)
+        config = ShortConvConfig(thr_m=8, thr_n=16, val_m=16, num_bits_per_copy=64, raster_order=RasterOrder.AlongN)
 
     B, M, N = dx.shape
     width = weight.shape[1]
@@ -661,18 +646,9 @@ def _short_conv_bwd_tuned(
         num_bits_per_copy=config.num_bits_per_copy,
         raster_order=config.raster_order,
     )
-    dweight_partials = rearrange(
-        dweight_partials,
-        "b nt (d w) -> (b nt) d w",
-        b=B,
-        nt=num_m_tiles,
-        d=N,
-        w=width,
-    )
-    _sum_reduce(
+    short_conv_dweight_(
+        dweight=dweight,
         partials=dweight_partials,
-        out=dweight,
-        dim=0,
     )
 
 
@@ -717,7 +693,9 @@ def short_conv_bwd(
     if dx is None:
         dx = torch.empty_like(x)
     if dweight is None:
-        dweight = torch.empty_like(weight, dtype=torch.float32)
+        dweight = torch.empty_like(weight)
+    if initial_state is not None and dinitial_state is None:
+        dinitial_state = torch.empty_like(initial_state)
     _short_conv_bwd(
         dx=dx,
         dy=dy,
