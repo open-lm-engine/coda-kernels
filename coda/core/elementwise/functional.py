@@ -159,6 +159,24 @@ def _prune_rope_bwd_zdz_configs(configs: list[AutotuneConfig], named_args: dict,
     ]
 
 
+def _prune_short_conv_configs(configs: list[AutotuneConfig], named_args: dict, **kwargs) -> list[AutotuneConfig]:
+    kwargs = named_args | kwargs
+    x = kwargs["x"]
+    weight = kwargs["weight"]
+    assert x.ndim == 3
+    assert weight.ndim == 2
+    size = x.shape[2]
+    width = weight.shape[1]
+    dtype_width = x.element_size() * 8
+    return [
+        c for c in configs
+        # dim splits into whole column tiles, each thr_n vector copies wide
+        if size % (c.kwargs["config"].thr_n * (c.kwargs["config"].num_bits_per_copy // dtype_width)) == 0 and
+        # a thread's own rows plus the shifted copy must cover every tap
+        c.kwargs["config"].val_m >= width - 1
+    ]
+
+
 @cute.jit
 def _dswiglu_op(tX: cute.Tensor, tY: cute.Tensor, tZ: cute.Tensor) -> None:
     static_assert(tX.dtype == cute.Int32)
