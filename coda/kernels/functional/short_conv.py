@@ -42,7 +42,6 @@ class ShortConv(torch.autograd.Function):
             activation=ctx.activation,
             initial_state=initial_state,
         )
-        dweight = dweight.to(dtype=weight.dtype)
         return dx, dweight, None, dinitial_state
 
 
