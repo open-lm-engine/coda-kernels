@@ -170,7 +170,7 @@ def _prune_short_conv_configs(configs: list[AutotuneConfig], named_args: dict, *
     dtype_width = x.element_size() * 8
     return [
         c for c in configs
-        # dim splits into whole column tiles, each thr_n vector copies wide
+        # size splits into whole column tiles, each thr_n vector copies wide
         if size % (c.kwargs["config"].thr_n * (c.kwargs["config"].num_bits_per_copy // dtype_width)) == 0 and
         # a thread's own rows plus the shifted copy must cover every tap
         c.kwargs["config"].val_m >= width - 1
