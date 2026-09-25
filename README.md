@@ -37,6 +37,7 @@ pip install -e .
 ## Functional API
 
 - [`linear_swiglu`](coda/kernels/functional/swiglu.py)
+- [`linear_sigmoid`](coda/kernels/functional/sigmoid.py)
 - [`linear_cross_entropy`](coda/kernels/functional/cross_entropy.py)
 - [`linear_cross_entropy_forward`](coda/kernels/functional/cross_entropy.py)
 - [`linear_qknorm_rope`](coda/kernels/functional/qknorm_rope.py)
