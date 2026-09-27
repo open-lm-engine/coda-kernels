@@ -221,8 +221,8 @@ _head_mean_sq_op = HeadMeanSq("qk")
 
 
 @gemm_epilogue(
-    # declared as a plain store op, so it keeps the full width: paired mode's default outputs are half width
-    outputs=(TileStore("preact"),),
+    # gated=False keeps the full width: paired mode's default outputs are half width
+    outputs=(TileStore("preact", gated=False),),
     ops={
         "qk": _head_mean_sq_op,
         "weight": HeadRowVecLoad("weight"),
