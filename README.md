@@ -16,13 +16,16 @@
 
 
 ## Updates
+- September 28, 2026. Released `v0.3.0`.
 - July 19, 2026. Released `v0.2`.
 - June 23, 2026. We are restructuring CODA. For legacy version, please check `v0.1` tag.
 
 ## Installation
 
+> **Note:** the `coda-kernels` package on PyPI is deprecated and no longer updated. Install from GitHub instead.
+
 ```bash
-pip install coda-kernels
+pip install git+https://github.com/open-lm-engine/coda-kernels.git@v0.3.0
 ```
 
 Or from source:
@@ -32,6 +35,8 @@ git clone https://github.com/open-lm-engine/coda-kernels.git
 cd coda-kernels
 pip install -e .
 ```
+
+CODA depends on a [fork of quack](https://github.com/HanGuo97/quack) pinned to a commit. If `quack-kernels` 0.6.5 is already installed from PyPI, pip keeps it because the versions match: run `pip uninstall quack-kernels` first, or install with `uv pip install`, which replaces it.
 
 
 ## Functional API
