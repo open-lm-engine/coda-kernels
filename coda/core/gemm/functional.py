@@ -69,65 +69,6 @@ def gemm(
 
 
 @_kernel_op(
-    name="coda::_gemm_add_dual_precision_epi",
-    mutates_args=("D", "auxiliary"),
-)
-@epilogue_autotune()
-def _gemm_add_dual_precision_epi(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    D: torch.Tensor,
-    auxiliary: torch.Tensor,
-    alpha: float,
-    beta: float,
-    config: GemmConfig,
-) -> None:
-    epilogue_launch(
-        epi_fn=epilogues.add_dual_precision_epi,
-        A=A,
-        B=B,
-        D=D,
-        C=C,
-        epi_args={
-            "alpha": alpha,
-            "beta": beta,
-            "auxiliary": auxiliary,
-        },
-        config=config,
-    )
-
-
-def gemm_add_dual_precision(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    alpha: float = 1.0,
-    beta: float = 1.0,
-    out: torch.Tensor | None = None,
-    out_auxiliary: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    M, _ = A.shape
-    _, N = B.shape
-    if out is None:
-        out = torch.empty(M, N, dtype=C.dtype, device=A.device)
-    else:
-        assert out.dtype == C.dtype
-    if out_auxiliary is None:
-        out_auxiliary = torch.empty(M, N, dtype=A.dtype, device=A.device)
-    _gemm_add_dual_precision_epi(
-        A=A,
-        B=B.mT,
-        C=C,
-        D=out,
-        auxiliary=out_auxiliary,
-        alpha=alpha,
-        beta=beta,
-    )
-    return out, out_auxiliary
-
-
-@_kernel_op(
     name="coda::_gemm_scalar_scale_epi",
     mutates_args=("D",),
 )
@@ -166,6 +107,64 @@ def gemm_scalar_scale(
         alpha=alpha,
     )
     return out
+
+
+@_kernel_op(
+    name="coda::_gemm_add_dual_precision_epi",
+    mutates_args=("D", "auxiliary"),
+)
+@epilogue_autotune(
+    # `D` may be `C` itself (in place)
+    restore_value=("D",),
+)
+def _gemm_add_dual_precision_epi(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    auxiliary: torch.Tensor,
+    C_scale: float,
+    config: GemmConfig,
+) -> None:
+    epilogue_launch(
+        epi_fn=epilogues.add_dual_precision_epi,
+        A=A,
+        B=B,
+        D=D,
+        C=C,
+        epi_args={
+            "C_scale": C_scale,
+            "auxiliary": auxiliary,
+        },
+        config=config,
+    )
+
+
+def gemm_add_dual_precision(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    C_scale: float = 1.0,
+    out: torch.Tensor | None = None,
+    out_auxiliary: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    M, _ = A.shape
+    _, N = B.shape
+    if out is None:
+        out = torch.empty(M, N, dtype=C.dtype, device=A.device)
+    else:
+        assert out.dtype == C.dtype
+    if out_auxiliary is None:
+        out_auxiliary = torch.empty(M, N, dtype=A.dtype, device=A.device)
+    _gemm_add_dual_precision_epi(
+        A=A,
+        B=B.mT,
+        C=C,
+        D=out,
+        auxiliary=out_auxiliary,
+        C_scale=C_scale,
+    )
+    return out, out_auxiliary
 
 
 @_kernel_op(
