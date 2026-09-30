@@ -81,6 +81,18 @@ def residual_sqsum_scaled_epi(acc: EpiValue, c: EpiValue, weight: EpiValue) -> E
 
 
 @gemm_epilogue(
+    outputs=("auxiliary",),
+    ops={
+        "alpha": Scalar("alpha"),
+        "beta": Scalar("beta"),
+    },
+)
+def add_dual_precision_epi(acc: EpiValue, c: EpiValue, alpha: EpiValue, beta: EpiValue) -> EpiOut:
+    y = acc * alpha + c * beta
+    return {"D": y, "auxiliary": y}
+
+
+@gemm_epilogue(
     ops={
         "pos": ColVecLoad("pos"),
         "freq": RowVecLoad("freq"),
