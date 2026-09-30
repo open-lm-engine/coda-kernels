@@ -148,14 +148,20 @@ def gemm_add_dual_precision(
     out: torch.Tensor | None = None,
     out_auxiliary: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    M, _ = A.shape
-    _, N = B.shape
+    if A.ndim == 2:
+        M, _ = A.shape
+        _, N = B.shape
+        shape = (M, N)
+    else:
+        L, M, _ = A.shape
+        _, _, N = B.shape
+        shape = (L, M, N)
     if out is None:
-        out = torch.empty(M, N, dtype=C.dtype, device=A.device)
+        out = torch.empty(shape, dtype=C.dtype, device=A.device)
     else:
         assert out.dtype == C.dtype
     if out_auxiliary is None:
-        out_auxiliary = torch.empty(M, N, dtype=A.dtype, device=A.device)
+        out_auxiliary = torch.empty(shape, dtype=A.dtype, device=A.device)
     _gemm_add_dual_precision_epi(
         A=A,
         B=B.mT,
