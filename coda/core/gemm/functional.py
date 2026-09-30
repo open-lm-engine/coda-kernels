@@ -11,6 +11,7 @@ from quack.epilogue.rotary import rope_posfreq_epi, rstd_rope_posfreq_epi
 from quack.gemm_interface import (
     gemm as quack_gemm,
     gemm_add as quack_gemm_add,
+    gemm_symmetric as quack_gemm_symmetric,
 )
 
 from coda.core.gemm import epilogues
@@ -66,6 +67,27 @@ def gemm(
         assert C.shape == (M, N)
         quack_gemm_add(A=A, B=B, C=C, out=out, tuned=True, split_k=None)
     return out
+
+
+def gemm_symmetric(
+    A: torch.Tensor,
+    C: torch.Tensor | None = None,
+    D_scale: float = 1.0,
+    C_scale: float = 1.0,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    # D_scale * A A^T + C_scale * C
+    # one triangle is computed and mirrored, so `C` must be symmetric
+    # quack's public API runs one fixed config; the low-level
+    # `quack.gemm_symmetric` with tuned configs (square cluster tiles) would be faster
+    return quack_gemm_symmetric(
+        A=A,
+        B=A.mT,
+        C=C,
+        out=out,
+        alpha=D_scale,
+        beta=C_scale,
+    )
 
 
 @_kernel_op(
