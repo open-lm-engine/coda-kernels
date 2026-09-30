@@ -71,18 +71,19 @@ def gemm(
 
 def gemm_symmetric(
     A: torch.Tensor,
+    B: torch.Tensor | None = None,
     C: torch.Tensor | None = None,
     D_scale: float = 1.0,
     C_scale: float = 1.0,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    # D_scale * A A^T + C_scale * C
-    # one triangle is computed and mirrored, so `C` must be symmetric
-    # quack's public API runs one fixed config; the low-level
-    # `quack.gemm_symmetric` with tuned configs (square cluster tiles) would be faster
+    # D_scale * A B + C_scale * C, B = A^T by default; A B and `C` must be symmetric
+    # tuned configs via the low-level `quack.gemm_symmetric` would beat the public API's fixed one
+    if B is None:
+        B = A.mT
     return quack_gemm_symmetric(
         A=A,
-        B=A.mT,
+        B=B,
         C=C,
         out=out,
         alpha=D_scale,
