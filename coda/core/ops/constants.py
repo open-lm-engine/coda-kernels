@@ -8,6 +8,3 @@ ALLOW_INPLACE_GRAD_OUTPUT = os.environ.get("CODA_ALLOW_INPLACE_GRAD_OUTPUT", "1"
 
 # off by default: the autotune key carries no GPU identity
 AUTOTUNE_CACHE_RESULTS = os.environ.get("CODA_AUTOTUNE_CACHE", "0") == "1"
-
-# error on any autotuning: picks must come from a warm-up run's cache
-STRICT_AUTOTUNE = os.environ.get("CODA_STRICT_AUTOTUNE", "0") == "1"
