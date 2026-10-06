@@ -265,13 +265,14 @@ def _elementwise_op(
             (8, 128, 2),
         )
     ],
-    key=["op"],
+    key=["op_name"],
     # `Z` may be `X` or `Y` itself
     restore_value=("Z",),
     cache_results=AUTOTUNE_CACHE_RESULTS,
 )
-def _elementwise_op_tuned(
+def _elementwise_op_tuned_by_name(
     op: Callable,
+    op_name: str,
     X: torch.Tensor,
     Y: torch.Tensor,
     Z: torch.Tensor,
@@ -288,4 +289,19 @@ def _elementwise_op_tuned(
         thr_m=config.thr_m,
         thr_n=config.thr_n,
         val_m=config.val_m,
+    )
+
+
+def _elementwise_op_tuned(
+    op: Callable,
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    Z: torch.Tensor,
+) -> None:
+    _elementwise_op_tuned_by_name(
+        op=op,
+        op_name=f"{op.__module__}.{op.__qualname__}",
+        X=X,
+        Y=Y,
+        Z=Z,
     )
