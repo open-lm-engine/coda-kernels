@@ -265,6 +265,7 @@ def _elementwise_op(
             (8, 128, 2),
         )
     ],
+    # keyed on the op's name, not the op: str() of a function holds its address, so the on-disk cache never hits
     key=["op_name"],
     # `Z` may be `X` or `Y` itself
     restore_value=("Z",),
