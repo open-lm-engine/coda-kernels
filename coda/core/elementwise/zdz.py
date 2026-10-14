@@ -529,8 +529,8 @@ def qknorm_rope_bwd_zdz_kernel(
                     # dn = R^T dy is the gradient of the qk-norm output n = gamma * z * rms
                     dn0 = dy0 * c + dy1 * s
                     dn1 = dy1 * c - dy0 * s
-                    z0 = tDYrZ[2 * flat_index].to(dtype=cute.Float32) * rRstd[row_index]
-                    z1 = tDYrZ[2 * flat_index + 1].to(dtype=cute.Float32) * rRstd[row_index]
+                    z0 = tDYrPreact[2 * flat_index].to(dtype=cute.Float32) * rRstd[row_index]
+                    z1 = tDYrPreact[2 * flat_index + 1].to(dtype=cute.Float32) * rRstd[row_index]
                     g0 = rGamma[2 * col_index]
                     g1 = rGamma[2 * col_index + 1]
                     rDN[2 * col_index] = dn0
@@ -554,8 +554,8 @@ def qknorm_rope_bwd_zdz_kernel(
                     g1 = rGamma[2 * col_index + 1]
                     dn0 = rDN[2 * col_index]
                     dn1 = rDN[2 * col_index + 1]
-                    z0 = tDYrZ[2 * flat_index].to(dtype=cute.Float32) * rRstd[row_index]
-                    z1 = tDYrZ[2 * flat_index + 1].to(dtype=cute.Float32) * rRstd[row_index]
+                    z0 = tDYrPreact[2 * flat_index].to(dtype=cute.Float32) * rRstd[row_index]
+                    z1 = tDYrPreact[2 * flat_index + 1].to(dtype=cute.Float32) * rRstd[row_index]
                     tDYrDZ[2 * flat_index] = (rms * g0 * dn0 + z0 * dssq2).to(dtype=tDYrDZ.element_type)
                     tDYrDZ[2 * flat_index + 1] = (rms * g1 * dn1 + z1 * dssq2).to(dtype=tDYrDZ.element_type)
 
