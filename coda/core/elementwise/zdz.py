@@ -563,6 +563,33 @@ def qknorm_rope_bwd_zdz_kernel(
                         rDGamma[2 * col_index] = rDGamma[2 * col_index] + dn0 * z0 * rms
                         rDGamma[2 * col_index + 1] = rDGamma[2 * col_index + 1] + dn1 * z1 * rms
 
+        else:
+            gV_packed = cute.local_tile(mV_packed, tiler_mn, (bidx, tile_index - num_tiles_qk))
+            copy_outputs_V = memory_utils.copy(
+                src=gV_packed,
+                dst="rmem",
+                crd=cDY_packed,
+                shape=mDY_packed.shape,
+                config=config,
+                thread_index=tidx,
+                smem_allocator=allocator,
+            )
+            tDYrV_packed = copy_outputs_V.dst_thread
+            tDYrV = cute.recast_tensor(tDYrV_packed, dtype=dtype)
+            if cutlass.const_expr(mDV_packed is not None):
+                gDV_packed = cute.local_tile(mDV_packed, tiler_mn, (bidx, tile_index - num_tiles_qk))
+                copy_outputs_DV = memory_utils.copy(
+                    src=gDV_packed,
+                    dst="rmem",
+                    crd=cDY_packed,
+                    shape=mDY_packed.shape,
+                    config=config,
+                    thread_index=tidx,
+                    smem_allocator=allocator,
+                )
+                tDYrDV_packed = copy_outputs_DV.dst_thread
+                tDYrDV = cute.recast_tensor(tDYrDV_packed, dtype=dtype)
+
         _ = memory_utils.copy(
             src=tDYrDZ_packed,
             dst=gDZ_packed,
