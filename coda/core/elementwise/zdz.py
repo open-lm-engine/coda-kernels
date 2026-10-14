@@ -384,6 +384,12 @@ def qknorm_rope_bwd_zdz_kernel(
         layout_tv=tv_layout,
     )
 
+    rDN = creation_utils.allocate_tensor_from_shape(
+        shape=(2 * vector_size,),
+        order="row",
+        dtype=cute.Float32,
+        memspace="rmem",
+    )
     # the row's running sum of z * dz
     rZdZ = creation_utils.allocate_tensor_from_shape(
         shape=(val_m,),
@@ -391,6 +397,7 @@ def qknorm_rope_bwd_zdz_kernel(
         dtype=cute.Float32,
         memspace="rmem",
     )
+    # a lane sits at the same offset within every head it visits, so its gamma and dgamma are tile-invariant
     rDGammaQ = creation_utils.allocate_tensor_from_shape(
         shape=(2 * vector_size,),
         order="row",
@@ -403,9 +410,6 @@ def qknorm_rope_bwd_zdz_kernel(
         dtype=cute.Float32,
         memspace="rmem",
     )
-    rZdZ.fill(value=0.0)
-    rDGammaQ.fill(value=0.0)
-    rDGammaK.fill(value=0.0)
     # preact is the raw accumulator: z = rstd * preact, with rstd the input norm's row scale
     rRstd = creation_utils.allocate_tensor_from_shape(
         shape=(val_m,),
@@ -413,7 +417,6 @@ def qknorm_rope_bwd_zdz_kernel(
         dtype=cute.Float32,
         memspace="rmem",
     )
-    # a lane sits at the same offset within every head it visits, so its gamma and dgamma are tile-invariant
     rGammaQ = creation_utils.allocate_tensor_from_shape(
         shape=(2 * vector_size,),
         order="row",
@@ -432,12 +435,9 @@ def qknorm_rope_bwd_zdz_kernel(
         dtype=cute.Float32,
         memspace="rmem",
     )
-    rDN = creation_utils.allocate_tensor_from_shape(
-        shape=(2 * vector_size,),
-        order="row",
-        dtype=cute.Float32,
-        memspace="rmem",
-    )
+    rZdZ.fill(value=0.0)
+    rDGammaQ.fill(value=0.0)
+    rDGammaK.fill(value=0.0)
 
     # tiles never straddle the [Q | K | V] regions, so each tile's region is static
     misc_utils.static_assert(mDY_packed.shape[1] % tiler_mn[1] == 0)
@@ -456,11 +456,11 @@ def qknorm_rope_bwd_zdz_kernel(
         )
         tDYrDY_packed = copy_outputs_DY.dst_thread
         tDYcDY_packed = copy_outputs_DY.crd_thread
-        # pos, rstd and gamma don't change across tiles: load them once
+        # rstd, gamma and pos don't change across tiles: load them once
         if cutlass.const_expr(tile_index == 0):
             for row_index in cutlass.range_constexpr(val_m):
                 row_coord, _ = tDYcDY_packed[row_index * vector_size]
-                # a row past M is never stored, but its pos and rstd reads must stay in bounds
+                # a row past M is never stored, but its rstd and pos reads must stay in bounds
                 row_coord_clamped = cutlass.min(row_coord, mDY_packed.shape[0] - 1)
                 rRstd[row_index] = mRstd[row_coord_clamped].to(dtype=cute.Float32)
                 rPos[row_index] = mPos[row_coord_clamped].to(dtype=cute.Float32)
