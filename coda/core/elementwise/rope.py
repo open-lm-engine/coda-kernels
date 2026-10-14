@@ -267,6 +267,7 @@ def _qknorm_rope_bwd(
     misc_utils.static_assert(len(mGamma.shape) == 1)
     misc_utils.static_assert(len(mPos.shape) == 1)
     misc_utils.static_assert(len(mFreq.shape) == 1)
+    misc_utils.static_assert(mHeadMeanSq.shape[1] == num_heads_qk)
     misc_utils.static_assert(mX.shape[1] == (head_dim * num_heads_qk))
     misc_utils.static_assert(mDQ.shape[1] == (head_dim * num_heads_q))
     misc_utils.static_assert(mDK.shape[1] == (head_dim * num_heads_k))
@@ -380,7 +381,7 @@ def _compile_qknorm_rope_bwd(
     )
     mHeadMeanSq = cute.runtime.make_fake_tensor(
         dtype=cute.Float32,
-        shape=(m, size // head_dim),
+        shape=(m, num_heads_qk),
         stride=(cute.sym_int64(divisibility=1), 1),
         assumed_align=4,
     )
