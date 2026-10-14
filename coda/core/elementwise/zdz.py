@@ -1,3 +1,4 @@
+import operator
 import torch
 import cutlass
 import cutlass.cute as cute
@@ -315,6 +316,189 @@ def rope_bwd_zdz_(
         dy,
         dz,
         zdz,
+        pos,
+        freq,
+    )
+
+
+@jit_cache
+def _compile_qknorm_rope_bwd_zdz(
+    size: int,
+    head_dim: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    eps: float,
+    scale: float,
+    has_dv: bool,
+    dtype: type[cute.Numeric],
+    pos_dtype: type[cute.Numeric],
+    freq_dtype: type[cute.Numeric],
+    thr_m: int,
+    thr_n: int,
+    val_m: int,
+) -> Callable:
+    m = cute.sym_int()
+    num_heads_qk = cutlass.const_expr(num_heads_q + num_heads_k)
+    size_q = cutlass.const_expr(head_dim * num_heads_q)
+    size_k = cutlass.const_expr(head_dim * num_heads_k)
+    size_qk = cutlass.const_expr(size_q + size_k)
+    size_v = cutlass.const_expr(size - size_qk)
+    vector_size = cutlass.const_expr(constants.NUM_BITS_PER_COPY // dtype.width)
+    # size is the full [Q | K | V] width: whole v heads follow q and k
+    misc_utils.static_assert(size_v > 0)
+    misc_utils.static_assert((size_v % head_dim) == 0)
+    misc_utils.static_assert((vector_size % 2) == 0)
+    mDY = cute.runtime.make_fake_tensor(
+        dtype=dtype,
+        shape=(m, size),
+        stride=(cute.sym_int64(divisibility=vector_size), 1),
+        assumed_align=16,
+    )
+    if cutlass.const_expr(has_dv):
+        mDV = cute.runtime.make_fake_tensor(
+            dtype=dtype,
+            shape=(m, size_v),
+            stride=(cute.sym_int64(divisibility=vector_size), 1),
+            assumed_align=16,
+        )
+    else:
+        mDV = None
+    mDZ = cute.runtime.make_fake_tensor(
+        dtype=dtype,
+        shape=(m, size),
+        stride=(cute.sym_int64(divisibility=vector_size), 1),
+        assumed_align=16,
+    )
+    mZdZ = cute.runtime.make_fake_tensor(
+        dtype=cute.Float32,
+        shape=(m,),
+        stride=(1,),
+        assumed_align=4,
+    )
+    mDGamma = cute.runtime.make_fake_tensor(
+        dtype=cute.Float32,
+        shape=(cute.sym_int(), 2 * head_dim),
+        stride=(cute.sym_int64(divisibility=1), 1),
+        assumed_align=4,
+    )
+    mPreact = cute.runtime.make_fake_tensor(
+        dtype=dtype,
+        shape=(m, size_qk),
+        stride=(cute.sym_int64(divisibility=vector_size), 1),
+        assumed_align=16,
+    )
+    mV = cute.runtime.make_fake_tensor(
+        dtype=dtype,
+        shape=(m, size_v),
+        stride=(cute.sym_int64(divisibility=vector_size), 1),
+        assumed_align=16,
+    )
+    mRstd = cute.runtime.make_fake_tensor(
+        dtype=cute.Float32,
+        shape=(m,),
+        stride=(1,),
+        assumed_align=4,
+    )
+    mHeadMeanSq = cute.runtime.make_fake_tensor(
+        dtype=cute.Float32,
+        shape=(m, num_heads_qk),
+        stride=(cute.sym_int64(divisibility=1), 1),
+        assumed_align=4,
+    )
+    mGamma = cute.runtime.make_fake_tensor(
+        dtype=dtype,
+        shape=(2 * head_dim,),
+        stride=(1,),
+        assumed_align=dtype.width // 8,
+    )
+    mPos = cute.runtime.make_fake_tensor(
+        dtype=pos_dtype,
+        shape=(m,),
+        stride=(1,),
+        assumed_align=pos_dtype.width // 8,
+    )
+    mFreq = cute.runtime.make_fake_tensor(
+        dtype=freq_dtype,
+        shape=(size_qk,),
+        stride=(1,),
+        assumed_align=freq_dtype.width // 8,
+    )
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    return cute.compile(
+        _qknorm_rope_bwd_zdz,
+        mDY=mDY,
+        mDV=mDV,
+        mDZ=mDZ,
+        mZdZ=mZdZ,
+        mDGamma=mDGamma,
+        mPreact=mPreact,
+        mV=mV,
+        mRstd=mRstd,
+        mHeadMeanSq=mHeadMeanSq,
+        mGamma=mGamma,
+        mPos=mPos,
+        mFreq=mFreq,
+        head_dim=head_dim,
+        num_heads_q=num_heads_q,
+        num_heads_k=num_heads_k,
+        eps=eps,
+        scale=scale,
+        thr_m=thr_m,
+        thr_n=thr_n,
+        val_m=val_m,
+        stream=stream,
+        options="--enable-tvm-ffi",
+    )
+
+
+def qknorm_rope_bwd_zdz_(
+    dy: torch.Tensor,
+    dv: torch.Tensor | None,
+    dz: torch.Tensor,
+    zdz: torch.Tensor,
+    dgamma: torch.Tensor,
+    preact: torch.Tensor,
+    v: torch.Tensor,
+    rstd: torch.Tensor,
+    head_mean_sq: torch.Tensor,
+    gamma: torch.Tensor,
+    pos: torch.Tensor,
+    freq: torch.Tensor,
+    head_dim: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    eps: float,
+    scale: float,
+    thr_m: int,
+    thr_n: int,
+    val_m: int,
+) -> None:
+    fn = _compile_qknorm_rope_bwd_zdz(
+        size=dy.shape[1],
+        head_dim=head_dim,
+        num_heads_q=num_heads_q,
+        num_heads_k=num_heads_k,
+        eps=eps,
+        scale=scale,
+        has_dv=dv is not None,
+        dtype=torch2cute_dtype_map[dy.dtype],
+        pos_dtype=torch2cute_dtype_map[pos.dtype],
+        freq_dtype=torch2cute_dtype_map[freq.dtype],
+        thr_m=thr_m,
+        thr_n=thr_n,
+        val_m=val_m,
+    )
+    fn(
+        dy,
+        dv,
+        dz,
+        zdz,
+        dgamma,
+        preact,
+        v,
+        rstd,
+        head_mean_sq,
+        gamma,
         pos,
         freq,
     )
