@@ -412,11 +412,19 @@ def _qknorm_rope_bwd_zdz(
     mPreact_packed = layout_utils.recast_tensor(mPreact, dtype=cute.Int32)
     mV_packed = layout_utils.recast_tensor(mV, dtype=cute.Int32)
     vector_size = cutlass.const_expr(constants.NUM_BITS_PER_COPY // mDY_packed.element_type.width)
+    num_heads_qk = cutlass.const_expr(num_heads_q + num_heads_k)
+    size_q = cutlass.const_expr(head_dim * num_heads_q)
+    size_k = cutlass.const_expr(head_dim * num_heads_k)
+    lanes_per_head = cutlass.const_expr(head_dim // (2 * vector_size))
     misc_utils.static_assert(mDY_packed.element_type.width == 2 * mDY.element_type.width)
+    if cutlass.const_expr(mDV is not None):
+        misc_utils.static_assert(mDV_packed.element_type.width == 2 * mDV.element_type.width)
     misc_utils.static_assert(mDZ_packed.element_type.width == 2 * mDZ.element_type.width)
     misc_utils.static_assert(mPreact_packed.element_type.width == 2 * mPreact.element_type.width)
     misc_utils.static_assert(mV_packed.element_type.width == 2 * mV.element_type.width)
     misc_utils.static_assert(len(mDY_packed.shape) == 2)
+    if cutlass.const_expr(mDV is not None):
+        misc_utils.static_assert(len(mDV_packed.shape) == 2)
     misc_utils.static_assert(len(mDZ_packed.shape) == 2)
     misc_utils.static_assert(len(mZdZ.shape) == 1)
     misc_utils.static_assert(len(mDGamma.shape) == 2)
@@ -427,9 +435,28 @@ def _qknorm_rope_bwd_zdz(
     misc_utils.static_assert(len(mGamma.shape) == 1)
     misc_utils.static_assert(len(mPos.shape) == 1)
     misc_utils.static_assert(len(mFreq.shape) == 1)
+    misc_utils.static_assert(mHeadMeanSq.shape[1] == num_heads_qk)
+    misc_utils.static_assert(mPreact.shape[1] == (head_dim * num_heads_qk))
+    misc_utils.static_assert(mDY_packed.shape[1] == (mPreact_packed.shape[1] + mV_packed.shape[1]))
+    misc_utils.static_assert(mDY_packed.shape[1] == mDZ_packed.shape[1])
     if cutlass.const_expr(mDV is not None):
-        misc_utils.static_assert(mDV_packed.element_type.width == 2 * mDV.element_type.width)
-
+        misc_utils.static_assert(mDV_packed.shape[1] == mV_packed.shape[1])
+    misc_utils.static_assert(mDY_packed.shape[1] % (thr_n * vector_size) == 0)
+    if cutlass.const_expr(mDV is not None):
+        misc_utils.static_assert(mDV_packed.shape[1] % (thr_n * vector_size) == 0)
+    misc_utils.static_assert(mDZ_packed.shape[1] % (thr_n * vector_size) == 0)
+    misc_utils.static_assert(mPreact_packed.shape[1] % (thr_n * vector_size) == 0)
+    misc_utils.static_assert(mV_packed.shape[1] % (thr_n * vector_size) == 0)
+    # q and k use different gammas, so no tile may straddle the q | k boundary
+    misc_utils.static_assert((size_q // 2) % (thr_n * vector_size) == 0)
+    misc_utils.static_assert((size_k // 2) % (thr_n * vector_size) == 0)
+    misc_utils.static_assert(mDGamma.shape[1] == (2 * head_dim))
+    misc_utils.static_assert(mGamma.shape[0] == (2 * head_dim))
+    misc_utils.static_assert(mFreq.shape[0] == mPreact.shape[1])
+    misc_utils.static_assert((head_dim % (2 * vector_size)) == 0)
+    misc_utils.static_assert(lanes_per_head <= 32)
+    misc_utils.static_assert((thr_n % lanes_per_head) == 0)
+    misc_utils.static_assert(misc_utils.is_power_of_2(lanes_per_head))
     tiler_mn, tv_layout = layout_utils.make_layout_tv_from_shape(
         thread_shape=(thr_m, thr_n),
         thread_order="row",
