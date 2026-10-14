@@ -489,7 +489,18 @@ def qknorm_rope_bwd_zdz_kernel(
             else:
                 rGamma = rGammaK
                 rDGamma = rDGammaK
-
+            gPreact_packed = cute.local_tile(mPreact_packed, tiler_mn, (bidx, tile_index))
+            copy_outputs_Preact = memory_utils.copy(
+                src=gPreact_packed,
+                dst="rmem",
+                crd=cDY_packed,
+                shape=mDY_packed.shape,
+                config=config,
+                thread_index=tidx,
+                smem_allocator=allocator,
+            )
+            tDYrPreact_packed = copy_outputs_Preact.dst_thread
+            tDYrPreact = cute.recast_tensor(tDYrPreact_packed, dtype=dtype)
             for row_index in cutlass.range_constexpr(val_m):
                 row_coord, col_coord_packed_begin = tDYcDY_packed[row_index * vector_size]
                 # a row past M clamps its reads to the last row and is left out of drms and dgamma
