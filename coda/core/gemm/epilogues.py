@@ -257,3 +257,47 @@ def qknorm_rope_epi(acc: EpiValue, qk: EpiValue, weight: EpiValue, eps: EpiValue
     x1 = x1 * rstd
     x2 = x2 * rstd
     return {"D": pack(x1 * c - x2 * s, x1 * s + x2 * c), "preact": acc}
+
+
+def _rstd_sq_prepass(acc: EpiValue, rstd: EpiValue) -> EpiOut:
+    # the head statistic is of the projection of the normed input, acc * rstd
+    scaled = acc * rstd
+    return {"qk": scaled * scaled}
+
+
+_rstd_head_mean_sq_op = HeadMeanSq("qk")
+
+
+@gemm_epilogue(
+    # gated=False keeps the full width: paired mode's default outputs are half width
+    outputs=(TileStore("preact", gated=False),),
+    ops={
+        "qk": _rstd_head_mean_sq_op,
+        "weight": HeadRowVecLoad("weight"),
+        "rstd": ColVecLoad("rstd"),
+        "eps": Scalar("eps"),
+        "pos": ColVecLoad("pos"),
+        "freq": RowVecLoad("freq"),
+    },
+    prepass=_rstd_sq_prepass,
+    prepass_outs=("qk",),
+    extra_ops=(
+        _rstd_head_mean_sq_op.out("head_mean_sq_out"),
+        ConstInt("num_heads_q"),
+        ConstInt("num_heads_k"),
+    ),
+    mode="acc_pair",
+)
+def rstd_qknorm_rope_epi(acc: EpiValue, qk: EpiValue, weight: EpiValue, rstd: EpiValue, eps: EpiValue, pos: EpiValue, freq: EpiValue) -> EpiOut:
+    # the statistic is per (row, head), so both lanes of the pair carry the same statistic
+    head_mean_sq, _ = unpack(qk)
+    head_rstd = cute.math.rsqrt(head_mean_sq + eps, fastmath=True)
+    scaled = acc * rstd
+    x1, x2 = unpack(scaled * weight)
+    s, c = _sincos_turns(*_angle_turns(pos, freq))
+    x1 = x1 * head_rstd
+    x2 = x2 * head_rstd
+    # preact stores acc, not scaled: acc is in registers anyway, while
+    # scaled would have to stay alive through the rope math and spill on
+    # large tiles. the backward recovers scaled as rstd * preact
+    return {"D": pack(x1 * c - x2 * s, x1 * s + x2 * c), "preact": acc}
