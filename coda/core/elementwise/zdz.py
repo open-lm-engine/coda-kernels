@@ -439,6 +439,25 @@ def qknorm_rope_bwd_zdz_kernel(
     rDGammaQ.fill(value=0.0)
     rDGammaK.fill(value=0.0)
 
+    # each run of lanes_per_head lanes covers one head, so a gamma column has one partial per run
+    head_group = tidx // lanes_per_head
+    for col_index in cutlass.range_constexpr(vector_size):
+        _, col_coord_packed = tYcY_packed[col_index]
+        gamma_index = (2 * col_coord_packed) % head_dim
+        sDGamma[head_group, gamma_index] = rDGammaQ[2 * col_index]
+        sDGamma[head_group, gamma_index + 1] = rDGammaQ[2 * col_index + 1]
+        sDGamma[head_group, head_dim + gamma_index] = rDGammaK[2 * col_index]
+        sDGamma[head_group, head_dim + gamma_index + 1] = rDGammaK[2 * col_index + 1]
+
+    cute.arch.barrier()
+    for i in cutlass.range_constexpr(misc_utils.ceil_div(2 * head_dim, num_threads)):
+        j = i * num_threads + tidx
+        if j < 2 * head_dim:
+            dg = cute.Float32.zero
+            for group in cutlass.range_constexpr(num_head_groups):
+                dg = dg + sDGamma[group, j]
+            mDGamma[bidx, j] = dg
+
     zdzs = []
     for row_index in cutlass.range_constexpr(val_m):
         zdz = cute.make_rmem_tensor((1,), cute.Float32)
