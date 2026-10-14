@@ -464,7 +464,7 @@ def qknorm_rope_bwd_zdz_kernel(
                 row_coord_clamped = cutlass.min(row_coord, mDY_packed.shape[0] - 1)
                 rRstd[row_index] = mRstd[row_coord_clamped].to(dtype=cute.Float32)
                 rPos[row_index] = mPos[row_coord_clamped].to(dtype=cute.Float32)
-            # gamma is [gamma_q | gamma_k], two entries per packed word
+            # gamma is [gamma_q | gamma_k]
             for col_index in cutlass.range_constexpr(vector_size):
                 _, col_coord_packed = tDYcDY_packed[col_index]
                 gamma_index = (2 * col_coord_packed) % head_dim
@@ -506,8 +506,6 @@ def qknorm_rope_bwd_zdz_kernel(
                 # a row past M clamps its reads to the last row and is left out of drms and dgamma
                 row_coord_clamped = cutlass.min(row_coord, mDY_packed.shape[0] - 1)
                 row_in_bound = row_coord < mDY_packed.shape[0]
-
-                # gamma is [gamma_q | gamma_k]
                 head_index = (2 * col_coord_packed_begin) // head_dim
                 rms = cute.math.rsqrt(
                     mHeadMeanSq[row_coord_clamped, head_index] + eps,
