@@ -354,11 +354,18 @@ def qknorm_rope_bwd_zdz_kernel(
 
     tile_N_packed = cutlass.const_expr(tiler_mn[1])
     num_threads = cutlass.const_expr(cute.size(tv_layout, mode=[0]))
+    # a lane covers 2 * vector_size columns (two per packed word),
+    # so one head spans lanes_per_head lanes
     lanes_per_head = cutlass.const_expr(head_dim // (2 * vector_size))
+    # the CTA's lanes form num_head_groups head-wide runs, each holding one partial dgamma row, summed at the end
     num_head_groups = cutlass.const_expr(num_threads // lanes_per_head)
     num_tiles_q = cutlass.const_expr((head_dim * num_heads_q) // (2 * tile_N_packed))
     num_tiles_k = cutlass.const_expr((head_dim * num_heads_k) // (2 * tile_N_packed))
     num_tiles_qk = cutlass.const_expr(num_tiles_q + num_tiles_k)
+    misc_utils.static_assert((head_dim % (2 * vector_size)) == 0)
+    misc_utils.static_assert((num_threads % lanes_per_head) == 0)
+    misc_utils.static_assert(((head_dim * num_heads_q) % (2 * tile_N_packed)) == 0)
+    misc_utils.static_assert(((head_dim * num_heads_k) % (2 * tile_N_packed)) == 0)
     sDGamma = creation_utils.allocate_tensor_from_shape(
         shape=(num_head_groups, 2 * head_dim),
         order="row",
@@ -391,6 +398,47 @@ def qknorm_rope_bwd_zdz_kernel(
         dtype=cute.Float32,
         memspace="rmem",
     )
+    # preact is the raw accumulator: z = rstd * preact, with rstd the input norm's row scale
+    rRstd = creation_utils.allocate_tensor_from_shape(
+        shape=(val_m,),
+        order="row",
+        dtype=cute.Float32,
+        memspace="rmem",
+    )
+    rD = creation_utils.allocate_tensor_from_shape(
+        shape=(2 * vector_size,),
+        order="row",
+        dtype=cute.Float32,
+        memspace="rmem",
+    )
+    # a lane sits at the same offset within every head it visits, so its gamma and dgamma are tile-invariant
+    rGammaQ = creation_utils.allocate_tensor_from_shape(
+        shape=(2 * vector_size,),
+        order="row",
+        dtype=cute.Float32,
+        memspace="rmem",
+    )
+    rGammaK = creation_utils.allocate_tensor_from_shape(
+        shape=(2 * vector_size,),
+        order="row",
+        dtype=cute.Float32,
+        memspace="rmem",
+    )
+    rDGammaQ = creation_utils.allocate_tensor_from_shape(
+        shape=(2 * vector_size,),
+        order="row",
+        dtype=cute.Float32,
+        memspace="rmem",
+    )
+    rDGammaK = creation_utils.allocate_tensor_from_shape(
+        shape=(2 * vector_size,),
+        order="row",
+        dtype=cute.Float32,
+        memspace="rmem",
+    )
+    cute.filter_zeros(rDGammaQ).fill(value=0.0)
+    cute.filter_zeros(rDGammaK).fill(value=0.0)
+
 
 @cute.jit
 def _qknorm_rope_bwd_zdz(
