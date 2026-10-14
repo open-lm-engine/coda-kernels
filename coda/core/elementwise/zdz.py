@@ -321,6 +321,160 @@ def rope_bwd_zdz_(
     )
 
 
+@cute.kernel
+def qknorm_rope_bwd_zdz_kernel(
+    mDY_packed: cute.Tensor,
+    mDV_packed: cute.Tensor | None,
+    mDZ_packed: cute.Tensor,
+    mZdZ: cute.Tensor,
+    mDGamma: cute.Tensor,
+    mPreact_packed: cute.Tensor,
+    mV_packed: cute.Tensor,
+    mRstd: cute.Tensor,
+    mHeadMeanSq: cute.Tensor,
+    mGamma: cute.Tensor,
+    mPos: cute.Tensor,
+    mFreq: cute.Tensor,
+    head_dim: cutlass.Constexpr[int],
+    num_heads_q: cutlass.Constexpr[int],
+    num_heads_k: cutlass.Constexpr[int],
+    eps: cutlass.Constexpr[float],
+    scale: cutlass.Constexpr[float],
+    dtype: type[cute.Numeric],
+    tiler_mn: cute.Shape,
+    tv_layout: cute.Layout,
+    thr_m: cutlass.Constexpr[int],
+    thr_n: cutlass.Constexpr[int],
+    val_m: cutlass.Constexpr[int],
+    vector_size: cutlass.Constexpr[int],
+) -> None:
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    allocator = cutlass.utils.SmemAllocator()
+
+    tile_N_packed = cutlass.const_expr(tiler_mn[1])
+    num_threads = cutlass.const_expr(cute.size(tv_layout, mode=[0]))
+
+    idDY_packed = cute.make_identity_tensor(mDY_packed.shape)
+    config = memory_utils.MemoryCopyConfig(
+        op="universal",
+        dtype=mDY_packed.element_type,
+        num_bits_per_copy=mDY_packed.element_type.width * vector_size,
+        tiler_mn=tiler_mn,
+        layout_tv=tv_layout,
+    )
+
+    # the row's running sum of z * dz
+    rZdZ = creation_utils.allocate_tensor_from_shape(
+        shape=(val_m,),
+        order="row",
+        dtype=cute.Float32,
+        memspace="rmem",
+    )
+    rZdZ.fill(value=0.0)
+    rPos = creation_utils.allocate_tensor_from_shape(
+        shape=(val_m,),
+        order="row",
+        dtype=cute.Float32,
+        memspace="rmem",
+    )
+
+@cute.jit
+def _qknorm_rope_bwd_zdz(
+    mDY: cute.Tensor,
+    mDV: cute.Tensor | None,
+    mDZ: cute.Tensor,
+    mZdZ: cute.Tensor,
+    mDGamma: cute.Tensor,
+    mPreact: cute.Tensor,
+    mV: cute.Tensor,
+    mRstd: cute.Tensor,
+    mHeadMeanSq: cute.Tensor,
+    mGamma: cute.Tensor,
+    mPos: cute.Tensor,
+    mFreq: cute.Tensor,
+    head_dim: cutlass.Constexpr[int],
+    num_heads_q: cutlass.Constexpr[int],
+    num_heads_k: cutlass.Constexpr[int],
+    eps: cutlass.Constexpr[float],
+    scale: cutlass.Constexpr[float],
+    thr_m: cutlass.Constexpr[int],
+    thr_n: cutlass.Constexpr[int],
+    val_m: cutlass.Constexpr[int],
+    stream: cuda.CUstream,
+) -> int:
+    mDY_packed = layout_utils.recast_tensor(mDY, dtype=cute.Int32)
+    if cutlass.const_expr(mDV is not None):
+        mDV_packed = layout_utils.recast_tensor(mDV, dtype=cute.Int32)
+    else:
+        mDV_packed = None
+    mDZ_packed = layout_utils.recast_tensor(mDZ, dtype=cute.Int32)
+    mPreact_packed = layout_utils.recast_tensor(mPreact, dtype=cute.Int32)
+    mV_packed = layout_utils.recast_tensor(mV, dtype=cute.Int32)
+    vector_size = cutlass.const_expr(constants.NUM_BITS_PER_COPY // mDY_packed.element_type.width)
+    misc_utils.static_assert(mDY_packed.element_type.width == 2 * mDY.element_type.width)
+    misc_utils.static_assert(mDZ_packed.element_type.width == 2 * mDZ.element_type.width)
+    misc_utils.static_assert(mPreact_packed.element_type.width == 2 * mPreact.element_type.width)
+    misc_utils.static_assert(mV_packed.element_type.width == 2 * mV.element_type.width)
+    misc_utils.static_assert(len(mDY_packed.shape) == 2)
+    misc_utils.static_assert(len(mDZ_packed.shape) == 2)
+    misc_utils.static_assert(len(mZdZ.shape) == 1)
+    misc_utils.static_assert(len(mDGamma.shape) == 2)
+    misc_utils.static_assert(len(mPreact_packed.shape) == 2)
+    misc_utils.static_assert(len(mV_packed.shape) == 2)
+    misc_utils.static_assert(len(mRstd.shape) == 1)
+    misc_utils.static_assert(len(mHeadMeanSq.shape) == 2)
+    misc_utils.static_assert(len(mGamma.shape) == 1)
+    misc_utils.static_assert(len(mPos.shape) == 1)
+    misc_utils.static_assert(len(mFreq.shape) == 1)
+    if cutlass.const_expr(mDV is not None):
+        misc_utils.static_assert(mDV_packed.element_type.width == 2 * mDV.element_type.width)
+
+    tiler_mn, tv_layout = layout_utils.make_layout_tv_from_shape(
+        thread_shape=(thr_m, thr_n),
+        thread_order="row",
+        value_shape=(val_m, vector_size),
+        value_order="row",
+    )
+
+    num_blocks = cute.ceil_div(mDY_packed.shape[0], tiler_mn[0])
+    num_threads = cute.size(tv_layout, mode=[0])
+    kernel = qknorm_rope_bwd_zdz_kernel(
+        mDY_packed=mDY_packed,
+        mDV_packed=mDV_packed,
+        mDZ_packed=mDZ_packed,
+        mZdZ=mZdZ,
+        mDGamma=mDGamma,
+        mPreact_packed=mPreact_packed,
+        mV_packed=mV_packed,
+        mRstd=mRstd,
+        mHeadMeanSq=mHeadMeanSq,
+        mGamma=mGamma,
+        mPos=mPos,
+        mFreq=mFreq,
+        head_dim=head_dim,
+        num_heads_q=num_heads_q,
+        num_heads_k=num_heads_k,
+        eps=eps,
+        scale=scale,
+        dtype=mDY.element_type,
+        tiler_mn=tiler_mn,
+        tv_layout=tv_layout,
+        thr_m=thr_m,
+        thr_n=thr_n,
+        val_m=val_m,
+        vector_size=vector_size,
+    )
+    kernel.launch(
+        grid=[num_blocks, 1, 1],
+        block=[num_threads, 1, 1],
+        cluster=None,
+        smem=None,
+        stream=stream,
+    )
+    return kernel.smem_usage()
+
+
 @jit_cache
 def _compile_qknorm_rope_bwd_zdz(
     size: int,
