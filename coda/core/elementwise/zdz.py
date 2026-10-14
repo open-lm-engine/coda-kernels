@@ -589,6 +589,22 @@ def qknorm_rope_bwd_zdz_kernel(
                 )
                 tDYrDV_packed = copy_outputs_DV.dst_thread
                 tDYrDV = cute.recast_tensor(tDYrDV_packed, dtype=dtype)
+            # v skips the qk-norm and rope, so its gradient passes through unchanged
+            for row_index in cutlass.range_constexpr(val_m):
+                for col_index in cutlass.range_constexpr(vector_size):
+                    flat_index = row_index * vector_size + col_index
+                    dz0 = tDYrDY[2 * flat_index].to(dtype=cute.Float32)
+                    dz1 = tDYrDY[2 * flat_index + 1].to(dtype=cute.Float32)
+                    # v also feeds the next block's XSA, and dv is that gradient
+                    if cutlass.const_expr(mDV_packed is not None):
+                        dz0 = dz0 + tDYrDV[2 * flat_index].to(dtype=cute.Float32)
+                        dz1 = dz1 + tDYrDV[2 * flat_index + 1].to(dtype=cute.Float32)
+                    v0 = tDYrV[2 * flat_index].to(dtype=cute.Float32)
+                    v1 = tDYrV[2 * flat_index + 1].to(dtype=cute.Float32)
+                    tDYrDZ[2 * flat_index] = dz0.to(dtype=tDYrDZ.element_type)
+                    tDYrDZ[2 * flat_index + 1] = dz1.to(dtype=tDYrDZ.element_type)
+                    # z is v on the v columns, so this adds v's share of sum(z * dz)
+                    rZdZ[row_index] = rZdZ[row_index] + v0 * dz0 + v1 * dz1
 
         _ = memory_utils.copy(
             src=tDYrDZ_packed,
