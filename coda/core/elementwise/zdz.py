@@ -354,6 +354,19 @@ def qknorm_rope_bwd_zdz_kernel(
 
     tile_N_packed = cutlass.const_expr(tiler_mn[1])
     num_threads = cutlass.const_expr(cute.size(tv_layout, mode=[0]))
+    lanes_per_head = cutlass.const_expr(head_dim // (2 * vector_size))
+    num_head_groups = cutlass.const_expr(num_threads // lanes_per_head)
+    num_tiles_q = cutlass.const_expr((head_dim * num_heads_q) // (2 * tile_N_packed))
+    num_tiles_k = cutlass.const_expr((head_dim * num_heads_k) // (2 * tile_N_packed))
+    num_tiles_qk = cutlass.const_expr(num_tiles_q + num_tiles_k)
+    sDGamma = creation_utils.allocate_tensor_from_shape(
+        shape=(num_head_groups, 2 * head_dim),
+        order="row",
+        dtype=cute.Float32,
+        memspace="smem",
+        smem_allocator=allocator,
+        byte_alignment=4,
+    )
 
     idDY_packed = cute.make_identity_tensor(mDY_packed.shape)
     config = memory_utils.MemoryCopyConfig(
