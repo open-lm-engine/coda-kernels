@@ -405,7 +405,7 @@ def qknorm_rope_bwd_zdz_kernel(
         dtype=cute.Float32,
         memspace="rmem",
     )
-    rD = creation_utils.allocate_tensor_from_shape(
+    rDN = creation_utils.allocate_tensor_from_shape(
         shape=(2 * vector_size,),
         order="row",
         dtype=cute.Float32,
@@ -436,8 +436,27 @@ def qknorm_rope_bwd_zdz_kernel(
         dtype=cute.Float32,
         memspace="rmem",
     )
-    cute.filter_zeros(rDGammaQ).fill(value=0.0)
-    cute.filter_zeros(rDGammaK).fill(value=0.0)
+    rDGammaQ.fill(value=0.0)
+    rDGammaK.fill(value=0.0)
+
+    zdzs = []
+    for row_index in cutlass.range_constexpr(val_m):
+        zdz = cute.make_rmem_tensor((1,), cute.Float32)
+        zdz[0] = rZdZ[row_index]
+        zdzs.append(zdz.load())
+    zdzs_reduced, _ = reduction_utils.reduce(
+        zdzs,
+        op="add",
+        thread_shape=(thr_m, thr_n),
+        smem_allocator=allocator,
+        reduction_buffer=None,
+    )
+    # the norm's backward wants zdz / hidden, so scale rides the store
+    for row_index in cutlass.range_constexpr(val_m):
+        row_coord, _ = tYcY_packed[row_index * vector_size]
+        row_in_bound = row_coord < mDY_packed.shape[0]
+        if ((tidx % thr_n) == 0) and row_in_bound:
+            mZdZ[row_coord] = zdzs_reduced[row_index] * scale
 
 
 @cute.jit
