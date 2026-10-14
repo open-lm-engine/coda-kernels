@@ -482,6 +482,86 @@ def qknorm_rope_bwd_zdz_kernel(
         tDYrDY = cute.recast_tensor(tDYrDY_packed, dtype=dtype)
         tDYrDZ = cute.recast_tensor(tDYrDZ_packed, dtype=dtype)
 
+        if cutlass.const_expr(tile_index < num_tiles_qk):
+            if cutlass.const_expr(tile_index < num_tiles_q):
+                rGamma = rGammaQ
+                rDGamma = rDGammaQ
+            else:
+                rGamma = rGammaK
+                rDGamma = rDGammaK
+
+            for row_index in cutlass.range_constexpr(val_m):
+                row_coord, col_coord_packed_begin = tDYcDY_packed[row_index * vector_size]
+                # a row past M clamps its reads to the last row and is left out of drms and dgamma
+                row_coord_clamped = cutlass.min(row_coord, mDY_packed.shape[0] - 1)
+                row_in_bound = row_coord < mDY_packed.shape[0]
+
+                # gamma is [gamma_q | gamma_k]
+                head_index = (2 * col_coord_packed_begin) // head_dim
+                rms = cute.math.rsqrt(
+                    mHeadMeanSq[row_coord_clamped, head_index] + eps,
+                    fastmath=True,
+                )
+                rms_cubed = rms * rms * rms
+                drms = cute.Float32.zero
+                for col_index in cutlass.range_constexpr(vector_size):
+                    flat_index = row_index * vector_size + col_index
+                    _, col_coord_packed = tDYcDY_packed[flat_index]
+                    freq_index = 2 * col_coord_packed
+                    s, c = math_utils.rope_pos_freq(
+                        pos=rPos[row_index],
+                        freq_hi=mFreq[freq_index].to(dtype=cute.Float32),
+                        freq_lo=mFreq[freq_index + 1].to(dtype=cute.Float32),
+                    )
+                    dy0 = tDYrDY[2 * flat_index].to(dtype=cute.Float32)
+                    dy1 = tDYrDY[2 * flat_index + 1].to(dtype=cute.Float32)
+                    # dn = R^T dy is the gradient of the qk-norm output n = gamma * z * rms
+                    dn0 = dy0 * c + dy1 * s
+                    dn1 = dy1 * c - dy0 * s
+                    z0 = tDYrZ[2 * flat_index].to(dtype=cute.Float32) * rRstd[row_index]
+                    z1 = tDYrZ[2 * flat_index + 1].to(dtype=cute.Float32) * rRstd[row_index]
+                    g0 = rGamma[2 * col_index]
+                    g1 = rGamma[2 * col_index + 1]
+                    rDN[2 * col_index] = dn0
+                    rDN[2 * col_index + 1] = dn1
+
+                    if row_in_bound:
+                        drms = drms + dn0 * g0 * z0 + dn1 * g1 * z1
+
+                if cutlass.const_expr(lanes_per_head > 1):
+                    drms = cute.arch.warp_reduction(
+                        drms,
+                        op=operator.add,
+                        threads_in_group=lanes_per_head,
+                    )
+
+                # dssq2 = 2 * dL/dssq
+                dssq2 = -drms * rms_cubed / head_dim
+                for col_index in cutlass.range_constexpr(vector_size):
+                    flat_index = row_index * vector_size + col_index
+                    g0 = rGamma[2 * col_index]
+                    g1 = rGamma[2 * col_index + 1]
+                    dn0 = rDN[2 * col_index]
+                    dn1 = rDN[2 * col_index + 1]
+                    z0 = tDYrZ[2 * flat_index].to(dtype=cute.Float32) * rRstd[row_index]
+                    z1 = tDYrZ[2 * flat_index + 1].to(dtype=cute.Float32) * rRstd[row_index]
+                    tDYrDZ[2 * flat_index] = (rms * g0 * dn0 + z0 * dssq2).to(dtype=tDYrDZ.element_type)
+                    tDYrDZ[2 * flat_index + 1] = (rms * g1 * dn1 + z1 * dssq2).to(dtype=tDYrDZ.element_type)
+
+                    if row_in_bound:
+                        rDGamma[2 * col_index] = rDGamma[2 * col_index] + dn0 * z0 * rms
+                        rDGamma[2 * col_index + 1] = rDGamma[2 * col_index + 1] + dn1 * z1 * rms
+
+        _ = memory_utils.copy(
+            src=tDYrDZ_packed,
+            dst=gDZ_packed,
+            crd=tDYcDY_packed,
+            shape=mDZ_packed.shape,
+            config=config,
+            thread_index=tidx,
+            smem_allocator=allocator,
+        )
+
     # each run of lanes_per_head lanes covers one head, so a gamma column has one partial per run
     head_group = tidx // lanes_per_head
     for col_index in cutlass.range_constexpr(vector_size):
