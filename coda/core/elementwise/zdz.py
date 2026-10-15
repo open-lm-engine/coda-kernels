@@ -503,7 +503,9 @@ def qknorm_rope_bwd_zdz_kernel(
             tDYrPreact = cute.recast_tensor(tDYrPreact_packed, dtype=dtype)
             for row_index in cutlass.range_constexpr(val_m):
                 row_coord, col_coord_packed_begin = tDYcDY_packed[row_index * vector_size]
-                # a row past M clamps its reads to the last row and is left out of drms and dgamma
+                # the last tile can run past M. rows beyond M never load or store their tiles,
+                # read head_mean_sq from row M - 1 to stay in bounds,
+                # and are skipped by dgamma, which sums over rows
                 row_coord_clamped = cutlass.min(row_coord, mDY_packed.shape[0] - 1)
                 row_in_bound = row_coord < mDY_packed.shape[0]
                 head_index = (2 * col_coord_packed_begin) // head_dim
@@ -533,10 +535,12 @@ def qknorm_rope_bwd_zdz_kernel(
                     g1 = rGamma[2 * col_index + 1]
                     rDN[2 * col_index] = dn0
                     rDN[2 * col_index + 1] = dn1
+                    drms = drms + dn0 * g0 * z0 + dn1 * g1 * z1
 
-                    if row_in_bound:
-                        drms = drms + dn0 * g0 * z0 + dn1 * g1 * z1
-
+                # zdz needs this head's sum(z * dz). the norm makes it exactly eps * rms^3 * drms,
+                # a value too small to survive rounding in dz, so it is computed from the formula.
+                # drms is still split across the head's lanes here, so each lane adds its own part
+                rZdZ[row_index] = rZdZ[row_index] + eps * rms_cubed * drms
                 if cutlass.const_expr(lanes_per_head > 1):
                     drms = cute.arch.warp_reduction(
                         drms,
