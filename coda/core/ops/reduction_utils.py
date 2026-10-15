@@ -359,6 +359,11 @@ def reduce(
     # this function assumes that all values owned by a warp are in the same row.
     # 1. each warp is in one row
     # 2. each thread is in one row as well
+    # so a warp never splits a row: a row spans whole warps, or a warp holds whole rows
+    static_assert(
+        (thread_shape[1] % cute.arch.WARP_SIZE == 0) or
+        (cute.arch.WARP_SIZE % thread_shape[1] == 0)
+    )
     num_elements = len(outputs)
     num_warps = cute.size(thread_shape) // cute.arch.WARP_SIZE
     num_warps_per_row = max(thread_shape[1] // cute.arch.WARP_SIZE, 1)

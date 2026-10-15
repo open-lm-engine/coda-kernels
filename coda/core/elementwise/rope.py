@@ -146,11 +146,11 @@ def qknorm_rope_bwd_kernel(
         head_index = (2 * col_coord_packed_begin) // head_dim
         gamma_offset = head_dim if head_index >= num_heads_q else 0
 
-        rms = cute.math.rsqrt(
+        head_rstd = cute.math.rsqrt(
             mHeadMeanSq[row_coord_clamped, head_index] + eps,
             fastmath=True,
         )
-        drms = cute.Float32.zero
+        dhead_rstd = cute.Float32.zero
         for col_index in cutlass.range_constexpr(vector_size):
             flat_index = row_index * vector_size + col_index
             _, col_coord_packed = tXcX_packed[flat_index]
@@ -171,17 +171,17 @@ def qknorm_rope_bwd_kernel(
             g1 = mGamma[gamma_offset + gamma_index + 1].to(dtype=cute.Float32)
             rDZ[2 * col_index] = dz0
             rDZ[2 * col_index + 1] = dz1
-            drms = drms + dz0 * g0 * x0 + dz1 * g1 * x1
+            dhead_rstd = dhead_rstd + dz0 * g0 * x0 + dz1 * g1 * x1
 
         if cutlass.const_expr(lanes_per_head > 1):
-            drms = cute.arch.warp_reduction(
-                drms,
+            dhead_rstd = cute.arch.warp_reduction(
+                dhead_rstd,
                 op=operator.add,
                 threads_in_group=lanes_per_head,
             )
 
         # dssq2 = 2 * dL/dssq
-        dssq2 = -drms * rms * rms * rms / head_dim
+        dssq2 = -dhead_rstd * head_rstd * head_rstd * head_rstd / head_dim
         for col_index in cutlass.range_constexpr(vector_size):
             flat_index = row_index * vector_size + col_index
             _, col_coord_packed = tXcX_packed[flat_index]
@@ -192,12 +192,12 @@ def qknorm_rope_bwd_kernel(
             dz1 = rDZ[2 * col_index + 1]
             x0 = tXrX[2 * flat_index].to(dtype=cute.Float32)
             x1 = tXrX[2 * flat_index + 1].to(dtype=cute.Float32)
-            tXrDX[2 * flat_index] = (rms * g0 * dz0 + x0 * dssq2).to(dtype=tXrDX.element_type)
-            tXrDX[2 * flat_index + 1] = (rms * g1 * dz1 + x1 * dssq2).to(dtype=tXrDX.element_type)
+            tXrDX[2 * flat_index] = (head_rstd * g0 * dz0 + x0 * dssq2).to(dtype=tXrDX.element_type)
+            tXrDX[2 * flat_index + 1] = (head_rstd * g1 * dz1 + x1 * dssq2).to(dtype=tXrDX.element_type)
 
             if row_in_bound:
-                rDGamma[2 * col_index] = rDGamma[2 * col_index] + dz0 * x0 * rms
-                rDGamma[2 * col_index + 1] = rDGamma[2 * col_index + 1] + dz1 * x1 * rms
+                rDGamma[2 * col_index] = rDGamma[2 * col_index] + dz0 * x0 * head_rstd
+                rDGamma[2 * col_index + 1] = rDGamma[2 * col_index + 1] + dz1 * x1 * head_rstd
 
     thr_row = tidx // thr_n
     col_coord_packed_offset = bidy * tile_N_packed

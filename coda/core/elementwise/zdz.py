@@ -509,12 +509,12 @@ def qknorm_rope_bwd_zdz_kernel(
                 row_coord_clamped = cutlass.min(row_coord, mDY_packed.shape[0] - 1)
                 row_in_bound = row_coord < mDY_packed.shape[0]
                 head_index = (2 * col_coord_packed_begin) // head_dim
-                rms = cute.math.rsqrt(
+                head_rstd = cute.math.rsqrt(
                     mHeadMeanSq[row_coord_clamped, head_index] + eps,
                     fastmath=True,
                 )
-                rms_cubed = rms * rms * rms
-                drms = cute.Float32.zero
+                head_rstd_cubed = head_rstd * head_rstd * head_rstd
+                dhead_rstd = cute.Float32.zero
                 for col_index in cutlass.range_constexpr(vector_size):
                     flat_index = row_index * vector_size + col_index
                     _, col_coord_packed = tDYcDY_packed[flat_index]
@@ -526,7 +526,7 @@ def qknorm_rope_bwd_zdz_kernel(
                     )
                     dy0 = tDYrDY[2 * flat_index].to(dtype=cute.Float32)
                     dy1 = tDYrDY[2 * flat_index + 1].to(dtype=cute.Float32)
-                    # dn = R^T dy is the gradient of the qk-norm output n = gamma * z * rms
+                    # dn = R^T dy is the gradient of the qk-norm output n = gamma * z * head_rstd
                     dn0 = dy0 * c + dy1 * s
                     dn1 = dy1 * c - dy0 * s
                     z0 = tDYrPreact[2 * flat_index].to(dtype=cute.Float32) * rRstd[row_index]
@@ -535,22 +535,22 @@ def qknorm_rope_bwd_zdz_kernel(
                     g1 = rGamma[2 * col_index + 1]
                     rDN[2 * col_index] = dn0
                     rDN[2 * col_index + 1] = dn1
-                    drms = drms + dn0 * g0 * z0 + dn1 * g1 * z1
+                    dhead_rstd = dhead_rstd + dn0 * g0 * z0 + dn1 * g1 * z1
 
-                # zdz needs this head's sum(z * dz). the norm makes it exactly eps * rms^3 * drms.
+                # zdz needs this head's sum(z * dz). the norm makes it exactly eps * head_rstd^3 * dhead_rstd.
                 # a direct sum of z * dz would be swamped by error: dz is rounded, and z is rebuilt
                 # from the bf16 preact, so mean(z^2) misses the forward's head_mean_sq by far more than eps.
-                # drms is still split across the head's lanes here, so each lane adds its own part
-                rZdZ[row_index] = rZdZ[row_index] + eps * rms_cubed * drms
+                # dhead_rstd is still split across the head's lanes here, so each lane adds its own part
+                rZdZ[row_index] = rZdZ[row_index] + eps * head_rstd_cubed * dhead_rstd
                 if cutlass.const_expr(lanes_per_head > 1):
-                    drms = cute.arch.warp_reduction(
-                        drms,
+                    dhead_rstd = cute.arch.warp_reduction(
+                        dhead_rstd,
                         op=operator.add,
                         threads_in_group=lanes_per_head,
                     )
 
                 # dssq2 = 2 * dL/dssq
-                dssq2 = -drms * rms_cubed / head_dim
+                dssq2 = -dhead_rstd * head_rstd_cubed / head_dim
                 for col_index in cutlass.range_constexpr(vector_size):
                     flat_index = row_index * vector_size + col_index
                     g0 = rGamma[2 * col_index]
@@ -559,12 +559,12 @@ def qknorm_rope_bwd_zdz_kernel(
                     dn1 = rDN[2 * col_index + 1]
                     z0 = tDYrPreact[2 * flat_index].to(dtype=cute.Float32) * rRstd[row_index]
                     z1 = tDYrPreact[2 * flat_index + 1].to(dtype=cute.Float32) * rRstd[row_index]
-                    tDYrDZ[2 * flat_index] = (rms * g0 * dn0 + z0 * dssq2).to(dtype=tDYrDZ.element_type)
-                    tDYrDZ[2 * flat_index + 1] = (rms * g1 * dn1 + z1 * dssq2).to(dtype=tDYrDZ.element_type)
+                    tDYrDZ[2 * flat_index] = (head_rstd * g0 * dn0 + z0 * dssq2).to(dtype=tDYrDZ.element_type)
+                    tDYrDZ[2 * flat_index + 1] = (head_rstd * g1 * dn1 + z1 * dssq2).to(dtype=tDYrDZ.element_type)
 
                     if row_in_bound:
-                        rDGamma[2 * col_index] = rDGamma[2 * col_index] + dn0 * z0 * rms
-                        rDGamma[2 * col_index + 1] = rDGamma[2 * col_index + 1] + dn1 * z1 * rms
+                        rDGamma[2 * col_index] = rDGamma[2 * col_index] + dn0 * z0 * head_rstd
+                        rDGamma[2 * col_index + 1] = rDGamma[2 * col_index + 1] + dn1 * z1 * head_rstd
 
         else:
             gV_packed = cute.local_tile(mV_packed, tiler_mn, (bidx, tile_index - num_tiles_qk))
