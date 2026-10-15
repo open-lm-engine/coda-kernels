@@ -364,12 +364,12 @@ def reduce(
     num_warps_per_row = max(thread_shape[1] // cute.arch.WARP_SIZE, 1)
     num_warps_per_col = num_warps // num_warps_per_row
     reduction_buffer_shape = (num_elements, num_warps_per_col, num_warps_per_row)
-    # a warp never splits a row: a row spans whole warps, or a warp holds whole rows
+    # a warp never splits a row: a row spans whole warps, or a warp holds whole rows,
+    # and the block is whole warps, so the divisions above are exact
     static_assert(
         (thread_shape[1] % cute.arch.WARP_SIZE == 0) or
         (cute.arch.WARP_SIZE % thread_shape[1] == 0)
     )
-    # and the block is whole warps, so the divisions above are exact
     static_assert(cute.size(thread_shape) % cute.arch.WARP_SIZE == 0)
     static_assert(num_warps_per_row <= cute.arch.WARP_SIZE)
     static_assert(pytree.tree_all(lambda x: x.element_type == xs[0].element_type, xs))
