@@ -135,25 +135,27 @@ def qknorm_rope_bwd_kernel(
     lanes_per_head = cutlass.const_expr(head_dim // (2 * vector_size))
 
     for row_index in cutlass.range_constexpr(val_m):
-        row_coord, col_coord_begin = tXcX_packed[row_index * vector_size]
-        # a row past M clamps its reads to the last row and is left out of drms and dgamma
+        row_coord, col_coord_packed_begin = tXcX_packed[row_index * vector_size]
+        # the last tile can run past M. rows beyond M never load or store their tiles,
+        # read head_mean_sq and pos from row M - 1 to stay in bounds,
+        # and are skipped by dgamma, which sums over rows
         row_coord_clamped = cutlass.min(row_coord, mX_packed.shape[0] - 1)
         row_in_bound = row_coord < mX_packed.shape[0]
 
         # gamma is [gamma_q | gamma_k]
-        head_idx = (2 * col_coord_begin) // head_dim
-        gamma_offset = head_dim if head_idx >= num_heads_q else 0
+        head_index = (2 * col_coord_packed_begin) // head_dim
+        gamma_offset = head_dim if head_index >= num_heads_q else 0
 
         rms = cute.math.rsqrt(
-            mHeadMeanSq[row_coord_clamped, head_idx] + eps,
+            mHeadMeanSq[row_coord_clamped, head_index] + eps,
             fastmath=True,
         )
         drms = cute.Float32.zero
         for col_index in cutlass.range_constexpr(vector_size):
             flat_index = row_index * vector_size + col_index
-            _, col_coord = tXcX_packed[flat_index]
-            gamma_index = (2 * col_coord) % head_dim
-            freq_index = 2 * col_coord
+            _, col_coord_packed = tXcX_packed[flat_index]
+            gamma_index = (2 * col_coord_packed) % head_dim
+            freq_index = 2 * col_coord_packed
             s, c = math_utils.rope_pos_freq(
                 pos=mPos[row_coord_clamped].to(dtype=cute.Float32),
                 freq_hi=mFreq[freq_index].to(dtype=cute.Float32),
@@ -169,9 +171,7 @@ def qknorm_rope_bwd_kernel(
             g1 = mGamma[gamma_offset + gamma_index + 1].to(dtype=cute.Float32)
             rDZ[2 * col_index] = dz0
             rDZ[2 * col_index + 1] = dz1
-
-            if row_in_bound:
-                drms = drms + dz0 * g0 * x0 + dz1 * g1 * x1
+            drms = drms + dz0 * g0 * x0 + dz1 * g1 * x1
 
         if cutlass.const_expr(lanes_per_head > 1):
             drms = cute.arch.warp_reduction(
@@ -184,8 +184,8 @@ def qknorm_rope_bwd_kernel(
         dssq2 = -drms * rms * rms * rms / head_dim
         for col_index in cutlass.range_constexpr(vector_size):
             flat_index = row_index * vector_size + col_index
-            _, col_coord = tXcX_packed[flat_index]
-            gamma_index = (2 * col_coord) % head_dim
+            _, col_coord_packed = tXcX_packed[flat_index]
+            gamma_index = (2 * col_coord_packed) % head_dim
             g0 = mGamma[gamma_offset + gamma_index].to(dtype=cute.Float32)
             g1 = mGamma[gamma_offset + gamma_index + 1].to(dtype=cute.Float32)
             dz0 = rDZ[2 * col_index]
