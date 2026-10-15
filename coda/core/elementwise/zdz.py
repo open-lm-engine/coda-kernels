@@ -537,8 +537,9 @@ def qknorm_rope_bwd_zdz_kernel(
                     rDN[2 * col_index + 1] = dn1
                     drms = drms + dn0 * g0 * z0 + dn1 * g1 * z1
 
-                # zdz needs this head's sum(z * dz). the norm makes it exactly eps * rms^3 * drms,
-                # a value too small to survive rounding in dz, so it is computed from the formula.
+                # zdz needs this head's sum(z * dz). the norm makes it exactly eps * rms^3 * drms.
+                # a direct sum of z * dz would be swamped by error: dz is rounded, and z is rebuilt
+                # from the bf16 preact, so mean(z^2) misses the forward's head_mean_sq by far more than eps.
                 # drms is still split across the head's lanes here, so each lane adds its own part
                 rZdZ[row_index] = rZdZ[row_index] + eps * rms_cubed * drms
                 if cutlass.const_expr(lanes_per_head > 1):
