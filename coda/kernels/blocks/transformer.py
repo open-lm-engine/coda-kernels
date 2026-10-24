@@ -469,6 +469,12 @@ def block_forward(
     head_dim: int,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    size_qkv = w3.shape[0]
+    assert size_qkv % (3 * head_dim) == 0
+    num_heads = size_qkv // (3 * head_dim)
+    size_qk = 2 * num_heads * head_dim
+    size_v = num_heads * head_dim
+
     y0 = xsa_fwd(
         x=o0,
         v=v0,
@@ -493,6 +499,13 @@ def block_forward(
         weight=wn1,
         eps=eps,
     )
+
+    # only q and k are normed per head and roped, so V is a GEMM of its own into
+    # the same [Q | K | V] buffer
+    qkv = x2.new_empty(x2.shape[0], size_qkv)
+    qk, v2 = qkv.split([size_qk, size_v], dim=1)
+    w3_qk, w3_v = w3.split([size_qk, size_v], dim=0)
+
     _, preact2, head_mean_sq2 = gemm_rmsnorm_qknorm_rope(
         A=h2,
         B=w3_qk.mT,
