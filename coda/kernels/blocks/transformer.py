@@ -641,39 +641,52 @@ def block_pre(
     x: torch.Tensor,
     w: torch.Tensor,
     wn: torch.Tensor,
+    wn2: torch.Tensor,
     positions: torch.Tensor,
     frequencies: torch.Tensor,
+    head_dim: int,
     eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, length, _ = x.shape
-    dim1, dim0 = w.shape
+    _, dim0 = w.shape
     assert x.shape == (batch, length, dim0)
-    assert x.dtype in (torch.float16, torch.bfloat16)
-    assert w.shape == (dim1, dim0)
+    # `v` feeds the XSA ops, which are bf16 only
+    assert x.dtype == torch.bfloat16
+    # MHA with H * head_dim == dim0: [Q | K | V] rows, q and k in adjacent-pair order
+    assert w.shape == (3 * dim0, dim0)
     assert w.dtype == x.dtype
     assert wn.shape == (dim0,)
     assert wn.dtype == x.dtype
+    # [gamma_q | gamma_k], each in the same pair order
+    assert wn2.shape == (2 * head_dim,)
+    assert wn2.dtype == x.dtype
     assert positions.shape == (batch * length,)
     assert positions.dtype in (torch.float32, torch.int32)
-    assert frequencies.shape == (dim1,)
+    # q and k only: v is not roped
+    assert frequencies.shape == (2 * dim0,)
     assert frequencies.dtype == torch.float32
-    residual, qkv = BlockPre.apply(
+    assert dim0 % head_dim == 0
+    residual, qkv, v = BlockPre.apply(
         rearrange(x, "b t d -> (b t) d"),
         w,
         wn,
+        wn2,
         positions,
         frequencies,
+        head_dim,
         eps,
     )
     return (
         rearrange(residual, "(b t) d -> b t d", b=batch),
         rearrange(qkv, "(b t) d -> b t d", b=batch),
+        rearrange(v, "(b t) d -> b t d", b=batch),
     )
 
 
 def block_post(
     x0: torch.Tensor,
-    y0: torch.Tensor,
+    o0: torch.Tensor,
+    v0: torch.Tensor,
     w0: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -681,6 +694,7 @@ def block_post(
     wn0: torch.Tensor,
     wn1: torch.Tensor,
     targets: torch.Tensor,
+    head_dim: int,
     eps: float,
     ignore_index: int = -100,
     reduction: str = "mean",
@@ -690,9 +704,12 @@ def block_post(
     dim1, _ = w1.shape
     dim3, _ = w3.shape
     assert x0.shape == (batch, length, dim0)
-    assert x0.dtype in (torch.float16, torch.bfloat16)
-    assert y0.shape == (batch, length, dim0)
-    assert y0.dtype == x0.dtype
+    # the XSA backward packs bf16 pairs
+    assert x0.dtype == torch.bfloat16
+    assert o0.shape == (batch, length, dim0)
+    assert o0.dtype == x0.dtype
+    assert v0.shape == (batch, length, dim0)
+    assert v0.dtype == x0.dtype
     assert w0.shape == (dim0, dim0)
     assert w0.dtype == x0.dtype
     assert w1.shape == (dim1, dim0)
@@ -710,7 +727,8 @@ def block_post(
     assert reduction in ("mean", "sum")
     return BlockPost.apply(
         rearrange(x0, "b t d -> (b t) d"),
-        rearrange(y0, "b t d -> (b t) d"),
+        rearrange(o0, "b t d -> (b t) d"),
+        rearrange(v0, "b t d -> (b t) d"),
         w0,
         w1,
         w2,
@@ -718,6 +736,7 @@ def block_post(
         wn0,
         wn1,
         targets,
+        head_dim,
         eps,
         ignore_index,
         reduction,
