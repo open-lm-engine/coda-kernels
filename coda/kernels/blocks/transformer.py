@@ -5,18 +5,20 @@ from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 from coda.core.ops.constants import ALLOW_INPLACE_GRAD_OUTPUT
 from coda.core.elementwise.functional import (
-    cross_entropy_fwd_bwd,
-    rope_bwd_zdz,
+    gemm_rmsnorm_lse_ce,
+    qknorm_rope_bwd_zdz,
+    xsa_fwd,
 )
 from coda.core.gemm.functional import (
     gemm as coda_gemm,
     gemm_scalar_scale,
     gemm_residual_partial_rmsnorm,
     gemm_residual_partial_rmsnorm_bwd,
-    gemm_rmsnorm_lse,
-    gemm_rmsnorm_rope,
+    gemm_rmsnorm,
+    gemm_rmsnorm_qknorm_rope,
     gemm_rmsnorm_swiglu,
     gemm_swiglu_bwd_zdz,
+    gemm_xsa_bwd,
 )
 
 USE_CODA_GEMM = False
@@ -453,17 +455,25 @@ class BlockPost(torch.autograd.Function):
 
 def block_forward(
     x0: torch.Tensor,
-    y0: torch.Tensor,
+    o0: torch.Tensor,
+    v0: torch.Tensor,
     w0: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
     w3: torch.Tensor,
     wn0: torch.Tensor,
     wn1: torch.Tensor,
+    wn2: torch.Tensor,
     positions: torch.Tensor,
     frequencies: torch.Tensor,
+    head_dim: int,
     eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    y0 = xsa_fwd(
+        x=o0,
+        v=v0,
+        head_dim=head_dim,
+    )
     x1, h1, rstd1 = gemm_residual_partial_rmsnorm(
         A=y0,
         B=w0.mT,
@@ -483,19 +493,34 @@ def block_forward(
         weight=wn1,
         eps=eps,
     )
-    qkv = gemm_rmsnorm_rope(
+    _, preact2, head_mean_sq2 = gemm_rmsnorm_qknorm_rope(
         A=h2,
         B=w3.mT,
         rstd=rstd2,
+        weight=wn2,
         positions=positions,
         frequencies=frequencies,
+        head_dim=head_dim,
+        num_heads_q=num_heads,
+        num_heads_k=num_heads,
+        eps=eps,
+        out=qk,
     )
-    return qkv, x1, x2, rstd1, rstd2, z1
+    gemm_rmsnorm(
+        A=h2,
+        B=w3.mT,
+        rstd=rstd2,
+        out=v,
+    )
+    return qkv, v, y0, x1, x2, rstd1, rstd2, z1, preact2, head_mean_sq2
 
 
 def block_backward(
     dx2: torch.Tensor,
     dy2: torch.Tensor,
+    dv2: torch.Tensor,
+    o0: torch.Tensor,
+    v0: torch.Tensor,
     y0: torch.Tensor,
     w0: torch.Tensor,
     w1: torch.Tensor,
@@ -503,34 +528,49 @@ def block_backward(
     w3: torch.Tensor,
     wn0: torch.Tensor,
     wn1: torch.Tensor,
+    wn2: torch.Tensor,
     qkv: torch.Tensor,
     x1: torch.Tensor,
     x2: torch.Tensor,
     rstd1: torch.Tensor,
     rstd2: torch.Tensor,
     z1: torch.Tensor,
+    preact2: torch.Tensor,
+    head_mean_sq2: torch.Tensor,
     positions: torch.Tensor,
     frequencies: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    head_dim: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     assert x2.ndim == 2
     assert x1.shape == x2.shape
     dim = x2.shape[1]
-    # y = R z and dz = R^T dy, hence
-    # sum(z * dz) = z^T R^T dy = (R z)^T dy = sum(y * dy).
-    dz2, zdz2 = rope_bwd_zdz(
-        y=qkv,
+    # sum(z * dz) = sum(y * dy) fails under the per-head norm: a normed head contributes
+    # eps * head_rstd^3 * dhead_rstd, formed in fp32 by the kernel; the V columns add
+    # the next block's XSA grad `dv2` to `dy2`
+    dz2, zdz2, dwn2 = qknorm_rope_bwd_zdz(
         dy=dy2,
+        v=v,
+        preact=preact2,
+        rstd=rstd2,
+        head_mean_sq=head_mean_sq2,
+        gamma=wn2,
         pos=positions,
         freq=frequencies,
+        head_dim=head_dim,
+        num_heads_q=num_heads,
+        num_heads_k=num_heads,
+        eps=eps,
         scale=1.0 / dim,
+        dv=dv2,
+        dz=dz2,
     )
-    dx_out = dx2 if ALLOW_INPLACE_GRAD_OUTPUT else dx2.clone()
     dx_out, dwn1, x_out2 = gemm_residual_partial_rmsnorm_bwd(
         A=dz2,
         B=w3.mT,
         weight=wn1,
         pre=x2,
-        # we don't need `/ dim` here because `rope_bwd_zdz` already does it
+        # we don't need `/ dim` here because `qknorm_rope_bwd_zdz` already does it
         ZdZ=zdz2,
         rstd=rstd2,
         dX=dx_out,
@@ -553,17 +593,25 @@ def block_backward(
         dX=dx_out,
     )
     dw1 = gemm(dz1.mT, x_out1)
-    dy0 = gemm(dx_out, w0)
+    do0, dv0 = gemm_xsa_bwd(
+        A=dx_out,
+        B=w0.mT,
+        x=o0,
+        v=v0,
+        head_dim=head_dim,
+    )
     dw0 = gemm(dx_out.mT, y0)
     return (
         dx_out,
-        dy0,
+        do0,
+        dv0,
         dw0,
         dw1,
         dw2,
         dw3,
         dwn0.to(dtype=wn0.dtype),
         dwn1.to(dtype=wn1.dtype),
+        dwn2.to(dtype=wn2.dtype),
     )
 
 
