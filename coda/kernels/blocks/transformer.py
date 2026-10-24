@@ -146,7 +146,7 @@ class BlockPre(torch.autograd.Function):
     def backward(
         ctx,
         dx: torch.Tensor,
-        dy: torch.Tensor,
+        dqkv: torch.Tensor,
         dv: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None, None, None, None]:
         (
@@ -163,7 +163,7 @@ class BlockPre(torch.autograd.Function):
         ) = ctx.saved_tensors
         dx_out, dw, dwn, dwn2 = block_pre_backward(
             dx=dx,
-            dy=dy,
+            dqkv=dqkv,
             dv=dv,
             x=x,
             w=w,
@@ -495,7 +495,7 @@ def block_forward(
     )
     _, preact2, head_mean_sq2 = gemm_rmsnorm_qknorm_rope(
         A=h2,
-        B=w3.mT,
+        B=w3_qk.mT,
         rstd=rstd2,
         weight=wn2,
         positions=positions,
@@ -508,16 +508,16 @@ def block_forward(
     )
     gemm_rmsnorm(
         A=h2,
-        B=w3.mT,
+        B=w3_v.mT,
         rstd=rstd2,
-        out=v,
+        out=v2,
     )
-    return qkv, v, y0, x1, x2, rstd1, rstd2, z1, preact2, head_mean_sq2
+    return qkv, v2, y0, x1, x2, rstd1, rstd2, z1, preact2, head_mean_sq2
 
 
 def block_backward(
     dx2: torch.Tensor,
-    dy2: torch.Tensor,
+    dqkv: torch.Tensor,
     dv2: torch.Tensor,
     o0: torch.Tensor,
     v0: torch.Tensor,
@@ -545,12 +545,12 @@ def block_backward(
     assert x2.ndim == 2
     assert x1.shape == x2.shape
     dim = x2.shape[1]
-    # sum(z * dz) = sum(y * dy) fails under the per-head norm: a normed head contributes
-    # eps * head_rstd^3 * dhead_rstd, formed in fp32 by the kernel; the V columns add
-    # the next block's XSA grad `dv2` to `dy2`
+    # sum(z2 * dz2) = sum(qkv * dqkv) fails under the per-head norm: a normed head
+    # contributes eps * head_rstd^3 * dhead_rstd, formed in fp32 by the kernel; the V
+    # columns add the next block's XSA grad `dv2` to `dqkv`
     dz2, zdz2, dwn2 = qknorm_rope_bwd_zdz(
-        dy=dy2,
-        v=v,
+        dy=dqkv,
+        v=v2,
         preact=preact2,
         rstd=rstd2,
         head_mean_sq=head_mean_sq2,
@@ -700,7 +700,7 @@ class Block(torch.autograd.Function):
     def backward(
         ctx,
         dx2: torch.Tensor,
-        dy2: torch.Tensor,
+        dqkv: torch.Tensor,
         dv2: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None, None, None, None]:
         (
@@ -727,7 +727,7 @@ class Block(torch.autograd.Function):
         ) = ctx.saved_tensors
         dx0, do0, dv0, dw0, dw1, dw2, dw3, dwn0, dwn1, dwn2 = block_backward(
             dx2=dx2,
-            dy2=dy2,
+            dqkv=dqkv,
             dv2=dv2,
             o0=o0,
             v0=v0,
@@ -925,7 +925,7 @@ def block(
     assert frequencies.shape == (2 * dim0,)
     assert frequencies.dtype == torch.float32
     assert dim0 % head_dim == 0
-    residual, qkv, v = Block.apply(
+    residual, qkv, v2 = Block.apply(
         rearrange(x0, "b t d -> (b t) d"),
         rearrange(o0, "b t d -> (b t) d"),
         rearrange(v0, "b t d -> (b t) d"),
@@ -944,5 +944,5 @@ def block(
     return (
         rearrange(residual, "(b t) d -> b t d", b=batch),
         rearrange(qkv, "(b t) d -> b t d", b=batch),
-        rearrange(v, "(b t) d -> b t d", b=batch),
+        rearrange(v2, "(b t) d -> b t d", b=batch),
     )
