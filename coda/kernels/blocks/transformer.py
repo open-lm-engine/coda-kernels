@@ -530,36 +530,57 @@ def block_backward(
 class Block(torch.autograd.Function):
 
     @staticmethod
-    @input_guard
+    # `v0` is a view of the previous `qkv`: making it contiguous would copy V
+    # and keep that copy alive for the backward
+    @input_guard(no_guard_contiguous=["v0"])
     @autocast_custom_fwd
     def forward(
         ctx,
         x0: torch.Tensor,
-        y0: torch.Tensor,
+        o0: torch.Tensor,
+        v0: torch.Tensor,
         w0: torch.Tensor,
         w1: torch.Tensor,
         w2: torch.Tensor,
         w3: torch.Tensor,
         wn0: torch.Tensor,
         wn1: torch.Tensor,
+        wn2: torch.Tensor,
         positions: torch.Tensor,
         frequencies: torch.Tensor,
+        head_dim: int,
         eps: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        qkv, x1, x2, rstd1, rstd2, z1 = block_forward(
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        (
+            qkv,
+            v2,
+            y0,
+            x1,
+            x2,
+            rstd1,
+            rstd2,
+            z1,
+            preact2,
+            head_mean_sq2,
+        ) = block_forward(
             x0=x0,
-            y0=y0,
+            o0=o0,
+            v0=v0,
             w0=w0,
             w1=w1,
             w2=w2,
             w3=w3,
             wn0=wn0,
             wn1=wn1,
+            wn2=wn2,
             positions=positions,
             frequencies=frequencies,
+            head_dim=head_dim,
             eps=eps,
         )
         ctx.save_for_backward(
+            o0,
+            v0,
             y0,
             w0,
             w1,
@@ -567,16 +588,23 @@ class Block(torch.autograd.Function):
             w3,
             wn0,
             wn1,
+            wn2,
             qkv,
             x1,
             x2,
             rstd1,
             rstd2,
             z1,
+            preact2,
+            head_mean_sq2,
             positions,
             frequencies,
         )
-        return x2, qkv
+        ctx.head_dim = head_dim
+        ctx.eps = eps
+        # `v2` is a view of `qkv`: as an output of its own, the next block's XSA grad
+        # reaches the backward apart from FA's, with no slice to scatter it back
+        return x2, qkv, v2
 
     @staticmethod
     @input_guard
@@ -585,8 +613,11 @@ class Block(torch.autograd.Function):
         ctx,
         dx2: torch.Tensor,
         dy2: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None, None, None]:
+        dv2: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None, None, None, None]:
         (
+            o0,
+            v0,
             y0,
             w0,
             w1,
@@ -594,18 +625,24 @@ class Block(torch.autograd.Function):
             w3,
             wn0,
             wn1,
+            wn2,
             qkv,
             x1,
             x2,
             rstd1,
             rstd2,
             z1,
+            preact2,
+            head_mean_sq2,
             positions,
             frequencies,
         ) = ctx.saved_tensors
-        dx0, dy0, dw0, dw1, dw2, dw3, dwn0, dwn1 = block_backward(
+        dx0, do0, dv0, dw0, dw1, dw2, dw3, dwn0, dwn1, dwn2 = block_backward(
             dx2=dx2,
             dy2=dy2,
+            dv2=dv2,
+            o0=o0,
+            v0=v0,
             y0=y0,
             w0=w0,
             w1=w1,
@@ -613,26 +650,34 @@ class Block(torch.autograd.Function):
             w3=w3,
             wn0=wn0,
             wn1=wn1,
+            wn2=wn2,
             qkv=qkv,
             x1=x1,
             x2=x2,
             rstd1=rstd1,
             rstd2=rstd2,
             z1=z1,
+            preact2=preact2,
+            head_mean_sq2=head_mean_sq2,
             positions=positions,
             frequencies=frequencies,
+            head_dim=ctx.head_dim,
+            eps=ctx.eps,
         )
         return (
             dx0,
-            dy0,
+            do0,
+            dv0,
             dw0,
             dw1,
             dw2,
             dw3,
             dwn0,
             dwn1,
+            dwn2,
             None,  # positions
             None,  # frequencies
+            None,  # head_dim
             None,  # eps
         )
 
@@ -725,6 +770,7 @@ def block_post(
     assert targets.shape == (batch * length,)
     assert targets.dtype == torch.int32
     assert reduction in ("mean", "sum")
+    assert dim0 % head_dim == 0
     return BlockPost.apply(
         rearrange(x0, "b t d -> (b t) d"),
         rearrange(o0, "b t d -> (b t) d"),
@@ -790,6 +836,7 @@ def block(
     # q and k only: v is not roped
     assert frequencies.shape == (2 * dim0,)
     assert frequencies.dtype == torch.float32
+    assert dim0 % head_dim == 0
     residual, qkv, v = Block.apply(
         rearrange(x0, "b t d -> (b t) d"),
         rearrange(o0, "b t d -> (b t) d"),
