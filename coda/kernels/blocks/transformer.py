@@ -558,6 +558,20 @@ def block_backward(
     assert x2.ndim == 2
     assert x1.shape == x2.shape
     dim = x2.shape[1]
+    size_qkv = w3.shape[0]
+    assert size_qkv % (3 * head_dim) == 0
+    num_heads = size_qkv // (3 * head_dim)
+    size_qk = 2 * num_heads * head_dim
+    size_v = num_heads * head_dim
+
+    _, v2 = qkv.split([size_qk, size_v], dim=1)
+    if ALLOW_INPLACE_GRAD_OUTPUT:
+        dz2 = dqkv
+        dx_out = dx2
+    else:
+        dz2 = None
+        dx_out = dx2.clone()
+
     # sum(z2 * dz2) = sum(qkv * dqkv) fails under the per-head norm: a normed head
     # contributes eps * head_rstd^3 * dhead_rstd, formed in fp32 by the kernel; the V
     # columns add the next block's XSA grad `dv2` to `dqkv`
