@@ -726,55 +726,69 @@ def block_post(
 
 def block(
     x0: torch.Tensor,
-    y0: torch.Tensor,
+    o0: torch.Tensor,
+    v0: torch.Tensor,
     w0: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
     w3: torch.Tensor,
     wn0: torch.Tensor,
     wn1: torch.Tensor,
+    wn2: torch.Tensor,
     positions: torch.Tensor,
     frequencies: torch.Tensor,
+    head_dim: int,
     eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, length, _ = x0.shape
     dim0, _ = w0.shape
     dim1, _ = w1.shape
-    dim3, _ = w3.shape
     assert x0.shape == (batch, length, dim0)
-    assert x0.dtype in (torch.float16, torch.bfloat16)
-    assert y0.shape == (batch, length, dim0)
-    assert y0.dtype == x0.dtype
+    # the XSA backward packs bf16 pairs
+    assert x0.dtype == torch.bfloat16
+    assert o0.shape == (batch, length, dim0)
+    assert o0.dtype == x0.dtype
+    assert v0.shape == (batch, length, dim0)
+    assert v0.dtype == x0.dtype
     assert w0.shape == (dim0, dim0)
     assert w0.dtype == x0.dtype
     assert w1.shape == (dim1, dim0)
     assert w1.dtype == x0.dtype
     assert w2.shape == (dim0, dim1 // 2)
     assert w2.dtype == x0.dtype
-    assert w3.shape == (dim3, dim0)
+    # MHA with H * head_dim == dim0: [Q | K | V] rows, q and k in adjacent-pair order
+    assert w3.shape == (3 * dim0, dim0)
     assert w3.dtype == x0.dtype
     assert wn0.shape == (dim0,)
     assert wn0.dtype == x0.dtype
     assert wn1.shape == (dim0,)
     assert wn1.dtype == x0.dtype
+    # [gamma_q | gamma_k], each in the same pair order
+    assert wn2.shape == (2 * head_dim,)
+    assert wn2.dtype == x0.dtype
     assert positions.shape == (batch * length,)
     assert positions.dtype in (torch.float32, torch.int32)
-    assert frequencies.shape == (dim3,)
+    # q and k only: v is not roped
+    assert frequencies.shape == (2 * dim0,)
     assert frequencies.dtype == torch.float32
-    residual, qkv = Block.apply(
+    residual, qkv, v = Block.apply(
         rearrange(x0, "b t d -> (b t) d"),
-        rearrange(y0, "b t d -> (b t) d"),
+        rearrange(o0, "b t d -> (b t) d"),
+        rearrange(v0, "b t d -> (b t) d"),
         w0,
         w1,
         w2,
         w3,
         wn0,
         wn1,
+        wn2,
         positions,
         frequencies,
+        head_dim,
         eps,
     )
     return (
         rearrange(residual, "(b t) d -> b t d", b=batch),
         rearrange(qkv, "(b t) d -> b t d", b=batch),
+        rearrange(v, "(b t) d -> b t d", b=batch),
     )
