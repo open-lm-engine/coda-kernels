@@ -107,8 +107,8 @@ def rope_bwd_zdz_kernel(
         for row_index in cutlass.range_constexpr(val_m):
             for col_index in cutlass.range_constexpr(vector_size):
                 flat_index = row_index * vector_size + col_index
-                _, col_coord = tYcY_packed[flat_index]
-                freq_index = 2 * col_coord
+                _, col_coord_packed = tYcY_packed[flat_index]
+                freq_index = 2 * col_coord_packed
                 s, c = math_utils.rope_pos_freq(
                     pos=rPos[row_index],
                     freq_hi=mFreq[freq_index].to(dtype=cute.Float32),
