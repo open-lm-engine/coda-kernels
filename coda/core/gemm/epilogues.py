@@ -251,11 +251,11 @@ _head_mean_sq_op = HeadMeanSq("qk")
 def qknorm_rope_epi(acc: EpiValue, qk: EpiValue, weight: EpiValue, eps: EpiValue, pos: EpiValue, freq: EpiValue) -> EpiOut:
     # the statistic is per (row, head), so both lanes of the pair carry the same statistic
     head_mean_sq, _ = unpack(qk)
-    rstd = cute.math.rsqrt(head_mean_sq + eps, fastmath=True)
+    head_rstd = cute.math.rsqrt(head_mean_sq + eps, fastmath=True)
     x1, x2 = unpack(acc * weight)
     s, c = _sincos_turns(*_angle_turns(pos, freq))
-    x1 = x1 * rstd
-    x2 = x2 * rstd
+    x1 = x1 * head_rstd
+    x2 = x2 * head_rstd
     return {"D": pack(x1 * c - x2 * s, x1 * s + x2 * c), "preact": acc}
 
 
