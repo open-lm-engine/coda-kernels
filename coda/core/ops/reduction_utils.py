@@ -143,6 +143,8 @@ class BlockReductionOp(NamedTuple):
     ) -> Sequence[Numeric]:
         static_assert(pytree.tree_all(lambda x: isinstance(x, Numeric), xs))
         if cutlass.const_expr(self.reduce_wrp is not None):
+            # reduce_wrp takes no width: it always reduces the whole warp
+            static_assert(width == cute.arch.WARP_SIZE)
             xs = self.reduce_wrp(xs)
         else:
             xs = warp_reduce(xs=xs, width=width, op=self.combine_fn)
@@ -356,9 +358,6 @@ def reduce(
     )
 
     # block reduction
-    # this function assumes that all values owned by a warp are in the same row.
-    # 1. each warp is in one row
-    # 2. each thread is in one row as well
     num_elements = len(outputs)
     num_warps = cute.size(thread_shape) // cute.arch.WARP_SIZE
     num_warps_per_row = max(thread_shape[1] // cute.arch.WARP_SIZE, 1)
@@ -381,6 +380,8 @@ def reduce(
             static_assert(reduction_buffer.shape == reduction_buffer_shape)
             static_assert(reduction_buffer.element_type == xs[0].element_type)
             static_assert(reduction_buffer.memspace == cute.AddressSpace.smem)
+            # a reused buffer may still be read by warps finishing the previous reduction
+            cute.arch.barrier()
         else:
             reduction_buffer_created = allocate_tensor_from_shape(
                 shape=reduction_buffer_shape,
