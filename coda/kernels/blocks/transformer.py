@@ -35,56 +35,111 @@ def block_pre_forward(
     x: torch.Tensor,
     w: torch.Tensor,
     wn: torch.Tensor,
+    wn2: torch.Tensor,
     positions: torch.Tensor,
     frequencies: torch.Tensor,
+    head_dim: int,
     eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     assert wn.dtype == x.dtype
     assert x.ndim == 2
     dim = x.shape[1]
+    size_qkv = w.shape[0]
+    assert size_qkv % (3 * head_dim) == 0
+    num_heads = size_qkv // (3 * head_dim)
+    size_qk = 2 * num_heads * head_dim
+    size_v = num_heads * head_dim
+
     h = x * rearrange(wn, "d -> 1 d")
     rstd = quack_rms_final_reduce(
         x=x.float() ** 2,
         scale=1.0 / dim,
         eps=eps,
     )
-    qkv = gemm_rmsnorm_rope(
+
+    # only q and k are normed per head and roped, so V is a GEMM of its own into
+    # the same [Q | K | V] buffer
+    qkv = x.new_empty(x.shape[0], size_qkv)
+    qk, v = qkv.split([size_qk, size_v], dim=1)
+    w_qk, w_v = w.split([size_qk, size_v], dim=0)
+
+    _, preact, head_mean_sq = gemm_rmsnorm_qknorm_rope(
         A=h,
-        B=w.mT,
+        B=w_qk.mT,
         rstd=rstd,
+        weight=wn2,
         positions=positions,
         frequencies=frequencies,
+        head_dim=head_dim,
+        num_heads_q=num_heads,
+        num_heads_k=num_heads,
+        eps=eps,
+        out=qk,
     )
-    return qkv, rstd
+    gemm_rmsnorm(
+        A=h,
+        B=w_v.mT,
+        rstd=rstd,
+        out=v,
+    )
+    return qkv, v, rstd, preact, head_mean_sq
 
 
 def block_pre_backward(
     dx: torch.Tensor,
-    dy: torch.Tensor,
+    dqkv: torch.Tensor,
+    dv: torch.Tensor,
     x: torch.Tensor,
     w: torch.Tensor,
     wn: torch.Tensor,
+    wn2: torch.Tensor,
     qkv: torch.Tensor,
     rstd: torch.Tensor,
+    preact: torch.Tensor,
+    head_mean_sq: torch.Tensor,
     positions: torch.Tensor,
     frequencies: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    head_dim: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     assert x.ndim == 2
     dim = x.shape[1]
-    # y = R z and dz = R^T dy, hence
-    # sum(z * dz) = z^T R^T dy = (R z)^T dy = sum(y * dy).
-    dz, zdz = rope_bwd_zdz(
-        y=qkv,
-        dy=dy,
+    size_qkv = w.shape[0]
+    assert size_qkv % (3 * head_dim) == 0
+    num_heads = size_qkv // (3 * head_dim)
+    size_qk = 2 * num_heads * head_dim
+    size_v = num_heads * head_dim
+
+    _, v = qkv.split([size_qk, size_v], dim=1)
+    if ALLOW_INPLACE_GRAD_OUTPUT:
+        dz = dqkv
+        dx_out = dx
+    else:
+        dz = None
+        dx_out = dx.clone()
+
+    # sum(z * dz) = sum(qkv * dqkv) fails under the per-head norm: a normed head
+    # contributes eps * head_rstd^3 * dhead_rstd, formed in fp32 by the kernel; the V
+    # columns add the next block's XSA grad `dv` to `dqkv`
+    dz, zdz, dwn2 = qknorm_rope_bwd_zdz(
+        dy=dqkv,
+        v=v,
+        preact=preact,
+        rstd=rstd,
+        head_mean_sq=head_mean_sq,
+        gamma=wn2,
         pos=positions,
         freq=frequencies,
+        head_dim=head_dim,
+        num_heads_q=num_heads,
+        num_heads_k=num_heads,
+        eps=eps,
         scale=1.0 / dim,
+        dv=dv,
+        dz=dz,
     )
-    dx_out = dx if ALLOW_INPLACE_GRAD_OUTPUT else dx.clone()
     dx_out, dwn, x_out = gemm_residual_partial_rmsnorm_bwd(
         A=dz,
-        # TODO: the function itself also transposes `B`
-        # maybe we can directly pass in `BT` there
         B=w.mT,
         weight=wn,
         pre=x,
@@ -93,7 +148,7 @@ def block_pre_backward(
         dX=dx_out,
     )
     dw = gemm(dz.mT, x_out)
-    return dx_out, dw, dwn.to(dtype=wn.dtype)
+    return dx_out, dw, dwn.to(dtype=wn.dtype), dwn2.to(dtype=wn2.dtype)
 
 
 class BlockPre(torch.autograd.Function):
@@ -192,7 +247,8 @@ class BlockPre(torch.autograd.Function):
 
 def block_post_forward(
     x0: torch.Tensor,
-    y0: torch.Tensor,
+    o0: torch.Tensor,
+    v0: torch.Tensor,
     w0: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -200,10 +256,16 @@ def block_post_forward(
     wn0: torch.Tensor,
     wn1: torch.Tensor,
     targets: torch.Tensor,
+    head_dim: int,
     eps: float,
     ignore_index: int,
     reduction: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+    y0 = xsa_fwd(
+        x=o0,
+        v=v0,
+        head_dim=head_dim,
+    )
     x1, h1, rstd1 = gemm_residual_partial_rmsnorm(
         A=y0,
         B=w0.mT,
@@ -242,11 +304,13 @@ def block_post_forward(
     else:
         scale = None
         loss = losses.sum()
-    return loss, x1, x2, rstd1, rstd2, z1, scale, dlogits, zdz2
+    return loss, y0, x1, x2, rstd1, rstd2, z1, scale, dlogits, zdz2
 
 
 def block_post_backward(
     dloss: torch.Tensor,
+    o0: torch.Tensor,
+    v0: torch.Tensor,
     y0: torch.Tensor,
     w0: torch.Tensor,
     w1: torch.Tensor,
@@ -262,7 +326,8 @@ def block_post_backward(
     scale: torch.Tensor | None,
     dlogits: torch.Tensor,
     zdz2: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     assert x2.ndim == 2
     assert x1.shape == x2.shape
     dim = x2.shape[1]
@@ -301,11 +366,18 @@ def block_post_backward(
         dX=dx_out,
     )
     dw1 = gemm(dz1.mT, x_out1)
-    dy0 = gemm(dx_out, w0)
+    do0, dv0 = gemm_xsa_bwd(
+        A=dx_out,
+        B=w0.mT,
+        x=o0,
+        v=v0,
+        head_dim=head_dim,
+    )
     dw0 = gemm(dx_out.mT, y0)
     return (
         dx_out,
-        dy0,
+        do0,
+        dv0,
         dw0,
         dw1,
         dw2,
