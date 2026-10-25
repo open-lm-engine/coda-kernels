@@ -5,7 +5,7 @@ from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 from coda.core.ops.constants import ALLOW_INPLACE_GRAD_OUTPUT
 from coda.core.elementwise.functional import (
-    cross_entropy_fwd_bwd,
+    gemm_rmsnorm_lse_ce,
     rope_bwd_zdz,
 )
 from coda.core.gemm.functional import (
@@ -13,7 +13,6 @@ from coda.core.gemm.functional import (
     gemm_scalar_scale,
     gemm_residual_partial_rmsnorm,
     gemm_residual_partial_rmsnorm_bwd,
-    gemm_rmsnorm_lse,
     gemm_rmsnorm_rope,
     gemm_rmsnorm_swiglu,
     gemm_swiglu_bwd_zdz,
@@ -198,19 +197,15 @@ def block_post_forward(
         weight=wn1,
         eps=eps,
     )
-    logits, lses = gemm_rmsnorm_lse(
+    # fused LM head and cross entropy, as accurate as fp32: the logits are never rounded to bf16
+    losses, dlogits, zdz2 = gemm_rmsnorm_lse_ce(
         A=h2,
         B=w3.mT,
         rstd=rstd2,
-    )
-    losses, zdz2 = cross_entropy_fwd_bwd(
-        logits=logits,
-        lses=lses,
         target=targets,
         ignore_index=ignore_index,
         return_zdz=True,
     )
-    dlogits = logits
     if reduction == "mean":
         scale = 1.0 / (targets != ignore_index).sum().float()
         loss = losses.sum() * scale
