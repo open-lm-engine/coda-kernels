@@ -4,10 +4,7 @@ from quack.rms_final_reduce import rms_final_reduce as quack_rms_final_reduce
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 from coda.core.ops.constants import ALLOW_INPLACE_GRAD_OUTPUT
-from coda.core.elementwise.functional import (
-    gemm_rmsnorm_lse_ce,
-    rope_bwd_zdz,
-)
+from coda.core.elementwise.functional import rope_bwd_zdz
 from coda.core.gemm.functional import (
     gemm as coda_gemm,
     gemm_scalar_scale,
@@ -17,6 +14,7 @@ from coda.core.gemm.functional import (
     gemm_rmsnorm_swiglu,
     gemm_swiglu_bwd_zdz,
 )
+from coda.kernels.functional.cross_entropy import gemm_rmsnorm_cross_entropy_fwd_bwd
 
 USE_CODA_GEMM = False
 
@@ -198,7 +196,7 @@ def block_post_forward(
         eps=eps,
     )
     # fused LM head and cross entropy, as accurate as fp32: the logits are never rounded to bf16
-    losses, dlogits, zdz2 = gemm_rmsnorm_lse_ce(
+    losses, dlogits, zdz2 = gemm_rmsnorm_cross_entropy_fwd_bwd(
         A=h2,
         B=w3.mT,
         rstd=rstd2,

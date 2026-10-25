@@ -5,7 +5,6 @@ from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 from coda.core.ops.constants import ALLOW_INPLACE_GRAD_OUTPUT
 from coda.core.elementwise.functional import (
-    gemm_rmsnorm_lse_ce,
     qknorm_rope_bwd_zdz,
     xsa_fwd,
 )
@@ -20,6 +19,7 @@ from coda.core.gemm.functional import (
     gemm_swiglu_bwd_zdz,
     gemm_xsa_bwd,
 )
+from coda.kernels.functional.cross_entropy import gemm_rmsnorm_cross_entropy_fwd_bwd
 
 USE_CODA_GEMM = False
 
@@ -112,9 +112,11 @@ def block_pre_backward(
 
     _, v = qkv.split([size_qk, size_v], dim=1)
     if ALLOW_INPLACE_GRAD_OUTPUT:
+        # overwrite the incoming gradients in place: nothing reads them afterwards
         dz = dqkv
         dx_out = dx
     else:
+        # the kernel allocates dz, and the GEMM accumulates into a copy of dx
         dz = None
         dx_out = dx.clone()
 
@@ -285,19 +287,15 @@ def block_post_forward(
         weight=wn1,
         eps=eps,
     )
-    logits, lses = gemm_rmsnorm_lse(
+    # fused LM head and cross entropy, as accurate as fp32: the logits are never rounded to bf16
+    losses, dlogits, zdz2 = gemm_rmsnorm_cross_entropy_fwd_bwd(
         A=h2,
         B=w3.mT,
         rstd=rstd2,
-    )
-    losses, zdz2 = cross_entropy_fwd_bwd(
-        logits=logits,
-        lses=lses,
         target=targets,
         ignore_index=ignore_index,
         return_zdz=True,
     )
-    dlogits = logits
     if reduction == "mean":
         scale = 1.0 / (targets != ignore_index).sum().float()
         loss = losses.sum() * scale
@@ -638,9 +636,11 @@ def block_backward(
 
     _, v2 = qkv.split([size_qk, size_v], dim=1)
     if ALLOW_INPLACE_GRAD_OUTPUT:
+        # overwrite the incoming gradients in place: nothing reads them afterwards
         dz2 = dqkv
         dx_out = dx2
     else:
+        # the kernel allocates dz2, and the GEMM accumulates into a copy of dx2
         dz2 = None
         dx_out = dx2.clone()
 
