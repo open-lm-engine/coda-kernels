@@ -7,7 +7,7 @@ import torch.utils._pytree as pytree
 from typing import NamedTuple, cast
 from collections.abc import Callable, Sequence
 
-from coda.core.ops.misc_utils import Numeric, static_assert, get_dtype, numel
+from coda.core.ops.misc_utils import Numeric, static_assert, get_dtype, numel, is_power_of_2
 from coda.core.ops.dtype_utils import f32x2_to_i64, i64_to_f32x2
 from coda.core.ops.creation_utils import allocate_tensor_from_shape
 
@@ -18,6 +18,10 @@ def warp_reduce(
     op: Callable[[Sequence[Numeric], Sequence[Numeric]], Sequence[Numeric]] | str,
     width: cutlass.Constexpr[int] = cute.arch.WARP_SIZE,
 ) -> Sequence[Numeric] | cute.TensorSSA:
+    # cute.arch.warp_reduction is a butterfly over width // 2, width // 4, ...: other widths skip lanes, and
+    # over 32 the first shuffle leaves the warp and combines each lane with itself (add doubles)
+    static_assert(is_power_of_2(width))
+    static_assert(width <= cute.arch.WARP_SIZE)
 
     if cutlass.const_expr(isinstance(xs, cute.TensorSSA)):
         ys = cute.make_rmem_tensor(xs.shape, xs.dtype)
@@ -383,6 +387,7 @@ def reduce(
             # a reused buffer may still be read by warps finishing the previous reduction
             cute.arch.barrier()
         else:
+            # one slot allocated at trace time: in a runtime loop, pass a buffer instead, or iterations race on it
             reduction_buffer_created = allocate_tensor_from_shape(
                 shape=reduction_buffer_shape,
                 order="row",
@@ -431,14 +436,18 @@ def online_softmax_reduce(
     )
 
     # block reduction
-    # this function assumes that all values owned by a warp are in the same row.
-    # 1. each warp is in one row
-    # 2. each thread is in one row as well
     num_elements = 1
     num_warps = cute.size(thread_shape) // cute.arch.WARP_SIZE
     num_warps_per_row = max(thread_shape[1] // cute.arch.WARP_SIZE, 1)
     num_warps_per_col = num_warps // num_warps_per_row
     reduction_buffer_shape = (num_elements, num_warps_per_col, num_warps_per_row)
+    # a warp never splits a row: a row spans whole warps, or a warp holds whole rows,
+    # and the block is whole warps, so the divisions above are exact
+    static_assert(
+        (thread_shape[1] % cute.arch.WARP_SIZE == 0) or
+        (cute.arch.WARP_SIZE % thread_shape[1] == 0)
+    )
+    static_assert(cute.size(thread_shape) % cute.arch.WARP_SIZE == 0)
     static_assert(num_warps_per_row <= cute.arch.WARP_SIZE)
 
     reduction_buffer_created = None
@@ -448,7 +457,10 @@ def online_softmax_reduce(
             static_assert(reduction_buffer.shape == reduction_buffer_shape)
             static_assert(reduction_buffer.element_type == cute.Int64)
             static_assert(reduction_buffer.memspace == cute.AddressSpace.smem)
+            # a reused buffer may still be read by warps finishing the previous reduction
+            cute.arch.barrier()
         else:
+            # one slot allocated at trace time: in a runtime loop, pass a buffer instead, or iterations race on it
             reduction_buffer_created = allocate_tensor_from_shape(
                 shape=reduction_buffer_shape,
                 order="row",
