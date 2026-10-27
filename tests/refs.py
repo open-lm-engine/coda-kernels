@@ -15,6 +15,17 @@ def swiglu(preact: torch.Tensor) -> torch.Tensor:
     return silu * up
 
 
+swiglu_bench_interleaved = swiglu
+
+
+def swiglu_bench(preact: torch.Tensor) -> torch.Tensor:
+    # gate and up as the contiguous halves [gate | up] of a GEMM over a model's packed [W_gate; W_up]
+    half = preact.shape[-1] // 2
+    gate, up = torch.split(preact, (half, half), dim=-1)
+    silu = torch.nn.functional.silu(gate)
+    return silu * up
+
+
 def dswiglu(preact: torch.Tensor, grad: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     # swiglu's vjp in closed form, interleaved like preact, and the postact it recomputes on the way: closed so that
     # it compiles under fullgraph as torch's arm, and pinned to fp64 autograd in test_refs
@@ -32,17 +43,6 @@ def dswiglu(preact: torch.Tensor, grad: torch.Tensor) -> tuple[torch.Tensor, tor
     grad_preact = rearrange(grad_pairs, "m n two -> m (n two)")
     postact = silu * up
     return grad_preact, postact
-
-
-swiglu_bench_interleaved = swiglu
-
-
-def swiglu_bench(preact: torch.Tensor) -> torch.Tensor:
-    # gate and up as the contiguous halves [gate | up] of a GEMM over a model's packed [W_gate; W_up]
-    half = preact.shape[-1] // 2
-    gate, up = torch.split(preact, (half, half), dim=-1)
-    silu = torch.nn.functional.silu(gate)
-    return silu * up
 
 
 dswiglu_bench_interleaved = dswiglu
