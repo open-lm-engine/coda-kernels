@@ -67,8 +67,7 @@ def drmsnorm(
     ZdZ = rearrange(ZdZ, "m -> m 1")
     row_dot_term = normed * ZdZ
     grad_difference = grad_normed - row_dot_term
-    grad_pre_unrounded = grad_difference * rstd
-    grad_pre = grad_pre_unrounded.to(dtype=pre.dtype)
+    grad_pre = grad_difference * rstd
     grad_weight = reduce(grad * normed, "m n -> n", "sum")
     norm_out = normed * weight
-    return grad_pre, grad_weight, norm_out.to(dtype=pre.dtype)
+    return grad_pre.to(dtype=pre.dtype), grad_weight, norm_out.to(dtype=pre.dtype)
