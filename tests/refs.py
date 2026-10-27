@@ -6,6 +6,7 @@ from quack.gemm_interface import gemm as quack_gemm
 
 
 class PairLayout(Enum):
+    # interleaved: CODA's pairs at columns (2j, 2j + 1); split: two side-by-side halves ([gate | up], rotate_half)
     interleaved = "interleaved"
     split = "split"
 
@@ -14,17 +15,18 @@ class PairLayout(Enum):
 
 
 def swiglu(preact: torch.Tensor) -> torch.Tensor:
-    # gate and up in adjacent columns (2i, 2i + 1), the pairing CODA's gated epilogue emits. In bf16, eager rounds
-    # silu(gate) before the product, as a model's eager swiglu does, and a compiled one does not
+    # silu(gate) * up, gate and up at adjacent columns (2i, 2i + 1)
     pairs = rearrange(preact, "m (n two) -> m n two", two=2)
     gate, up = torch.unbind(pairs, dim=-1)
     silu = torch.nn.functional.silu(gate)
     return silu * up
 
 
-def swiglu_bench(preact: torch.Tensor, layout: PairLayout = PairLayout.interleaved) -> torch.Tensor:
-    # swiglu in either layout, split with gate and up the contiguous halves [gate | up] of a GEMM over a model's
-    # packed [W_gate; W_up]: the forward whose autograd the dswiglu_backward benchmark times
+def swiglu_bench(
+    preact: torch.Tensor,
+    layout: PairLayout,
+) -> torch.Tensor:
+    # swiglu in either layout; split takes gate and up as the halves [gate | up] of a packed [W_gate; W_up] GEMM
     if layout == PairLayout.interleaved:
         return swiglu(preact=preact)
     assert layout == PairLayout.split
@@ -34,9 +36,12 @@ def swiglu_bench(preact: torch.Tensor, layout: PairLayout = PairLayout.interleav
     return silu * up
 
 
-def dswiglu(preact: torch.Tensor, grad: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    # swiglu's vjp dpreact in closed form, interleaved like preact, and the postact it recomputes on the way: closed
-    # so that it compiles under fullgraph as torch's arm, and pinned to fp64 autograd in test_refs
+def dswiglu(
+    preact: torch.Tensor,
+    grad: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # swiglu's vjp dpreact, interleaved like preact, and the recomputed postact
+    # closed form so torch's arm compiles under fullgraph
     pairs = rearrange(preact, "m (n two) -> m n two", two=2)
     gate, up = torch.unbind(pairs, dim=-1)
     sigmoid = torch.nn.functional.sigmoid(gate)
@@ -58,7 +63,7 @@ def _dswiglu_bench(
     grad: torch.Tensor,
     layout: PairLayout,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # dswiglu in either layout, split on the halves, dgate and dup concatenated as the split preact holds them
+    # dswiglu in either layout; split returns dpreact as [dgate | dup], like preact
     if layout == PairLayout.interleaved:
         return dswiglu(preact=preact, grad=grad)
     assert layout == PairLayout.split
@@ -77,19 +82,27 @@ def _dswiglu_bench(
     return dpreact, postact
 
 
-def rmsnorm_rstd(x: torch.Tensor, eps: float) -> torch.Tensor:
-    # the norm's row scale 1 / sqrt(mean(x^2) + eps)
+def rmsnorm_rstd(
+    x: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    # each row's 1 / sqrt(mean(x^2) + eps)
     square = torch.square(x)
     mean_square = reduce(square, "m n -> m", "mean")
     return torch.rsqrt(mean_square + eps)
 
 
-def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    # the model's norm
+def rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    # x * rstd * weight
     rstd = rmsnorm_rstd(x=x, eps=eps)
     rstd = rearrange(rstd, "m -> m 1")
     x_rstd = x * rstd
-    return x_rstd * weight
+    normed = x_rstd * weight
+    return normed.to(dtype=x.dtype)
 
 
 def drmsnorm(
@@ -99,9 +112,8 @@ def drmsnorm(
     ZdZ: torch.Tensor,
     rstd: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # rmsnorm's vjp in closed form, dpre, given grad on its output and its row dot ZdZ = sum(Z dZ) / N, which the
-    # kernel upstream forms from the next GEMM's own output Z and cotangent dZ; then dweight, summed over rows, and
-    # the norm's output normed, recomputed for the next GEMM's wgrad. Pinned to fp64 autograd in test_refs
+    # rmsnorm's vjp dpre and dweight, and the output normed recomputed for the next GEMM's wgrad; ZdZ is the row
+    # dot sum(Z dZ) / N over the next GEMM's output Z
     rstd = rearrange(rstd, "m -> m 1")
     pre_rstd = pre * rstd
     dpre_rstd = grad * weight
@@ -112,14 +124,15 @@ def drmsnorm(
     grad_pre_rstd = grad * pre_rstd
     dweight = reduce(grad_pre_rstd, "m n -> n", "sum")
     normed = pre_rstd * weight
-    return dpre, dweight, normed
+    return dpre.to(dtype=pre.dtype), dweight, normed.to(dtype=pre.dtype)
 
 
-def rope_tables(positions: torch.Tensor, frequencies: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    # each row's (cos, sin) per rotation pair, (M, N / 2), from the table CODA's ops take: pair j's inv_freq / 2 pi
-    # split into an fp32 (hi, lo) at columns (2j, 2j + 1), so the angle is 2 pi pos (hi + lo), in the operands'
-    # dtype. In fp64 it is the float-float angle the kernels form; in fp32 lo drops out and the product rounds, as a
-    # model's fp32 table does
+def rope_tables(
+    positions: torch.Tensor,
+    frequencies: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # (M, N / 2) cos and sin of 2 pi positions (hi + lo), frequencies holding pair j's inv_freq / 2 pi as an fp32
+    # (hi, lo) at columns (2j, 2j + 1); fp64 gives the kernels' float-float angle, fp32 a model's table
     pairs = rearrange(frequencies, "(p two) -> p two", two=2)
     hi, lo = torch.unbind(pairs, dim=1)
     two_pi = 2 * math.pi
@@ -132,9 +145,11 @@ def rope_tables(positions: torch.Tensor, frequencies: torch.Tensor) -> tuple[tor
     return cos, sin
 
 
-def rope_angles(positions: torch.Tensor, inv_freq: torch.Tensor) -> torch.Tensor:
-    # (M, head_dim / 2) radians from what a model holds, its positions and fp32 inv_freq: their product is exact in
-    # fp64 (24 bits by 24), the angle CODA's float-float table carries past fp32, read by the truth and the ideal
+def rope_angles(
+    positions: torch.Tensor,
+    inv_freq: torch.Tensor,
+) -> torch.Tensor:
+    # (M, head_dim / 2) angles positions * inv_freq, in fp64 so the product of the fp32 inputs is exact
     positions = positions.to(dtype=torch.float64)
     positions = rearrange(positions, "m -> m 1")
     inv_freq = inv_freq.to(dtype=torch.float64)
@@ -142,10 +157,13 @@ def rope_angles(positions: torch.Tensor, inv_freq: torch.Tensor) -> torch.Tensor
     return positions * inv_freq
 
 
-def rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    # CODA's layout: each adjacent pair (x0, x1) at columns (2j, 2j + 1) rotated by theta_j,
-    # (x0 cos - x1 sin, x1 cos + x0 sin); -sin rotates by -theta_j, the transpose. The (M, pairs) tables, all heads'
-    # or one head's, broadcast across the heads and are cast to x's dtype, so x sets the precision
+def rope(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    # each pair (x0, x1) at columns (2j, 2j + 1) rotated to (x0 cos - x1 sin, x1 cos + x0 sin), -sin rotating
+    # back; the (M, pairs) tables, one head's or all heads', broadcast over heads, and x's dtype sets the precision
     pairs = rearrange(x, "m (h p two) -> m h p two", p=cos.shape[-1], two=2)
     x0, x1 = torch.unbind(pairs, dim=-1)
     cos = cos.to(dtype=x.dtype)
@@ -169,9 +187,7 @@ def _rope_bench(
     head_dim: int,
     layout: PairLayout,
 ) -> torch.Tensor:
-    # rope in either layout, split as a model's rotate_half writes it: each head's halves (x0, x1) at columns
-    # (j, j + head_dim / 2) rotated by theta_j, (x0 cos - x1 sin, x1 cos + x0 sin). The (M, pairs) tables, all
-    # heads' or one head's, broadcast across the heads and are cast to x's dtype, so x sets the precision
+    # rope in either layout; split pairs each head's halves, columns (j, j + head_dim / 2), as rotate_half does
     if layout == PairLayout.interleaved:
         return rope(x=x, cos=cos, sin=sin)
     assert layout == PairLayout.split
@@ -192,8 +208,11 @@ def _rope_bench(
     return rearrange(rotated, "m h two p -> m (h two p)")
 
 
-def head_mean_square(x: torch.Tensor, head_dim: int) -> torch.Tensor:
-    # each head's mean of squares, (M, heads): the statistic a qk norm reads
+def head_mean_square(
+    x: torch.Tensor,
+    head_dim: int,
+) -> torch.Tensor:
+    # (M, heads) mean of squares per head, qknorm's statistic
     x_heads = rearrange(x, "m (h d) -> m h d", d=head_dim)
     square = torch.square(x_heads)
     return reduce(square, "m h d -> m h", "mean")
@@ -212,14 +231,15 @@ def qknorm(
     x_heads = rearrange(x, "m (h d) -> m h d", d=head_dim)
     rstd_per_head = torch.rsqrt(head_mean_sq + eps)
     rstd_per_head = rearrange(rstd_per_head, "m h -> m h 1")
-    # gamma is [gamma_q | gamma_k]: its q half weights the first num_heads_q heads, its k half the rest
+    # gamma_q weights the first num_heads_q heads, gamma_k the rest
     gamma_q, gamma_k = torch.split(gamma, (head_dim, head_dim))
     gamma_q = repeat(gamma_q, "d -> h d", h=num_heads_q)
     gamma_k = repeat(gamma_k, "d -> h d", h=num_heads_k)
     gamma_heads = torch.cat((gamma_q, gamma_k))
     x_rstd = x_heads * rstd_per_head
     normed_heads = x_rstd * gamma_heads
-    return rearrange(normed_heads, "m h d -> m (h d)")
+    normed = rearrange(normed_heads, "m h d -> m (h d)")
+    return normed.to(dtype=x.dtype)
 
 
 def dqknorm(
@@ -232,15 +252,14 @@ def dqknorm(
     num_heads_k: int,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # qknorm's vjp in closed form at the forward's statistic: per head, with rstd = rsqrt(head_mean_sq + eps) and
-    # drstd = sum(dn gamma z), dz = rstd dn gamma - rstd^3 z drstd / head_dim, and dgamma sums dn z rstd over rows
-    # and each half's heads. Also zdz_qk, the q and k heads' part of an input norm's row dot sum(z dz), in its
-    # closed form eps rstd^3 drstd: summed directly over a z rounded after the statistic, it misses by ~1000 eps
+    # qknorm's vjp at the forward's statistic: dgamma, and per head dz = rstd dn gamma - rstd^3 z drstd / head_dim
+    # with drstd = sum(dn gamma z); zdz_qk = sum(z dz) over the q and k heads, in closed form eps rstd^3 drstd
+    # since a direct sum over a z rounded after the statistic is off by ~1000 eps
     dn_heads = rearrange(dn, "m (h d) -> m h d", d=head_dim)
     z_heads = rearrange(z, "m (h d) -> m h d", d=head_dim)
     rstd_per_head = torch.rsqrt(head_mean_sq + eps)
     rstd_per_head = rearrange(rstd_per_head, "m h -> m h 1")
-    # gamma is [gamma_q | gamma_k]: its q half weights the first num_heads_q heads, its k half the rest
+    # gamma_q weights the first num_heads_q heads, gamma_k the rest
     gamma_q, gamma_k = torch.split(gamma, (head_dim, head_dim))
     gamma_q = repeat(gamma_q, "d -> h d", h=num_heads_q)
     gamma_k = repeat(gamma_k, "d -> h d", h=num_heads_k)
@@ -261,7 +280,7 @@ def dqknorm(
     dgamma_q = reduce(dgamma_q, "h d -> d", "sum")
     dgamma_k = reduce(dgamma_k, "h d -> d", "sum")
     dgamma = torch.cat((dgamma_q, dgamma_k))
-    # recomputed, not reused: reusing the rstd_cubed above changes autograd's rounding of dhead_mean_sq
+    # recomputed: reusing rstd_cubed above changes autograd's rounding of dhead_mean_sq
     rstd_cubed = rstd_per_head**3
     eps_rstd_cubed = eps * rstd_cubed
     zdz_per_head = eps_rstd_cubed * drstd_per_head
@@ -275,9 +294,8 @@ def cross_entropy(
     target: torch.Tensor,
     ignore_index: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # each row's loss lse - target_logits, and the gradient of the summed loss on the logits, softmax - onehot,
-    # whose target entry dlogits_target is minus the off-target mass: on a confident row p_t - 1 cancels to 0 even
-    # in fp64. A row whose target is ignore_index gets 0 for both
+    # per-row loss lse - target_logits and dlogits = softmax - onehot, ignore_index rows zeroed; the target entry
+    # is minus the off-target mass, since p_t - 1 cancels to 0 on a confident row even in fp64
     kept = target != ignore_index
     safe_target = torch.where(condition=kept, input=target, other=0)
     row_index = torch.arange(logits.shape[0], device=logits.device)
@@ -298,14 +316,39 @@ def cross_entropy(
 # ---- gemm
 
 
-def mm(A: torch.Tensor, B: torch.Tensor, coda_accumulator: bool = False) -> torch.Tensor:
-    # every reference's GEMM, A @ B with B (K, N), or a batch of them. By default torch's, in the operands' dtype:
-    # what a model runs, and with fp64 operands the truth (on a CPU too). With coda_accumulator, CODA's fp32
-    # accumulator of the 16-bit product: quack's GEMM never splitting K, so it sums K as CODA's mainloop does, bit
-    # for bit; untuned, as every config sums K in the same order and gives the same bits. fp8's is refs_fp8's
+def gemm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    coda_accumulator: bool = False,
+) -> torch.Tensor:
+    # A @ B, B (K, N), batched or not: torch's in the operands' dtype, or with coda_accumulator CODA's fp32
+    # accumulator from quack with split_k=1, which sums K in CODA's order bit for bit, untuned since every config
+    # gives the same bits
     if not coda_accumulator:
-        return torch.mm(A, B)
+        return torch.matmul(input=A, other=B)
     return quack_gemm(A=A, B=B, out_dtype=torch.float32, tuned=False, split_k=1)
+
+
+def gemm_symmetric(
+    A: torch.Tensor,
+    B: torch.Tensor | None = None,
+    C: torch.Tensor | None = None,
+    D_scale: float | None = None,
+    C_scale: float | None = None,
+    coda_accumulator: bool = False,
+) -> torch.Tensor:
+    # D_scale * A B + C_scale * C, B = A^T by default: Newton-Schulz's X X^T, then b A + c A A; a scale left None is
+    # not multiplied
+    if B is None:
+        B = A.mT
+    D = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
+    if D_scale is not None:
+        D = D_scale * D
+    if C is None:
+        return D
+    if C_scale is not None:
+        C = C_scale * C
+    return D + C
 
 
 def gemm_scalar_scale(
@@ -314,27 +357,55 @@ def gemm_scalar_scale(
     alpha: torch.Tensor,
     coda_accumulator: bool = False,
 ) -> torch.Tensor:
-    # alpha is a one-element fp32 tensor on the device, the cross-entropy backward's dloss, scaling the accumulator
-    product = mm(A=A, B=B, coda_accumulator=coda_accumulator)
+    # (A @ B) * alpha, alpha a one-element fp32 device tensor (the cross-entropy backward's dloss)
+    product = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
     return product * alpha
 
 
-def gemm_scalar_scale_bench(A: torch.Tensor, B: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
-    # an alpha of shape (1,) promotes a bf16 product where a 0-d one does not, so it goes back to the operands'
-    # dtype, where CODA stores it
-    product = mm(A=A, B=B)
+def gemm_scalar_scale_bench(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    alpha: torch.Tensor,
+) -> torch.Tensor:
+    # a (1,) alpha promotes a bf16 product (a 0-d one would not), so cast back to the operands' dtype
+    product = gemm(A=A, B=B)
     scaled = product * alpha
     return scaled.to(dtype=A.dtype)
 
 
-def gemm_sigmoid(A: torch.Tensor, B: torch.Tensor, coda_accumulator: bool = False) -> torch.Tensor:
-    product = mm(A=A, B=B, coda_accumulator=coda_accumulator)
+def gemm_add_dual_precision(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    C_scale: float | None = None,
+    coda_accumulator: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Newton-Schulz's X <- a X + B X over an fp32 master: out = A B + C_scale * C in C's dtype, and out rounded to
+    # the operands' dtype, the next iteration's operand, a rounding kept since CODA's contract is that operand bit
+    # for bit; without coda_accumulator a bf16 A B rounds before the add
+    product = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
+    if C_scale is not None:
+        C = C_scale * C
+    out = product + C
+    return out, out.to(dtype=A.dtype)
+
+
+def gemm_sigmoid(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    coda_accumulator: bool = False,
+) -> torch.Tensor:
+    product = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
     return torch.nn.functional.sigmoid(product)
 
 
-def linear_sigmoid(x: torch.Tensor, weight: torch.Tensor, coda_accumulator: bool = False) -> torch.Tensor:
-    # weight is (N, K), as nn.Linear holds it; out_dtype is CODA's storage choice, not the op's meaning. Autograd of
-    # this is the backward's reference
+def linear_sigmoid(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    coda_accumulator: bool = False,
+) -> torch.Tensor:
+    # sigmoid(x @ weight^T), weight (N, K) as nn.Linear holds it; CODA's out_dtype only picks storage, so not an
+    # argument here; its autograd is the backward's reference
     return gemm_sigmoid(A=x, B=weight.mT, coda_accumulator=coda_accumulator)
 
 
@@ -347,7 +418,7 @@ def gemm_swiglu(
     coda_accumulator: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # B is (K, 2N), gate and up in adjacent columns
-    preact = mm(A=A, B=B, coda_accumulator=coda_accumulator)
+    preact = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
     postact = swiglu(preact=preact)
     return preact, postact
 
@@ -355,11 +426,10 @@ def gemm_swiglu(
 def gemm_swiglu_bench(
     A: torch.Tensor,
     B: torch.Tensor,
-    layout: PairLayout = PairLayout.interleaved,
+    layout: PairLayout,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # B is (K, 2N), gate and up in adjacent columns, or split as the contiguous halves of its columns. In bf16 the
-    # GEMM rounds its output once, as torch's does
-    preact = mm(A=A, B=B)
+    # B is (K, 2N), gate and up columns interleaved or split into halves
+    preact = gemm(A=A, B=B)
     postact = swiglu_bench(preact=preact, layout=layout)
     return preact, postact
 
@@ -370,8 +440,8 @@ def gemm_rmsnorm_swiglu(
     rstd: torch.Tensor,
     coda_accumulator: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # the input norm's row scale, deferred onto the accumulator, preact stored scaled and postact from it
-    product = mm(A=A, B=B, coda_accumulator=coda_accumulator)
+    # preact = (A @ B) rstd, the input norm's row scale deferred onto the accumulator, and postact from it
+    product = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
     rstd = rearrange(rstd, "m -> m 1")
     preact = product * rstd
     postact = swiglu(preact=preact)
@@ -385,10 +455,9 @@ def gemm_swiglu_bwd_zdz(
     scale: float | None = None,
     coda_accumulator: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # the down projection's dgrad through swiglu: B arrives (N, K), the block's w2.mT, so A @ B^T is dpostact, the
-    # postact's cotangent; then swiglu's backward against the stored preact Z, the row dot ZdZ = sum(Z dZ), and the
-    # postact recomputed for the down projection's wgrad
-    dpostact = mm(A=A, B=B.mT, coda_accumulator=coda_accumulator)
+    # the down projection's dgrad through swiglu: dpostact = A @ B^T, B (N, K), then dZ against the stored
+    # preact Z, ZdZ = scale * sum(Z dZ), and postact recomputed for the wgrad
+    dpostact = gemm(A=A, B=B.mT, coda_accumulator=coda_accumulator)
     dZ, postact = dswiglu(preact=Z, grad=dpostact)
     Z_dZ = Z * dZ
     ZdZ = reduce(Z_dZ, "m n -> m", "sum")
@@ -401,11 +470,11 @@ def gemm_swiglu_bwd_zdz_bench(
     A: torch.Tensor,
     B: torch.Tensor,
     Z: torch.Tensor,
+    layout: PairLayout,
     scale: float | None = None,
-    layout: PairLayout = PairLayout.interleaved,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # ZdZ in the model's dtype: it spans the whole row, so only dZ's layout differs
-    dpostact = mm(A=A, B=B.mT)
+    # ZdZ in the model's dtype, the same whole-row sum in either layout
+    dpostact = gemm(A=A, B=B.mT)
     dZ, postact = _dswiglu_bench(preact=Z, grad=dpostact, layout=layout)
     Z_dZ = Z * dZ
     ZdZ = reduce(Z_dZ, "m n -> m", "sum")
@@ -414,8 +483,11 @@ def gemm_swiglu_bwd_zdz_bench(
     return dZ, ZdZ, postact
 
 
-def dswiglu_backward(preact: torch.Tensor, grad_out: torch.Tensor) -> torch.Tensor:
-    # swiglu's vjp alone, as the elementwise op returns it
+def dswiglu_backward(
+    preact: torch.Tensor,
+    grad_out: torch.Tensor,
+) -> torch.Tensor:
+    # swiglu's vjp dpreact alone
     dpreact, _ = dswiglu(preact=preact, grad=grad_out)
     return dpreact
 
@@ -423,15 +495,18 @@ def dswiglu_backward(preact: torch.Tensor, grad_out: torch.Tensor) -> torch.Tens
 def dswiglu_backward_bench(
     preact: torch.Tensor,
     grad_out: torch.Tensor,
-    layout: PairLayout = PairLayout.interleaved,
+    layout: PairLayout,
 ) -> torch.Tensor:
     dpreact, _ = _dswiglu_bench(preact=preact, grad=grad_out, layout=layout)
     return dpreact
 
 
-def linear_swiglu(x: torch.Tensor, weight: torch.Tensor, coda_accumulator: bool = False) -> torch.Tensor:
-    # weight is the packed (2N, K) gate_up weight, gate and up rows interleaved; autograd of this is the backward's
-    # reference
+def linear_swiglu(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    coda_accumulator: bool = False,
+) -> torch.Tensor:
+    # weight (2N, K), gate and up rows interleaved; its autograd is the backward's reference
     _, postact = gemm_swiglu(A=x, B=weight.mT, coda_accumulator=coda_accumulator)
     return postact
 
@@ -439,9 +514,9 @@ def linear_swiglu(x: torch.Tensor, weight: torch.Tensor, coda_accumulator: bool 
 def linear_swiglu_bench(
     x: torch.Tensor,
     weight: torch.Tensor,
-    layout: PairLayout = PairLayout.interleaved,
+    layout: PairLayout,
 ) -> torch.Tensor:
-    # weight is the (2N, K) gate_up weight, gate and up rows interleaved, or split, packed as [W_gate; W_up]
+    # weight (2N, K), gate and up rows interleaved, or split as [W_gate; W_up]
     _, postact = gemm_swiglu_bench(A=x, B=weight.mT, layout=layout)
     return postact
 
@@ -455,15 +530,19 @@ def gemm_rmsnorm(
     rstd: torch.Tensor,
     coda_accumulator: bool = False,
 ) -> torch.Tensor:
-    # the input norm's row scale, deferred onto the accumulator of the GEMM that consumes the norm: B is (K, N)
-    product = mm(A=A, B=B, coda_accumulator=coda_accumulator)
+    # (A @ B) rstd, B (K, N): the input norm's row scale deferred onto the accumulator
+    product = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
     rstd = rearrange(rstd, "m -> m 1")
     return product * rstd
 
 
-def gemm_rmsnorm_bench(A: torch.Tensor, B: torch.Tensor, rstd: torch.Tensor) -> torch.Tensor:
-    # the fp32 rstd promotes a 16-bit product, so the output goes back to the operands' dtype
-    product = mm(A=A, B=B)
+def gemm_rmsnorm_bench(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    rstd: torch.Tensor,
+) -> torch.Tensor:
+    # the fp32 rstd promotes a 16-bit product, so cast back to the operands' dtype
+    product = gemm(A=A, B=B)
     rstd = rearrange(rstd, "m -> m 1")
     scaled = product * rstd
     return scaled.to(dtype=A.dtype)
@@ -477,9 +556,9 @@ def gemm_residual_partial_rmsnorm(
     eps: float,
     coda_accumulator: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # a GEMM joining the residual stream C, B (K, N), and the norm after it, partial: post = pre * weight, its rstd
-    # left to the GEMM that consumes post (gemm_rmsnorm and its siblings), as a statistic of pre before rounding
-    product = mm(A=A, B=B, coda_accumulator=coda_accumulator)
+    # pre = A @ B + C, B (K, N), the partial norm post = pre * weight, and rstd of the unrounded pre, which the GEMM
+    # consuming post applies
+    product = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
     pre = product + C
     post = pre * weight
     rstd = rmsnorm_rstd(x=pre, eps=eps)
@@ -497,10 +576,9 @@ def gemm_residual_partial_rmsnorm_bwd(
     dX: torch.Tensor | None = None,
     coda_accumulator: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # the dgrad of the GEMM that consumed the norm: B arrives (N, K), the block's w.mT, so A @ B^T is dnormed, the
-    # grad on the norm's output, scaled by alpha (the loss scale at the LM head); then the norm's backward against
-    # the stored pre and its forward rstd. A dX handed to the op is accumulated into: dX plus this dpre
-    dnormed = mm(A=A, B=B.mT, coda_accumulator=coda_accumulator)
+    # dnormed = A @ B^T, B (N, K), the consuming GEMM's dgrad, times alpha (the LM head's loss scale); then
+    # drmsnorm against the stored pre and rstd, dpre added to dX when given
+    dnormed = gemm(A=A, B=B.mT, coda_accumulator=coda_accumulator)
     if alpha is not None:
         dnormed = dnormed * alpha
     dpre, dweight, normed = drmsnorm(pre=pre, grad=dnormed, weight=weight, ZdZ=ZdZ, rstd=rstd)
@@ -510,55 +588,33 @@ def gemm_residual_partial_rmsnorm_bwd(
     return accumulated, dweight, normed
 
 
-def gemm_residual_partial_rmsnorm_bwd_bench(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    weight: torch.Tensor,
-    pre: torch.Tensor,
-    ZdZ: torch.Tensor,
-    rstd: torch.Tensor,
-    alpha: torch.Tensor | None = None,
-    dX: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # dpre and the norm's output back in pre's dtype, as a model's autograd hands them on; a dX, the residual's
-    # incoming grad as block_post runs the op at the MLP, takes that rounded dpre out of place
-    dnormed = mm(A=A, B=B.mT)
-    if alpha is not None:
-        dnormed = dnormed * alpha
-    dpre, dweight, normed = drmsnorm(pre=pre, grad=dnormed, weight=weight, ZdZ=ZdZ, rstd=rstd)
-    if dX is None:
-        return dpre.to(dtype=pre.dtype), dweight, normed.to(dtype=pre.dtype)
-    rounded_dpre = dpre.to(dtype=pre.dtype)
-    accumulated = dX + rounded_dpre
-    return accumulated, dweight, normed.to(dtype=pre.dtype)
-
-
 # ---- xsa: each head of the attention output without its component along the head's value
 
 
-def _dot(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
-    # a per-head row dot
-    first_second = first * second
-    return reduce(first_second, "... h d -> ... h 1", "sum")
+def _dot_per_head(
+    left_heads: torch.Tensor,
+    right_heads: torch.Tensor,
+) -> torch.Tensor:
+    # the dot product of two (..., h, d) per-head views over each head's d, kept (..., h, 1) to broadcast
+    left_right = left_heads * right_heads
+    return reduce(left_right, "... h d -> ... h 1", "sum")
 
 
-def xsa_fwd(x: torch.Tensor, v: torch.Tensor, head_dim: int) -> torch.Tensor:
-    # z = x - x_projection per head, x_projection = x_projection_scale v with x_projection_scale = <x, v> / <v, v>
-    # and no epsilon, as lm-engine's _compute_xsa_output writes it for MHA
+def xsa_fwd(
+    x: torch.Tensor,
+    v: torch.Tensor,
+    head_dim: int,
+) -> torch.Tensor:
+    # per head, z = x - x_projection_scale v with x_projection_scale = <x, v> / <v, v>, no epsilon
     x_heads = rearrange(x, "... (h d) -> ... h d", d=head_dim)
     v_heads = rearrange(v, "... (h d) -> ... h d", d=head_dim)
-    x_dot_v = _dot(first=x_heads, second=v_heads)
-    v_dot_v = _dot(first=v_heads, second=v_heads)
+    x_dot_v = _dot_per_head(left_heads=x_heads, right_heads=v_heads)
+    v_dot_v = _dot_per_head(left_heads=v_heads, right_heads=v_heads)
     x_projection_scale = x_dot_v / v_dot_v
     x_projection = x_projection_scale * v_heads
     z_heads = x_heads - x_projection
+    z_heads = z_heads.to(dtype=x.dtype)
     return rearrange(z_heads, "... h d -> ... (h d)")
-
-
-def xsa_fwd_bench(x: torch.Tensor, v: torch.Tensor, head_dim: int) -> torch.Tensor:
-    # z in x's dtype, as lm-engine returns it
-    z = xsa_fwd(x=x, v=v, head_dim=head_dim)
-    return z.to(dtype=x.dtype)
 
 
 def dxsa(
@@ -567,18 +623,16 @@ def dxsa(
     v: torch.Tensor,
     head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # xsa's vjp in closed form given grad, the grad dz on z, in the operands' dtype, so that a test can take dz from
-    # the GEMM's own accumulator. Per head, with xsa_fwd's x_projection_scale and
-    # dz_projection_scale = <dz, v> / <v, v>: dx = dz - dz_projection_scale v, and
-    # dv = 2 dz_projection_scale x_projection_scale v - (x_projection_scale dz + dz_projection_scale x). Pinned to
-    # fp64 autograd in test_refs
+    # xsa's vjp given grad = dz, in closed form so a test can feed dz from the GEMM's accumulator; per head:
+    # dx = dz - dz_projection_scale v, dz_projection_scale = <dz, v> / <v, v>, and
+    # dv = 2 dz_projection_scale x_projection_scale v - (x_projection_scale dz + dz_projection_scale x)
     dz_heads = rearrange(grad, "... (h d) -> ... h d", d=head_dim)
     x_heads = rearrange(x, "... (h d) -> ... h d", d=head_dim)
     v_heads = rearrange(v, "... (h d) -> ... h d", d=head_dim)
-    v_dot_v = _dot(first=v_heads, second=v_heads)
-    x_dot_v = _dot(first=x_heads, second=v_heads)
+    v_dot_v = _dot_per_head(left_heads=v_heads, right_heads=v_heads)
+    x_dot_v = _dot_per_head(left_heads=x_heads, right_heads=v_heads)
     x_projection_scale = x_dot_v / v_dot_v
-    dz_dot_v = _dot(first=dz_heads, second=v_heads)
+    dz_dot_v = _dot_per_head(left_heads=dz_heads, right_heads=v_heads)
     dz_projection_scale = dz_dot_v / v_dot_v
     dz_projection = dz_projection_scale * v_heads
     dx_heads = dz_heads - dz_projection
@@ -602,26 +656,13 @@ def gemm_xsa_bwd(
     head_dim: int,
     coda_accumulator: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # c_proj's dgrad through xsa: A the block's (M, K) dy and B = W^T, the (K, N) c_proj weight arriving (N, K), so
-    # dz = A @ B^T = dy W is the grad on z
-    dz = mm(A=A, B=B.mT, coda_accumulator=coda_accumulator)
-    return dxsa(grad=dz, x=x, v=v, head_dim=head_dim)
-
-
-def gemm_xsa_bwd_bench(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    x: torch.Tensor,
-    v: torch.Tensor,
-    head_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # dz rounded by the unfused GEMM before the formula, which runs in the model's dtype
-    dz = mm(A=A, B=B.mT)
+    # the output projection's dgrad through xsa: dz = A @ B^T, B (N, K), then dxsa
+    dz = gemm(A=A, B=B.mT, coda_accumulator=coda_accumulator)
     dx, dv = dxsa(grad=dz, x=x, v=v, head_dim=head_dim)
     return dx.to(dtype=x.dtype), dv.to(dtype=v.dtype)
 
 
-# ---- cross entropy: the LM head's logits and their loss, its gradient formed in the forward
+# ---- cross entropy: the LM head's loss, its gradient formed in the forward
 
 
 def _fused_cross_entropy(
@@ -630,14 +671,44 @@ def _fused_cross_entropy(
     ignore_index: int,
     return_zdz: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    # the fused op's outputs from its logits, with return_zdz the row dot zdz = sum(logits dlogits) the final norm's
-    # backward reads
+    # losses, dlogits and, with return_zdz, zdz = sum(logits dlogits) for the final norm's backward
+
     losses, dlogits = cross_entropy(logits=logits, target=target, ignore_index=ignore_index)
     zdz = None
     if return_zdz:
         logits_dlogits = logits * dlogits
         zdz = reduce(logits_dlogits, "m n -> m", "sum")
     return losses, dlogits, zdz
+
+
+def _cross_entropy_bench(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    ignore_index: int,
+    return_zdz: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    # per-row loss and dlogits = softmax - onehot as autograd forms them, in the logits' dtype; ignored rows get 0;
+    # target arrives int64, as a model's labels do
+    losses = torch.nn.functional.cross_entropy(
+        input=logits,
+        target=target,
+        ignore_index=ignore_index,
+        reduction="none",
+    )
+    kept = target != ignore_index
+    safe_target = torch.where(condition=kept, input=target, other=0)
+    rows = torch.arange(logits.shape[0], device=logits.device)
+    probabilities = torch.nn.functional.softmax(input=logits, dim=-1)
+    target_probabilities = probabilities[rows, safe_target]
+    target_gradients = target_probabilities - 1
+    probabilities[rows, safe_target] = target_gradients
+    kept = rearrange(kept, "m -> m 1")
+    dlogits = torch.where(condition=kept, input=probabilities, other=0)
+    row_dot = None
+    if return_zdz:
+        row_dot_terms = logits * dlogits
+        row_dot = reduce(row_dot_terms, "m v -> m", "sum")
+    return losses, dlogits, row_dot
 
 
 def gemm_cross_entropy_fwd_bwd(
@@ -648,9 +719,8 @@ def gemm_cross_entropy_fwd_bwd(
     return_zdz: bool = False,
     coda_accumulator: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    # the logits A @ B, B (K, V). CODA forms zdz over its stored, rounded gradient, so a test reads it with that
-    # gradient as dZ
-    logits = mm(A=A, B=B, coda_accumulator=coda_accumulator)
+    # logits = A @ B, B (K, V); CODA forms zdz over its rounded dlogits, so a test checks it with those as dZ
+    logits = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
     return _fused_cross_entropy(logits=logits, target=target, ignore_index=ignore_index, return_zdz=return_zdz)
 
 
@@ -661,9 +731,8 @@ def gemm_cross_entropy_fwd_bwd_bench(
     ignore_index: int,
     return_zdz: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    # a model never forms the gradient in the forward: this is the LM head's bf16 logits, as its GEMM stores them,
-    # then the loss and the gradient its autograd would form
-    logits = mm(A=A, B=B)
+    # the LM head's bf16 logits as a model's GEMM stores them, then the loss and the gradient autograd forms
+    logits = gemm(A=A, B=B)
     return _cross_entropy_bench(logits=logits, target=target, ignore_index=ignore_index, return_zdz=return_zdz)
 
 
@@ -676,8 +745,8 @@ def gemm_rmsnorm_cross_entropy_fwd_bwd(
     return_zdz: bool = False,
     coda_accumulator: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    # the final norm's row scale deferred onto the accumulator: the logits are (A @ B) rstd
-    product = mm(A=A, B=B, coda_accumulator=coda_accumulator)
+    # logits = (A @ B) rstd, the final norm's row scale deferred onto the accumulator
+    product = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
     rstd = rearrange(rstd, "m -> m 1")
     logits = product * rstd
     return _fused_cross_entropy(logits=logits, target=target, ignore_index=ignore_index, return_zdz=return_zdz)
@@ -691,7 +760,24 @@ def gemm_rmsnorm_cross_entropy_fwd_bwd_bench(
     ignore_index: int,
     return_zdz: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    # the final norm's row scale deferred onto the product, the logits back in the model's dtype before the loss
-    # reads them
+    # logits = (A @ B) rstd, cast back to the model's dtype before the loss
     logits = gemm_rmsnorm_bench(A=A, B=B, rstd=rstd)
     return _cross_entropy_bench(logits=logits, target=target, ignore_index=ignore_index, return_zdz=return_zdz)
+
+
+def linear_cross_entropy(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    target: torch.Tensor,
+    ignore_index: int = -100,
+    reduction: str = "mean",
+    coda_accumulator: bool = False,
+) -> torch.Tensor:
+    # weight (V, K) as nn.Linear holds it, target int64; its autograd is the backward's reference
+    logits = gemm(A=x, B=weight.mT, coda_accumulator=coda_accumulator)
+    return torch.nn.functional.cross_entropy(
+        input=logits,
+        target=target,
+        ignore_index=ignore_index,
+        reduction=reduction,
+    )
