@@ -386,3 +386,221 @@ def linear_swiglu_bench(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     # weight is the (2N, K) gate_up weight packed as [W_gate; W_up]
     _, postact = gemm_swiglu_bench(A=x, B=weight.mT)
     return postact
+
+
+
+# ---- rmsnorm
+
+
+def gemm_rmsnorm(A: torch.Tensor, B: torch.Tensor, rstd: torch.Tensor) -> torch.Tensor:
+    # the input norm's row scale, deferred onto the accumulator of the GEMM that consumes the norm: B is (K, N). The
+    # fp32 rstd promotes a 16-bit product, so the output goes back to the operands' dtype
+    product = A @ B
+    rstd = rearrange(rstd, "m -> m 1")
+    scaled = product * rstd
+    return scaled.to(dtype=A.dtype)
+
+
+gemm_rmsnorm_bench = gemm_rmsnorm
+
+
+def gemm_residual_partial_rmsnorm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # a GEMM joining the residual stream C, B (K, N), and the norm after it, partial: post = pre * weight, its rstd
+    # left to the GEMM that consumes post (gemm_rmsnorm and its siblings), as a statistic of pre before rounding
+    product = A @ B
+    pre = product + C
+    post = pre * weight
+    rstd = rmsnorm_rstd(x=pre, eps=eps)
+    return pre, post, rstd
+
+
+gemm_residual_partial_rmsnorm_bench = gemm_residual_partial_rmsnorm
+
+
+def gemm_residual_partial_rmsnorm_bwd(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    weight: torch.Tensor,
+    pre: torch.Tensor,
+    ZdZ: torch.Tensor,
+    rstd: torch.Tensor,
+    alpha: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # the dgrad of the GEMM that consumed the norm: B arrives (N, K), the block's w.mT, so A @ B^T is dnormed, the
+    # grad on the norm's output, scaled by alpha (the loss scale at the LM head); then the norm's backward against
+    # the stored pre and its forward rstd. A dX handed to the op is accumulated into, so its reference is dX plus
+    # this dpre
+    dnormed = A @ B.mT
+    if alpha is not None:
+        dnormed = dnormed * alpha
+    return drmsnorm(pre=pre, grad=dnormed, weight=weight, ZdZ=ZdZ, rstd=rstd)
+
+
+def gemm_residual_partial_rmsnorm_bwd_bench(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    weight: torch.Tensor,
+    pre: torch.Tensor,
+    ZdZ: torch.Tensor,
+    rstd: torch.Tensor,
+    alpha: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # dweight summed in the model's dtype
+    dnormed = A @ B.mT
+    if alpha is not None:
+        dnormed = dnormed * alpha
+    return drmsnorm(pre=pre, grad=dnormed, weight=weight, ZdZ=ZdZ, rstd=rstd)
+
+
+# ---- xsa: each head of the attention output without its component along the head's value
+
+
+def xsa_fwd(x: torch.Tensor, v: torch.Tensor, head_dim: int) -> torch.Tensor:
+    # z = x - x_projection per head, x_projection = x_projection_scale v with x_projection_scale = <x, v> / <v, v>
+    # and no epsilon, as lm-engine's _compute_xsa_output writes it for MHA, z in x's dtype
+    x_heads = rearrange(x, "... (h d) -> ... h d", d=head_dim)
+    v_heads = rearrange(v, "... (h d) -> ... h d", d=head_dim)
+    x_dot_v = _dot(first=x_heads, second=v_heads)
+    v_dot_v = _dot(first=v_heads, second=v_heads)
+    x_projection_scale = x_dot_v / v_dot_v
+    x_projection = x_projection_scale * v_heads
+    z_heads = x_heads - x_projection
+    z_heads = z_heads.to(dtype=x.dtype)
+    return rearrange(z_heads, "... h d -> ... (h d)")
+
+
+xsa_fwd_bench = xsa_fwd
+
+
+def dxsa(
+    grad: torch.Tensor,
+    x: torch.Tensor,
+    v: torch.Tensor,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # xsa's vjp in closed form given grad, the grad dz on z, in the operands' dtype, so that a test can take dz from
+    # the GEMM's own accumulator. Per head, with xsa_fwd's x_projection_scale and
+    # dz_projection_scale = <dz, v> / <v, v>: dx = dz - dz_projection_scale v, and
+    # dv = 2 dz_projection_scale x_projection_scale v - (x_projection_scale dz + dz_projection_scale x). Pinned to
+    # fp64 autograd in test_refs
+    dz_heads = rearrange(grad, "... (h d) -> ... h d", d=head_dim)
+    x_heads = rearrange(x, "... (h d) -> ... h d", d=head_dim)
+    v_heads = rearrange(v, "... (h d) -> ... h d", d=head_dim)
+    v_dot_v = _dot(first=v_heads, second=v_heads)
+    x_dot_v = _dot(first=x_heads, second=v_heads)
+    x_projection_scale = x_dot_v / v_dot_v
+    dz_dot_v = _dot(first=dz_heads, second=v_heads)
+    dz_projection_scale = dz_dot_v / v_dot_v
+    dz_projection = dz_projection_scale * v_heads
+    dx_heads = dz_heads - dz_projection
+    two_dz_projection_scale = 2 * dz_projection_scale
+    two_dz_projection_scale_x_projection_scale = two_dz_projection_scale * x_projection_scale
+    two_dz_projection_scale_x_projection_scale_v = two_dz_projection_scale_x_projection_scale * v_heads
+    x_projection_scale_dz = x_projection_scale * dz_heads
+    dz_projection_scale_x = dz_projection_scale * x_heads
+    x_projection_scale_dz_plus_dz_projection_scale_x = x_projection_scale_dz + dz_projection_scale_x
+    dv_heads = two_dz_projection_scale_x_projection_scale_v - x_projection_scale_dz_plus_dz_projection_scale_x
+    dx = rearrange(dx_heads, "... h d -> ... (h d)")
+    dv = rearrange(dv_heads, "... h d -> ... (h d)")
+    return dx, dv
+
+
+def gemm_xsa_bwd(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    x: torch.Tensor,
+    v: torch.Tensor,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # c_proj's dgrad through xsa: A the block's (M, K) dy and B = W^T, the (K, N) c_proj weight arriving (N, K), so
+    # dz = A @ B^T = dy W is the grad on z
+    dz = A @ B.mT
+    dx, dv = dxsa(grad=dz, x=x, v=v, head_dim=head_dim)
+    return dx.to(dtype=x.dtype), dv.to(dtype=v.dtype)
+
+
+def gemm_xsa_bwd_bench(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    x: torch.Tensor,
+    v: torch.Tensor,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # dz rounded by the unfused GEMM before the formula, the dots in fp32
+    dz = A @ B.mT
+    dz_heads = rearrange(dz, "... (h d) -> ... h d", d=head_dim)
+    x_heads = rearrange(x, "... (h d) -> ... h d", d=head_dim)
+    v_heads = rearrange(v, "... (h d) -> ... h d", d=head_dim)
+    v_dot_v = _dot(first=v_heads, second=v_heads)
+    x_dot_v = _dot(first=x_heads, second=v_heads)
+    x_projection_scale = x_dot_v / v_dot_v
+    dz_dot_v = _dot(first=dz_heads, second=v_heads)
+    dz_projection_scale = dz_dot_v / v_dot_v
+    dz_projection = dz_projection_scale * v_heads
+    dx_heads = dz_heads - dz_projection
+    two_dz_projection_scale = 2 * dz_projection_scale
+    two_dz_projection_scale_x_projection_scale = two_dz_projection_scale * x_projection_scale
+    two_dz_projection_scale_x_projection_scale_v = two_dz_projection_scale_x_projection_scale * v_heads
+    x_projection_scale_dz = x_projection_scale * dz_heads
+    dz_projection_scale_x = dz_projection_scale * x_heads
+    x_projection_scale_dz_plus_dz_projection_scale_x = x_projection_scale_dz + dz_projection_scale_x
+    dv_heads = two_dz_projection_scale_x_projection_scale_v - x_projection_scale_dz_plus_dz_projection_scale_x
+    dx_heads = dx_heads.to(dtype=x.dtype)
+    dx = rearrange(dx_heads, "... h d -> ... (h d)")
+    dv_heads = dv_heads.to(dtype=v.dtype)
+    dv = rearrange(dv_heads, "... h d -> ... (h d)")
+    return dx, dv
+
+
+# ---- cross entropy: the LM head's logits and their loss, its gradient formed in the forward
+
+
+def _fused_cross_entropy(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    ignore_index: int,
+    return_zdz: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    # the fused op's outputs from its logits, with return_zdz the row dot zdz = sum(logits dlogits) the final norm's
+    # backward reads
+    losses, dlogits = cross_entropy(logits=logits, target=target, ignore_index=ignore_index)
+    zdz = None
+    if return_zdz:
+        logits_dlogits = logits * dlogits
+        zdz = reduce(logits_dlogits, "m n -> m", "sum")
+    return losses, dlogits, zdz
+
+
+def gemm_cross_entropy_fwd_bwd(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    target: torch.Tensor,
+    ignore_index: int,
+    return_zdz: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    # the truth only: a model never forms the gradient in the forward, so the timed torch arm is
+    # linear_cross_entropy_bench. The logits A @ B, B (K, V). CODA forms zdz over its stored, rounded gradient, so a
+    # test reads it with that gradient as dZ
+    logits = A @ B
+    return _fused_cross_entropy(logits=logits, target=target, ignore_index=ignore_index, return_zdz=return_zdz)
+
+
+def gemm_rmsnorm_cross_entropy_fwd_bwd(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    rstd: torch.Tensor,
+    target: torch.Tensor,
+    ignore_index: int,
+    return_zdz: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    # the truth only, the final norm's row scale deferred onto the accumulator: the logits are (A @ B) rstd
+    product = A @ B
+    rstd = rearrange(rstd, "m -> m 1")
+    logits = product * rstd
+    return _fused_cross_entropy(logits=logits, target=target, ignore_index=ignore_index, return_zdz=return_zdz)
