@@ -10,8 +10,7 @@ def swiglu(preact: torch.Tensor) -> torch.Tensor:
     # gate and up in adjacent columns (2i, 2i + 1), the pairing CODA's gated epilogue emits. In bf16, eager rounds
     # silu(gate) before the product, as a model's eager swiglu does, and a compiled one does not
     pairs = rearrange(preact, "m (n two) -> m n two", two=2)
-    gate = pairs[..., 0]
-    up = pairs[..., 1]
+    gate, up = torch.unbind(pairs, dim=-1)
     silu = torch.nn.functional.silu(gate)
     return silu * up
 
@@ -20,8 +19,7 @@ def dswiglu(preact: torch.Tensor, grad: torch.Tensor) -> tuple[torch.Tensor, tor
     # swiglu's vjp in closed form, interleaved like preact, and the postact it recomputes on the way: closed so that
     # it compiles under fullgraph as torch's arm, and pinned to fp64 autograd in test_refs
     pairs = rearrange(preact, "m (n two) -> m n two", two=2)
-    gate = pairs[..., 0]
-    up = pairs[..., 1]
+    gate, up = torch.unbind(pairs, dim=-1)
     sigmoid = torch.nn.functional.sigmoid(gate)
     silu = gate * sigmoid
     grad_silu = grad * up
@@ -78,7 +76,8 @@ def rope_tables(positions: torch.Tensor, frequencies: torch.Tensor) -> tuple[tor
     # split into an fp32 (hi, lo) at columns (2j, 2j + 1), so the angle is 2 pi pos (hi + lo), in the operands'
     # dtype. In fp64 it is the float-float angle the kernels form; in fp32 lo drops out and the product rounds, as a
     # model's fp32 table does
-    hi, lo = rearrange(frequencies, "(p two) -> two p", two=2)
+    pairs = rearrange(frequencies, "(p two) -> p two", two=2)
+    hi, lo = torch.unbind(pairs, dim=1)
     two_pi = 2 * math.pi
     positions = rearrange(positions, "m -> m 1")
     turns = hi + lo
@@ -97,6 +96,27 @@ def rope_angles(positions: torch.Tensor, inv_freq: torch.Tensor) -> torch.Tensor
     inv_freq_fp64 = inv_freq.to(dtype=torch.float64)
     inv_freq_row = rearrange(inv_freq_fp64, "p -> 1 p")
     return positions_column * inv_freq_row
+
+
+def rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    # adjacent pairs (2j, 2j + 1) rotated by +theta_j, (x0 c - x1 s, x1 c + x0 s), and by -theta_j for -sin, the
+    # transpose. The tables are cast to x's dtype, as a model casting its cache does, so x sets the precision: fp32
+    # for the ideal even from fp64 tables. Their pairs repeat across x's columns, so a per-head cache rotates every
+    # head
+    pairs = rearrange(x, "m (h p two) -> m h p two", p=cos.shape[-1], two=2)
+    x0, x1 = torch.unbind(pairs, dim=-1)
+    cos_cast = cos.to(dtype=x.dtype)
+    c = rearrange(cos_cast, "m p -> m 1 p")
+    sin_cast = sin.to(dtype=x.dtype)
+    s = rearrange(sin_cast, "m p -> m 1 p")
+    x0_cos = x0 * c
+    x1_sin = x1 * s
+    rotated_x0 = x0_cos - x1_sin
+    x1_cos = x1 * c
+    x0_sin = x0 * s
+    rotated_x1 = x1_cos + x0_sin
+    rotated = torch.stack((rotated_x0, rotated_x1), dim=-1)
+    return rearrange(rotated, "m h p two -> m (h p two)")
 
 
 def head_mean_square(x: torch.Tensor, head_dim: int) -> torch.Tensor:
@@ -120,7 +140,11 @@ def qknorm(
     heads = rearrange(x, "m (h d) -> m h d", d=head_dim)
     rstd_per_head = torch.rsqrt(head_mean_sq + eps)
     rstd = rearrange(rstd_per_head, "m h -> m h 1")
-    weights = _head_weights(gamma=gamma, head_dim=head_dim, num_heads_q=num_heads_q, num_heads_k=num_heads_k)
+    # gamma is [gamma_q | gamma_k]: its q half weights the first num_heads_q heads, its k half the rest
+    gamma_q, gamma_k = torch.split(gamma, (head_dim, head_dim))
+    weight_q = repeat(gamma_q, "d -> h d", h=num_heads_q)
+    weight_k = repeat(gamma_k, "d -> h d", h=num_heads_k)
+    weights = torch.cat((weight_q, weight_k))
     normed_heads = heads * rstd * weights
     normed = rearrange(normed_heads, "m h d -> m (h d)")
     return normed.to(dtype=x.dtype)
