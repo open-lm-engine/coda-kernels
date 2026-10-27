@@ -217,8 +217,8 @@ def dqknorm(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # qknorm's vjp in closed form at the forward's statistic: with r = rsqrt(head_mean_sq + eps) and
     # dr = sum(gamma dn z) per head, dz = r gamma dn - r^3 z dr / head_dim, and dgamma sums dn z r over rows and
-    # each half's heads. Also the heads' share of an input norm's row dot sum(z dz), in its closed form eps r^3 dr:
-    # summed directly over a z rounded after the statistic, it misses by ~1000 eps
+    # each half's heads. Also zdz_qk, the q/k columns' part of an input norm's row dot sum(z dz), in its closed
+    # form eps r^3 dr: summed directly over a z rounded after the statistic, it misses by ~1000 eps
     heads_dn = rearrange(dn, "m (h d) -> m h d", d=head_dim)
     heads_z = rearrange(z, "m (h d) -> m h d", d=head_dim)
     rstd_per_head = torch.rsqrt(head_mean_sq + eps)
@@ -242,9 +242,9 @@ def dqknorm(
     dgamma_k = reduce(columns_k, "h d -> d", "sum")
     dgamma = torch.cat((dgamma_q, dgamma_k))
     share_rstd_cubed = rstd_per_head**3
-    zdz_share_terms = eps * share_rstd_cubed * drstd
-    zdz_share = reduce(zdz_share_terms, "m h 1 -> m", "sum")
-    return rearrange(dz, "m h d -> m (h d)"), dgamma, zdz_share
+    zdz_qk_terms = eps * share_rstd_cubed * drstd
+    zdz_qk = reduce(zdz_qk_terms, "m h 1 -> m", "sum")
+    return rearrange(dz, "m h d -> m (h d)"), dgamma, zdz_qk
 
 
 def cross_entropy(
