@@ -34,12 +34,18 @@ def dswiglu(preact: torch.Tensor, grad: torch.Tensor) -> tuple[torch.Tensor, tor
     return grad_preact, postact
 
 
+swiglu_bench_interleaved = swiglu
+
+
 def swiglu_bench(preact: torch.Tensor) -> torch.Tensor:
     # gate and up as the contiguous halves [gate | up] of a GEMM over a model's packed [W_gate; W_up]
     half = preact.shape[-1] // 2
     gate, up = torch.split(preact, (half, half), dim=-1)
     silu = torch.nn.functional.silu(gate)
     return silu * up
+
+
+dswiglu_bench_interleaved = dswiglu
 
 
 def dswiglu_bench(preact: torch.Tensor, grad: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -113,20 +119,6 @@ def rope_tables(positions: torch.Tensor, frequencies: torch.Tensor) -> tuple[tor
     return cos, sin
 
 
-def rope_tables_bench(
-    positions: torch.Tensor,
-    frequencies: torch.Tensor,
-    head_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # rope_tables on the split layout: each head's pairs repeated across its halves, as a NeoX model's cache
-    # concatenates (freqs, freqs), so that one head's frequencies give a model's (M, head_dim) cache
-    pair_cos, pair_sin = rope_tables(positions=positions, frequencies=frequencies)
-    half = head_dim // 2
-    cos = repeat(pair_cos, "m (h p) -> m (h two p)", two=2, p=half)
-    sin = repeat(pair_sin, "m (h p) -> m (h two p)", two=2, p=half)
-    return cos, sin
-
-
 def rope_angles(positions: torch.Tensor, inv_freq: torch.Tensor) -> torch.Tensor:
     # (M, head_dim / 2) radians from what a model holds, its positions and fp32 inv_freq: their product is exact in
     # fp64 (24 bits by 24), the angle CODA's float-float table carries past fp32, read by the truth and the ideal
@@ -138,41 +130,48 @@ def rope_angles(positions: torch.Tensor, inv_freq: torch.Tensor) -> torch.Tensor
 
 
 def rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    # adjacent pairs (2j, 2j + 1) rotated by +theta_j, (x0 c - x1 s, x1 c + x0 s), and by -theta_j for -sin, the
-    # transpose. The tables are cast to x's dtype, as a model casting its cache does, so x sets the precision: fp32
-    # for the ideal even from fp64 tables. Their pairs repeat across x's columns, so a per-head cache rotates every
-    # head
+    # CODA's layout: each adjacent pair (x0, x1) at columns (2j, 2j + 1) rotated by theta_j,
+    # (x0 cos - x1 sin, x1 cos + x0 sin); -sin rotates by -theta_j, the transpose. The (M, pairs) tables, all heads'
+    # or one head's, broadcast across the heads and are cast to x's dtype, so x sets the precision
     pairs = rearrange(x, "m (h p two) -> m h p two", p=cos.shape[-1], two=2)
     x0, x1 = torch.unbind(pairs, dim=-1)
-    cos_cast = cos.to(dtype=x.dtype)
-    c = rearrange(cos_cast, "m p -> m 1 p")
-    sin_cast = sin.to(dtype=x.dtype)
-    s = rearrange(sin_cast, "m p -> m 1 p")
-    x0_cos = x0 * c
-    x1_sin = x1 * s
+    cos = cos.to(dtype=x.dtype)
+    cos = rearrange(cos, "m p -> m 1 p")
+    sin = sin.to(dtype=x.dtype)
+    sin = rearrange(sin, "m p -> m 1 p")
+    x0_cos = x0 * cos
+    x1_sin = x1 * sin
     rotated_x0 = x0_cos - x1_sin
-    x1_cos = x1 * c
-    x0_sin = x0 * s
+    x1_cos = x1 * cos
+    x0_sin = x0 * sin
     rotated_x1 = x1_cos + x0_sin
     rotated = torch.stack((rotated_x0, rotated_x1), dim=-1)
     return rearrange(rotated, "m h p two -> m (h p two)")
 
 
+rope_bench_interleaved = rope
+
+
 def rope_bench(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, head_dim: int) -> torch.Tensor:
-    # rope on the split layout, as a model's rotate_half runs it: each head of x as NeoX's halves, pair j at columns
-    # (j, j + head_dim / 2), and x cos + rotate_half(x) sin over rope_tables_bench's tables or a model's per-head
-    # (M, head_dim) cache, cast to x's dtype; -sin rotates by -theta_j, the transpose. In eager bf16 it rounds as
-    # rope does, bitwise
-    heads = rearrange(x, "m (h d) -> m h d", d=head_dim)
-    half = heads.shape[-1] // 2
-    first, second = torch.split(heads, (half, half), dim=-1)
-    negated_second = -second
-    rotated_half = torch.cat((negated_second, first), dim=-1)
-    cos_cast = cos.to(dtype=x.dtype)
-    c = rearrange(cos_cast, "m (h d) -> m h d", d=head_dim)
-    sin_cast = sin.to(dtype=x.dtype)
-    s = rearrange(sin_cast, "m (h d) -> m h d", d=head_dim)
-    return rearrange(rotated, "m h d -> m (h d)")
+    # the split layout a model's rotate_half uses: each head's halves (x0, x1) at columns (j, j + head_dim / 2)
+    # rotated by theta_j, (x0 cos - x1 sin, x1 cos + x0 sin); -sin rotates by -theta_j, the transpose. The
+    # (M, pairs) tables, all heads' or one head's, broadcast across the heads and are cast to x's dtype, so x sets
+    # the precision
+    half = head_dim // 2
+    halves = rearrange(x, "m (h two p) -> m h two p", two=2, p=half)
+    x0, x1 = torch.unbind(halves, dim=2)
+    cos = cos.to(dtype=x.dtype)
+    cos = rearrange(cos, "m (h p) -> m h p", p=half)
+    sin = sin.to(dtype=x.dtype)
+    sin = rearrange(sin, "m (h p) -> m h p", p=half)
+    x0_cos = x0 * cos
+    x1_sin = x1 * sin
+    rotated_x0 = x0_cos - x1_sin
+    x1_cos = x1 * cos
+    x0_sin = x0 * sin
+    rotated_x1 = x1_cos + x0_sin
+    rotated = torch.stack((rotated_x0, rotated_x1), dim=2)
+    return rearrange(rotated, "m h two p -> m (h two p)")
 
 
 def head_mean_square(x: torch.Tensor, head_dim: int) -> torch.Tensor:
@@ -195,13 +194,13 @@ def qknorm(
     # back in x's dtype, as a model's norm returns it
     heads = rearrange(x, "m (h d) -> m h d", d=head_dim)
     rstd_per_head = torch.rsqrt(head_mean_sq + eps)
-    rstd = rearrange(rstd_per_head, "m h -> m h 1")
+    rstd_per_head = rearrange(rstd_per_head, "m h -> m h 1")
     # gamma is [gamma_q | gamma_k]: its q half weights the first num_heads_q heads, its k half the rest
     gamma_q, gamma_k = torch.split(gamma, (head_dim, head_dim))
     weight_q = repeat(gamma_q, "d -> h d", h=num_heads_q)
     weight_k = repeat(gamma_k, "d -> h d", h=num_heads_k)
     weights = torch.cat((weight_q, weight_k))
-    normed_heads = heads * rstd * weights
+    normed_heads = heads * rstd_per_head * weights
     normed = rearrange(normed_heads, "m h d -> m (h d)")
     return normed.to(dtype=x.dtype)
 
@@ -223,8 +222,29 @@ def dqknorm(
     heads_dn = rearrange(dn, "m (h d) -> m h d", d=head_dim)
     heads_z = rearrange(z, "m (h d) -> m h d", d=head_dim)
     rstd_per_head = torch.rsqrt(head_mean_sq + eps)
-    rstd = rearrange(rstd_per_head, "m h -> m h 1")
+    rstd_per_head = rearrange(rstd_per_head, "m h -> m h 1")
     # gamma is [gamma_q | gamma_k]: its q half weights the first num_heads_q heads, its k half the rest
+    gamma_q, gamma_k = torch.split(gamma, (head_dim, head_dim))
+    weight_q = repeat(gamma_q, "d -> h d", h=num_heads_q)
+    weight_k = repeat(gamma_k, "d -> h d", h=num_heads_k)
+    weights = torch.cat((weight_q, weight_k))
+    weighted = heads_dn * weights
+    drstd = reduce(weighted * heads_z, "m h d -> m h 1", "sum")
+    dz_direct = rstd_per_head * weighted
+    rstd_cubed = rstd_per_head**3
+    rstd_cubed_z_drstd = rstd_cubed * heads_z * drstd
+    dz_statistic = rstd_cubed_z_drstd / head_dim
+    dz = dz_direct - dz_statistic
+    dgamma_terms = heads_dn * heads_z * rstd_per_head
+    columns = reduce(dgamma_terms, "m h d -> h d", "sum")
+    columns_q, columns_k = torch.split(columns, (num_heads_q, num_heads_k))
+    dgamma_q = reduce(columns_q, "h d -> d", "sum")
+    dgamma_k = reduce(columns_k, "h d -> d", "sum")
+    dgamma = torch.cat((dgamma_q, dgamma_k))
+    share_rstd_cubed = rstd_per_head**3
+    zdz_share_terms = eps * share_rstd_cubed * drstd
+    zdz_share = reduce(zdz_share_terms, "m h 1 -> m", "sum")
+    return rearrange(dz, "m h d -> m (h d)"), dgamma, zdz_share
 
 
 def cross_entropy(
@@ -235,4 +255,17 @@ def cross_entropy(
     # each row's loss lse - z_t, and the gradient of the summed loss on the logits, softmax - onehot, whose target
     # entry is minus the off-target mass: on a confident row p_t - 1 cancels to 0 even in fp64. A row whose target
     # is ignore_index gets 0 for both
+    kept = target != ignore_index
+    safe_target = torch.where(condition=kept, input=target, other=0)
+    rows = torch.arange(logits.shape[0], device=logits.device)
+    lse = torch.logsumexp(logits, dim=-1)
+    target_logits = logits[rows, safe_target]
+    losses = lse - target_logits
+    dlogits = torch.softmax(logits, dim=-1)
+    dlogits[rows, safe_target] = 0
+    off_target_mass = reduce(dlogits, "m v -> m", "sum")
+    dlogits[rows, safe_target] = -off_target_mass
+    losses = torch.where(condition=kept, input=losses, other=0)
+    kept = rearrange(kept, "m -> m 1")
+    dlogits = torch.where(condition=kept, input=dlogits, other=0)
     return losses, dlogits
