@@ -14,24 +14,20 @@ class PairLayout(Enum):
 # ---- primitives
 
 
-def swiglu(preact: torch.Tensor) -> torch.Tensor:
-    # silu(gate) * up, gate and up at adjacent columns (2i, 2i + 1)
-    pairs = rearrange(preact, "m (n two) -> m n two", two=2)
-    gate, up = torch.unbind(pairs, dim=-1)
-    silu = torch.nn.functional.silu(gate)
-    return silu * up
-
-
-def swiglu_bench(
+def swiglu(
     preact: torch.Tensor,
     layout: PairLayout,
 ) -> torch.Tensor:
-    # swiglu in either layout; split takes gate and up as the halves [gate | up] of a packed [W_gate; W_up] GEMM
+    # silu(gate) * up, gate and up at adjacent columns (2i, 2i + 1), or split as the halves [gate | up] of a packed
+    # [W_gate; W_up] GEMM
     if layout == PairLayout.interleaved:
-        return swiglu(preact=preact)
-    assert layout == PairLayout.split
-    half = preact.shape[-1] // 2
-    gate, up = torch.split(preact, (half, half), dim=-1)
+        pairs = rearrange(preact, "m (n two) -> m n two", two=2)
+        gate, up = torch.unbind(pairs, dim=-1)
+    else:
+        assert layout == PairLayout.split
+        half = preact.shape[-1] // 2
+        gate, up = torch.split(preact, (half, half), dim=-1)
+
     silu = torch.nn.functional.silu(gate)
     return silu * up
 
@@ -39,36 +35,18 @@ def swiglu_bench(
 def dswiglu(
     preact: torch.Tensor,
     grad: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # swiglu's vjp dpreact, interleaved like preact, and the recomputed postact
-    # closed form so torch's arm compiles under fullgraph
-    pairs = rearrange(preact, "m (n two) -> m n two", two=2)
-    gate, up = torch.unbind(pairs, dim=-1)
-    sigmoid = torch.nn.functional.sigmoid(gate)
-    silu = gate * sigmoid
-    dsilu = grad * up
-    one_minus_sigmoid = 1 - sigmoid
-    silu_one_minus_sigmoid = silu * one_minus_sigmoid
-    dsilu_dgate = sigmoid + silu_one_minus_sigmoid
-    dgate = dsilu * dsilu_dgate
-    dup = grad * silu
-    dpairs = torch.stack((dgate, dup), dim=-1)
-    dpreact = rearrange(dpairs, "m n two -> m (n two)")
-    postact = silu * up
-    return dpreact, postact
-
-
-def _dswiglu_bench(
-    preact: torch.Tensor,
-    grad: torch.Tensor,
     layout: PairLayout,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # dswiglu in either layout; split returns dpreact as [dgate | dup], like preact
+    # swiglu's vjp dpreact, in preact's layout, and the recomputed postact
+    # closed form so torch's arm compiles under fullgraph
     if layout == PairLayout.interleaved:
-        return dswiglu(preact=preact, grad=grad)
-    assert layout == PairLayout.split
-    half = preact.shape[-1] // 2
-    gate, up = torch.split(preact, (half, half), dim=-1)
+        pairs = rearrange(preact, "m (n two) -> m n two", two=2)
+        gate, up = torch.unbind(pairs, dim=-1)
+    else:
+        assert layout == PairLayout.split
+        half = preact.shape[-1] // 2
+        gate, up = torch.split(preact, (half, half), dim=-1)
+
     sigmoid = torch.nn.functional.sigmoid(gate)
     silu = gate * sigmoid
     dsilu = grad * up
@@ -77,7 +55,13 @@ def _dswiglu_bench(
     dsilu_dgate = sigmoid + silu_one_minus_sigmoid
     dgate = dsilu * dsilu_dgate
     dup = grad * silu
-    dpreact = torch.cat((dgate, dup), dim=-1)
+
+    if layout == PairLayout.interleaved:
+        dpairs = torch.stack((dgate, dup), dim=-1)
+        dpreact = rearrange(dpairs, "m n two -> m (n two)")
+    else:
+        dpreact = torch.cat((dgate, dup), dim=-1)
+
     postact = silu * up
     return dpreact, postact
 
@@ -161,49 +145,37 @@ def rope(
     x: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-) -> torch.Tensor:
-    # each pair (x0, x1) at columns (2j, 2j + 1) rotated to (x0 cos - x1 sin, x1 cos + x0 sin), -sin rotating
-    # back; the (M, pairs) tables, one head's or all heads', broadcast over heads, and x's dtype sets the precision
-    pairs = rearrange(x, "m (h p two) -> m h p two", p=cos.shape[-1], two=2)
-    x0, x1 = torch.unbind(pairs, dim=-1)
-    cos = cos.to(dtype=x.dtype)
-    cos = rearrange(cos, "m p -> m 1 p")
-    sin = sin.to(dtype=x.dtype)
-    sin = rearrange(sin, "m p -> m 1 p")
-    x0_cos = x0 * cos
-    x1_sin = x1 * sin
-    rotated_x0 = x0_cos - x1_sin
-    x1_cos = x1 * cos
-    x0_sin = x0 * sin
-    rotated_x1 = x1_cos + x0_sin
-    rotated = torch.stack((rotated_x0, rotated_x1), dim=-1)
-    return rearrange(rotated, "m h p two -> m (h p two)")
-
-
-def _rope_bench(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    head_dim: int,
     layout: PairLayout,
+    head_dim: int | None = None,
 ) -> torch.Tensor:
-    # rope in either layout; split pairs each head's halves, columns (j, j + head_dim / 2), as rotate_half does
+    # each pair (x0, x1) rotated to (x0 cos - x1 sin, x1 cos + x0 sin), -sin rotating back: at adjacent columns
+    # (2j, 2j + 1), or split as each head's halves (j, j + head_dim / 2), which needs head_dim; the (M, pairs)
+    # tables, one head's or all heads', broadcast over heads, and x's dtype sets the precision
     if layout == PairLayout.interleaved:
-        return rope(x=x, cos=cos, sin=sin)
-    assert layout == PairLayout.split
-    half = head_dim // 2
-    halves = rearrange(x, "m (h two p) -> m h two p", two=2, p=half)
-    x0, x1 = torch.unbind(halves, dim=2)
-    cos = cos.to(dtype=x.dtype)
-    cos = rearrange(cos, "m (h p) -> m h p", p=half)
-    sin = sin.to(dtype=x.dtype)
-    sin = rearrange(sin, "m (h p) -> m h p", p=half)
+        pairs = rearrange(x, "m (h p two) -> m h p two", p=cos.shape[-1], two=2)
+        x0, x1 = torch.unbind(pairs, dim=-1)
+        cos = cos.to(dtype=x.dtype)
+        cos = rearrange(cos, "m p -> m 1 p")
+        sin = sin.to(dtype=x.dtype)
+        sin = rearrange(sin, "m p -> m 1 p")
+    else:
+        assert layout == PairLayout.split
+        half = head_dim // 2
+        halves = rearrange(x, "m (h two p) -> m h two p", two=2, p=half)
+        x0, x1 = torch.unbind(halves, dim=2)
+        cos = cos.to(dtype=x.dtype)
+        cos = rearrange(cos, "m (h p) -> m h p", p=half)
+        sin = sin.to(dtype=x.dtype)
+        sin = rearrange(sin, "m (h p) -> m h p", p=half)
     x0_cos = x0 * cos
     x1_sin = x1 * sin
     rotated_x0 = x0_cos - x1_sin
     x1_cos = x1 * cos
     x0_sin = x0 * sin
     rotated_x1 = x1_cos + x0_sin
+    if layout == PairLayout.interleaved:
+        rotated = torch.stack((rotated_x0, rotated_x1), dim=-1)
+        return rearrange(rotated, "m h p two -> m (h p two)")
     rotated = torch.stack((rotated_x0, rotated_x1), dim=2)
     return rearrange(rotated, "m h two p -> m (h two p)")
 
@@ -415,22 +387,12 @@ def linear_sigmoid(
 def gemm_swiglu(
     A: torch.Tensor,
     B: torch.Tensor,
+    layout: PairLayout,
     coda_accumulator: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # B is (K, 2N), gate and up in adjacent columns
+    # B is (K, 2N), gate and up columns interleaved, or split into halves
     preact = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
-    postact = swiglu(preact=preact)
-    return preact, postact
-
-
-def gemm_swiglu_bench(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    layout: PairLayout,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # B is (K, 2N), gate and up columns interleaved or split into halves
-    preact = gemm(A=A, B=B)
-    postact = swiglu_bench(preact=preact, layout=layout)
+    postact = swiglu(preact=preact, layout=layout)
     return preact, postact
 
 
@@ -444,7 +406,7 @@ def gemm_rmsnorm_swiglu(
     D = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
     rstd = rearrange(rstd, "m -> m 1")
     preact = D * rstd
-    postact = swiglu(preact=preact)
+    postact = swiglu(preact=preact, layout=PairLayout.interleaved)
     return preact, postact
 
 
@@ -459,7 +421,7 @@ def gemm_rmsnorm_swiglu_bench(
     rstd = rearrange(rstd, "m -> m 1")
     preact = D * rstd
     preact = preact.to(dtype=A.dtype)
-    postact = swiglu_bench(preact=preact, layout=layout)
+    postact = swiglu(preact=preact, layout=layout)
     return preact, postact
 
 
@@ -467,30 +429,14 @@ def gemm_swiglu_bwd_zdz(
     A: torch.Tensor,
     B: torch.Tensor,
     Z: torch.Tensor,
+    layout: PairLayout,
     scale: float | None = None,
     coda_accumulator: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # the down projection's dgrad through swiglu: dpostact = A @ B^T, B (N, K), then dZ against the stored
     # preact Z, ZdZ = scale * sum(Z dZ), and postact recomputed for the wgrad
     dpostact = gemm(A=A, B=B.mT, coda_accumulator=coda_accumulator)
-    dZ, postact = dswiglu(preact=Z, grad=dpostact)
-    Z_dZ = Z * dZ
-    ZdZ = reduce(Z_dZ, "m n -> m", "sum")
-    if scale is not None:
-        ZdZ = ZdZ * scale
-    return dZ, ZdZ, postact
-
-
-def gemm_swiglu_bwd_zdz_bench(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    Z: torch.Tensor,
-    layout: PairLayout,
-    scale: float | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # ZdZ in the model's dtype, the same whole-row sum in either layout
-    dpostact = gemm(A=A, B=B.mT)
-    dZ, postact = _dswiglu_bench(preact=Z, grad=dpostact, layout=layout)
+    dZ, postact = dswiglu(preact=Z, grad=dpostact, layout=layout)
     Z_dZ = Z * dZ
     ZdZ = reduce(Z_dZ, "m n -> m", "sum")
     if scale is not None:
@@ -501,38 +447,22 @@ def gemm_swiglu_bwd_zdz_bench(
 def dswiglu_backward(
     preact: torch.Tensor,
     grad_out: torch.Tensor,
-) -> torch.Tensor:
-    # swiglu's vjp dpreact alone
-    dpreact, _ = dswiglu(preact=preact, grad=grad_out)
-    return dpreact
-
-
-def dswiglu_backward_bench(
-    preact: torch.Tensor,
-    grad_out: torch.Tensor,
     layout: PairLayout,
 ) -> torch.Tensor:
-    dpreact, _ = _dswiglu_bench(preact=preact, grad=grad_out, layout=layout)
+    # swiglu's vjp dpreact alone
+    dpreact, _ = dswiglu(preact=preact, grad=grad_out, layout=layout)
     return dpreact
 
 
 def linear_swiglu(
     x: torch.Tensor,
     weight: torch.Tensor,
+    layout: PairLayout,
     coda_accumulator: bool = False,
 ) -> torch.Tensor:
-    # weight (2N, K), gate and up rows interleaved; its autograd is the backward's reference
-    _, postact = gemm_swiglu(A=x, B=weight.mT, coda_accumulator=coda_accumulator)
-    return postact
-
-
-def linear_swiglu_bench(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    layout: PairLayout,
-) -> torch.Tensor:
-    # weight (2N, K), gate and up rows interleaved, or split as [W_gate; W_up]
-    _, postact = gemm_swiglu_bench(A=x, B=weight.mT, layout=layout)
+    # weight (2N, K), gate and up rows interleaved, or split as [W_gate; W_up]; its autograd is the backward's
+    # reference
+    _, postact = gemm_swiglu(A=x, B=weight.mT, layout=layout, coda_accumulator=coda_accumulator)
     return postact
 
 
@@ -604,21 +534,33 @@ def gemm_residual_partial_rmsnorm_bwd(
 
 
 # ---- rope: q and k heads rotated, v passed through at zero frequency
-# given cos and sin, a model's one-head (tokens, head_dim / 2) cache, a speed reference rotates the first size_qk
+# given cos and sin, a model's one-head (tokens, head_dim / 2) cache, a reference rotates the first size_qk
 # columns, q | k, and returns v apart, as that table cannot leave it unrotated; positions and frequencies are None
 
 
 def gemm_rope(
     A: torch.Tensor,
     B: torch.Tensor,
-    positions: torch.Tensor,
-    frequencies: torch.Tensor,
+    positions: torch.Tensor | None,
+    frequencies: torch.Tensor | None,
+    layout: PairLayout,
+    head_dim: int | None = None,
+    cos: torch.Tensor | None = None,
+    sin: torch.Tensor | None = None,
+    size_qk: int | None = None,
     coda_accumulator: bool = False,
-) -> torch.Tensor:
-    # rope(A @ B), B (K, N); zero-frequency columns (a packed v) pass through
-    cos, sin = rope_tables(positions=positions, frequencies=frequencies)
-    D = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
-    return rope(x=D, cos=cos, sin=sin)
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    # rope(A @ B), B (K, N); zero-frequency columns (a packed v) pass through; split relabels B's q | k columns
+    # per head
+    if cos is None:
+        cos, sin = rope_tables(positions=positions, frequencies=frequencies)
+        D = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
+        return rope(x=D, cos=cos, sin=sin, layout=layout, head_dim=head_dim)
+    qkv = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
+    size_v = qkv.shape[1] - size_qk
+    qk, v = torch.split(qkv, (size_qk, size_v), dim=1)
+    rotated_qk = rope(x=qk, cos=cos, sin=sin, layout=layout, head_dim=head_dim)
+    return rotated_qk, v
 
 
 def gemm_rmsnorm_rope(
@@ -634,22 +576,26 @@ def gemm_rmsnorm_rope(
     rstd = rearrange(rstd, "m -> m 1")
     z = D * rstd
     cos, sin = rope_tables(positions=positions, frequencies=frequencies)
-    return rope(x=z, cos=cos, sin=sin)
+    return rope(x=z, cos=cos, sin=sin, layout=PairLayout.interleaved)
 
 
 def gemm_qknorm_rope(
     A: torch.Tensor,
     B: torch.Tensor,
     weight: torch.Tensor,
-    positions: torch.Tensor,
-    frequencies: torch.Tensor,
+    positions: torch.Tensor | None,
+    frequencies: torch.Tensor | None,
     head_dim: int,
     num_heads_q: int,
     num_heads_k: int,
     eps: float,
+    cos: torch.Tensor | None,
+    sin: torch.Tensor | None,
+    layout: PairLayout,
     coda_accumulator: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # rope(qknorm(A @ B)), B (K, N) with N = [q | k] heads, and the saved preact and head_mean_sq
+    # rope(qknorm(A @ B)), B (K, N) with N = [q | k] heads, and the saved preact and head_mean_sq; split relabels
+    # B's columns and gamma per head, head_mean_sq the same in either layout
     preact = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
     head_mean_sq = head_mean_square(x=preact, head_dim=head_dim)
     normed = qknorm(
@@ -661,8 +607,9 @@ def gemm_qknorm_rope(
         num_heads_k=num_heads_k,
         eps=eps,
     )
-    cos, sin = rope_tables(positions=positions, frequencies=frequencies)
-    rotated_normed = rope(x=normed, cos=cos, sin=sin)
+    if cos is None:
+        cos, sin = rope_tables(positions=positions, frequencies=frequencies)
+    rotated_normed = rope(x=normed, cos=cos, sin=sin, layout=layout, head_dim=head_dim)
     return rotated_normed, preact, head_mean_sq
 
 
@@ -694,7 +641,7 @@ def gemm_rmsnorm_qknorm_rope(
         eps=eps,
     )
     cos, sin = rope_tables(positions=positions, frequencies=frequencies)
-    rotated_normed = rope(x=normed, cos=cos, sin=sin)
+    rotated_normed = rope(x=normed, cos=cos, sin=sin, layout=PairLayout.interleaved)
     return rotated_normed, preact, head_mean_sq
 
 
@@ -704,17 +651,22 @@ def qknorm_rope_bwd(
     x: torch.Tensor,
     head_mean_sq: torch.Tensor,
     gamma: torch.Tensor,
-    pos: torch.Tensor,
-    freq: torch.Tensor,
+    pos: torch.Tensor | None,
+    freq: torch.Tensor | None,
     head_dim: int,
     num_heads_q: int,
     num_heads_k: int,
     eps: float,
+    cos: torch.Tensor | None,
+    sin: torch.Tensor | None,
+    layout: PairLayout,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # gemm_qknorm_rope's epilogue backward at the forward's statistic, x = [q | k] its saved preact
-    cos, sin = rope_tables(positions=pos, frequencies=freq)
+    # gemm_qknorm_rope's epilogue backward at the forward's statistic, x = [q | k] its saved preact; split relabels
+    # the cotangents, x and gamma per head
+    if cos is None:
+        cos, sin = rope_tables(positions=pos, frequencies=freq)
     dqk = torch.cat((dq, dk), dim=1)
-    dnormed = rope(x=dqk, cos=cos, sin=-sin)
+    dnormed = rope(x=dqk, cos=cos, sin=-sin, layout=layout, head_dim=head_dim)
     dx, dgamma, _ = dqknorm(
         dn=dnormed,
         z=x,
@@ -728,23 +680,6 @@ def qknorm_rope_bwd(
     return dx.to(dtype=x.dtype), dgamma
 
 
-def rope_bwd_zdz(
-    y: torch.Tensor,
-    dy: torch.Tensor,
-    pos: torch.Tensor,
-    freq: torch.Tensor,
-    scale: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # dz = R^T dy for the stored y = R z; R is orthogonal, so zdz = scale * sum(z dz) = scale * sum(y dy)
-    cos, sin = rope_tables(positions=pos, frequencies=freq)
-    dz = rope(x=dy, cos=cos, sin=-sin)
-    y_dy = y * dy
-    zdz_unscaled = reduce(y_dy, "m n -> m", "sum")
-    zdz = zdz_unscaled * scale
-    return dz, zdz
-
-
-
 def qknorm_rope_bwd_zdz(
     dy: torch.Tensor,
     preact: torch.Tensor,
@@ -752,24 +687,30 @@ def qknorm_rope_bwd_zdz(
     rstd: torch.Tensor,
     head_mean_sq: torch.Tensor,
     gamma: torch.Tensor,
-    pos: torch.Tensor,
-    freq: torch.Tensor,
+    pos: torch.Tensor | None,
+    freq: torch.Tensor | None,
     head_dim: int,
     num_heads_q: int,
     num_heads_k: int,
     eps: float,
     scale: float,
+    layout: PairLayout,
     dv: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    cos: torch.Tensor | None = None,
+    sin: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]:
     # gemm_rmsnorm_qknorm_rope's epilogue backward, dy and dz [q | k | v]: q and k through rope and qknorm at
     # z = rstd preact, v at z = v with dz = dy + dv when given; zdz = scale * sum(z dz), its q | k part from dqknorm
+    # with a cache, q | k's dz and v's are returned apart
+    cached = cos is not None
     size_qk = preact.shape[1]
     rstd = rearrange(rstd, "m -> m 1")
     z = rstd * preact
-    cos, sin = rope_tables(positions=pos, frequencies=freq)
+    if cos is None:
+        cos, sin = rope_tables(positions=pos, frequencies=freq)
     size_v = v.shape[1]
     dy_qk, dy_v = torch.split(dy, (size_qk, size_v), dim=1)
-    dnormed = rope(x=dy_qk, cos=cos, sin=-sin)
+    dnormed = rope(x=dy_qk, cos=cos, sin=-sin, layout=layout, head_dim=head_dim)
     dz_qk, dgamma, zdz_qk = dqknorm(
         dn=dnormed,
         z=z,
@@ -796,15 +737,19 @@ def linear_qknorm_rope(
     x: torch.Tensor,
     weight: torch.Tensor,
     gamma: torch.Tensor,
-    positions: torch.Tensor,
-    frequencies: torch.Tensor,
+    positions: torch.Tensor | None,
+    frequencies: torch.Tensor | None,
     head_dim: int,
     num_heads_q: int,
     num_heads_k: int,
     eps: float,
+    layout: PairLayout,
+    cos: torch.Tensor | None = None,
+    sin: torch.Tensor | None = None,
     coda_accumulator: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # weight rows [q | k | v]: q, k normed per head and rotated, v plain; its autograd is the backward's reference
+    # weight rows [q | k | v]: q, k normed per head and rotated, v plain; its autograd is the backward's reference;
+    # split relabels weight's q | k rows and gamma per head
     size_q = head_dim * num_heads_q
     size_k = head_dim * num_heads_k
     size_qk = size_q + size_k
@@ -820,6 +765,9 @@ def linear_qknorm_rope(
         num_heads_q=num_heads_q,
         num_heads_k=num_heads_k,
         eps=eps,
+        layout=layout,
+        cos=cos,
+        sin=sin,
         coda_accumulator=coda_accumulator,
     )
     q, k = torch.split(rotated_qk, (size_q, size_k), dim=-1)
