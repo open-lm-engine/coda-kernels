@@ -656,9 +656,81 @@ def gemm_residual_partial_rmsnorm_bwd(
 
 
 # ---- rope: q and k heads rotated, v passed through at zero frequency
-# a reference of a [q | k | v] returns q, k and v apart, as a model splits them, in either form: given cos and sin,
-# a model's one-head (tokens, head_dim / 2) cache, positions and frequencies are None; without them, the tables
-# are formed from q's and k's columns of frequencies
+# a reference of a [q | k | v] returns q | k and v apart, as a model splits them, in either form: given cos and
+# sin, a model's one-head (tokens, head_dim / 2) cache, positions and frequencies are None; without them, the
+# tables are formed from q | k's columns of frequencies
+
+
+def gemm_rope(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    cos: torch.Tensor | None,
+    sin: torch.Tensor | None,
+    positions: torch.Tensor | None,
+    frequencies: torch.Tensor | None,
+    size_q: int,
+    size_k: int,
+    size_v: int,
+    layout: PairLayout,
+    head_dim: int | None = None,
+    use_quack: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # rope(A @ B), B (K, N) with N = [q | k | v]: q | k rotated, v as it came (CODA's zero-frequency columns); split
+    # relabels B's q | k columns per head
+    qkv = gemm(
+        A=A,
+        B=B,
+        use_quack=use_quack,
+    )
+    size_qk = size_q + size_k
+    qk, v = torch.split(qkv, (size_qk, size_v), dim=1)
+    if cos is None:
+        cos, sin = rope_tables(
+            positions=positions,
+            frequencies=frequencies[:size_qk],
+        )
+    rotated_qk = rope(
+        x=qk,
+        cos=cos,
+        sin=sin,
+        layout=layout,
+        head_dim=head_dim,
+    )
+    return rotated_qk, v
+
+
+def gemm_rmsnorm_rope(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    rstd: torch.Tensor,
+    positions: torch.Tensor,
+    frequencies: torch.Tensor,
+    size_q: int,
+    size_k: int,
+    size_v: int,
+    use_quack: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # rope((A @ B) rstd), the input norm's row scale deferred onto the accumulator; q | k and v as in gemm_rope
+    D = gemm(
+        A=A,
+        B=B,
+        use_quack=use_quack,
+    )
+    rstd = rearrange(rstd, "m -> m 1")
+    z = D * rstd
+    size_qk = size_q + size_k
+    z_qk, z_v = torch.split(z, (size_qk, size_v), dim=1)
+    cos, sin = rope_tables(
+        positions=positions,
+        frequencies=frequencies[:size_qk],
+    )
+    rotated_qk = rope(
+        x=z_qk,
+        cos=cos,
+        sin=sin,
+        layout=PairLayout.interleaved,
+    )
+    return rotated_qk, z_v
 
 
 def gemm_qknorm_rope(
@@ -711,6 +783,53 @@ def gemm_qknorm_rope(
     return rotated_normed, preact, head_mean_sq
 
 
+def gemm_rmsnorm_qknorm_rope(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    rstd: torch.Tensor,
+    weight: torch.Tensor,
+    positions: torch.Tensor,
+    frequencies: torch.Tensor,
+    head_dim: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    eps: float,
+    use_quack: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # rotated_normed and head_mean_sq are of z = rstd (A @ B), but preact is the raw A @ B; the backward rebuilds z
+    preact = gemm(
+        A=A,
+        B=B,
+        use_quack=use_quack,
+    )
+    rstd = rearrange(rstd, "m -> m 1")
+    z = preact * rstd
+    head_mean_sq = head_mean_square(
+        x=z,
+        head_dim=head_dim,
+    )
+    normed = qknorm(
+        x=z,
+        head_mean_sq=head_mean_sq,
+        gamma=weight,
+        head_dim=head_dim,
+        num_heads_q=num_heads_q,
+        num_heads_k=num_heads_k,
+        eps=eps,
+    )
+    cos, sin = rope_tables(
+        positions=positions,
+        frequencies=frequencies,
+    )
+    rotated_normed = rope(
+        x=normed,
+        cos=cos,
+        sin=sin,
+        layout=PairLayout.interleaved,
+    )
+    return rotated_normed, preact, head_mean_sq
+
+
 def qknorm_rope_bwd(
     dq: torch.Tensor,
     dk: torch.Tensor,
@@ -755,6 +874,42 @@ def qknorm_rope_bwd(
     return dx.to(dtype=x.dtype), dgamma
 
 
+def rope_bwd_zdz(
+    y: torch.Tensor,
+    dy: torch.Tensor,
+    cos: torch.Tensor | None,
+    sin: torch.Tensor | None,
+    pos: torch.Tensor | None,
+    freq: torch.Tensor | None,
+    scale: float,
+    size_q: int,
+    size_k: int,
+    size_v: int,
+    layout: PairLayout,
+    head_dim: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # dz = R^T dy for the stored y = R z, q | k's, then v's dy as it came; R is orthogonal, so
+    # zdz = scale * sum(z dz) = scale * sum(y dy)
+    size_qk = size_q + size_k
+    dy_qk, dy_v = torch.split(dy, (size_qk, size_v), dim=1)
+    if cos is None:
+        cos, sin = rope_tables(
+            positions=pos,
+            frequencies=freq[:size_qk],
+        )
+    dz_qk = rope(
+        x=dy_qk,
+        cos=cos,
+        sin=-sin,
+        layout=layout,
+        head_dim=head_dim,
+    )
+    y_dy = y * dy
+    zdz_unscaled = reduce(y_dy, "m n -> m", "sum")
+    zdz = zdz_unscaled * scale
+    return dz_qk, dy_v, zdz
+
+
 def qknorm_rope_bwd_zdz(
     dy: torch.Tensor,
     preact: torch.Tensor,
@@ -775,11 +930,9 @@ def qknorm_rope_bwd_zdz(
     dv: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     # gemm_rmsnorm_qknorm_rope's epilogue backward, dy [q | k | v]: q and k through rope and qknorm at z = rstd
-    # preact, v at z = v with dz = dy + dv when given; zdz = scale * sum(z dz), its q | k part from dqknorm. q's,
-    # k's and v's dz are returned apart, as a model's split takes them back
-    size_q = head_dim * num_heads_q
-    size_k = head_dim * num_heads_k
-    size_qk = size_q + size_k
+    # preact, v at z = v with dz = dy + dv when given; zdz = scale * sum(z dz), its q | k part from dqknorm. q | k's
+    # dz and v's are returned apart, as a model's split takes them back
+    size_qk = preact.shape[1]
     rstd = rearrange(rstd, "m -> m 1")
     z = rstd * preact
     if cos is None:
@@ -814,6 +967,7 @@ def qknorm_rope_bwd_zdz(
     zdz_v = reduce(v_dz_v, "m n -> m", "sum")
     zdz_unscaled = zdz_v + zdz_qk
     zdz = zdz_unscaled * scale
+    return dz_qk, dz_v, zdz, dgamma
 
 
 def linear_qknorm_rope(
