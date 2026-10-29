@@ -167,15 +167,18 @@ def rope(
         cos = rearrange(cos, "m (h p) -> m h p", p=half)
         sin = sin.to(dtype=x.dtype)
         sin = rearrange(sin, "m (h p) -> m h p", p=half)
+
     x0_cos = x0 * cos
     x1_sin = x1 * sin
     rotated_x0 = x0_cos - x1_sin
     x1_cos = x1 * cos
     x0_sin = x0 * sin
     rotated_x1 = x1_cos + x0_sin
+
     if layout == PairLayout.interleaved:
         rotated = torch.stack((rotated_x0, rotated_x1), dim=-1)
         return rearrange(rotated, "m h p two -> m (h p two)")
+
     rotated = torch.stack((rotated_x0, rotated_x1), dim=2)
     return rearrange(rotated, "m h two p -> m (h two p)")
 
@@ -291,14 +294,15 @@ def cross_entropy(
 def gemm(
     A: torch.Tensor,
     B: torch.Tensor,
-    coda_accumulator: bool = False,
+    use_quack: bool = False,
 ) -> torch.Tensor:
-    # A @ B, B (K, N), batched or not: torch's in the operands' dtype, or with coda_accumulator CODA's fp32
-    # accumulator from quack with split_k=1, which sums K in CODA's order bit for bit, untuned since every config
-    # gives the same bits
-    if not coda_accumulator:
+    # A @ B, B (K, N), batched or not: torch's in the operands' dtype, or with use_quack the fp32 accumulator of
+    # quack's GEMM with split_k=1, the one CODA's epilogues read, which sums K in CODA's order bit for bit, untuned
+    # since every config gives the same bits
+    if not use_quack:
         return torch.matmul(input=A, other=B)
-    return quack_gemm(A=A, B=B, out_dtype=torch.float32, tuned=False, split_k=1)
+    else:
+        return quack_gemm(A=A, B=B, out_dtype=torch.float32, tuned=False, split_k=1)
 
 
 def gemm_symmetric(
@@ -307,13 +311,13 @@ def gemm_symmetric(
     C: torch.Tensor | None = None,
     D_scale: float | None = None,
     C_scale: float | None = None,
-    coda_accumulator: bool = False,
+    use_quack: bool = False,
 ) -> torch.Tensor:
     # D_scale * A B + C_scale * C, B = A^T by default: Newton-Schulz's X X^T, then b A + c A A; a scale left None is
     # not multiplied
     if B is None:
         B = A.mT
-    D = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
+    D = gemm(A=A, B=B, use_quack=use_quack)
     if D_scale is not None:
         D = D_scale * D
     if C is None:
@@ -327,10 +331,10 @@ def gemm_scalar_scale(
     A: torch.Tensor,
     B: torch.Tensor,
     alpha: torch.Tensor,
-    coda_accumulator: bool = False,
+    use_quack: bool = False,
 ) -> torch.Tensor:
     # (A @ B) * alpha, alpha a one-element fp32 device tensor (the cross-entropy backward's dloss)
-    D = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
+    D = gemm(A=A, B=B, use_quack=use_quack)
     return D * alpha
 
 
@@ -350,12 +354,12 @@ def gemm_add_dual_precision(
     B: torch.Tensor,
     C: torch.Tensor,
     C_scale: float | None = None,
-    coda_accumulator: bool = False,
+    use_quack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Newton-Schulz's X <- a X + B X over an fp32 master: out = A B + C_scale * C in C's dtype, and out rounded to
     # the operands' dtype, the next iteration's operand, a rounding kept since CODA's contract is that operand bit
-    # for bit; without coda_accumulator a bf16 A B rounds before the add
-    D = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
+    # for bit; without use_quack a bf16 A B rounds before the add
+    D = gemm(A=A, B=B, use_quack=use_quack)
     if C_scale is not None:
         C = C_scale * C
     out = D + C
@@ -365,20 +369,20 @@ def gemm_add_dual_precision(
 def gemm_sigmoid(
     A: torch.Tensor,
     B: torch.Tensor,
-    coda_accumulator: bool = False,
+    use_quack: bool = False,
 ) -> torch.Tensor:
-    D = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
+    D = gemm(A=A, B=B, use_quack=use_quack)
     return torch.nn.functional.sigmoid(D)
 
 
 def linear_sigmoid(
     x: torch.Tensor,
     weight: torch.Tensor,
-    coda_accumulator: bool = False,
+    use_quack: bool = False,
 ) -> torch.Tensor:
     # sigmoid(x @ weight^T), weight (N, K) as nn.Linear holds it; CODA's out_dtype only picks storage, so not an
     # argument here; its autograd is the backward's reference
-    return gemm_sigmoid(A=x, B=weight.mT, coda_accumulator=coda_accumulator)
+    return gemm_sigmoid(A=x, B=weight.mT, use_quack=use_quack)
 
 
 # ---- swiglu
@@ -388,10 +392,10 @@ def gemm_swiglu(
     A: torch.Tensor,
     B: torch.Tensor,
     layout: PairLayout,
-    coda_accumulator: bool = False,
+    use_quack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # B is (K, 2N), gate and up columns interleaved, or split into halves
-    preact = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
+    preact = gemm(A=A, B=B, use_quack=use_quack)
     postact = swiglu(preact=preact, layout=layout)
     return preact, postact
 
@@ -400,10 +404,10 @@ def gemm_rmsnorm_swiglu(
     A: torch.Tensor,
     B: torch.Tensor,
     rstd: torch.Tensor,
-    coda_accumulator: bool = False,
+    use_quack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # preact = (A @ B) rstd, the input norm's row scale deferred onto the accumulator, and postact from it
-    D = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
+    D = gemm(A=A, B=B, use_quack=use_quack)
     rstd = rearrange(rstd, "m -> m 1")
     preact = D * rstd
     postact = swiglu(preact=preact, layout=PairLayout.interleaved)
@@ -431,11 +435,11 @@ def gemm_swiglu_bwd_zdz(
     Z: torch.Tensor,
     layout: PairLayout,
     scale: float | None = None,
-    coda_accumulator: bool = False,
+    use_quack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # the down projection's dgrad through swiglu: dpostact = A @ B^T, B (N, K), then dZ against the stored
     # preact Z, ZdZ = scale * sum(Z dZ), and postact recomputed for the wgrad
-    dpostact = gemm(A=A, B=B.mT, coda_accumulator=coda_accumulator)
+    dpostact = gemm(A=A, B=B.mT, use_quack=use_quack)
     dZ, postact = dswiglu(preact=Z, grad=dpostact, layout=layout)
     Z_dZ = Z * dZ
     ZdZ = reduce(Z_dZ, "m n -> m", "sum")
@@ -458,11 +462,11 @@ def linear_swiglu(
     x: torch.Tensor,
     weight: torch.Tensor,
     layout: PairLayout,
-    coda_accumulator: bool = False,
+    use_quack: bool = False,
 ) -> torch.Tensor:
     # weight (2N, K), gate and up rows interleaved, or split as [W_gate; W_up]; its autograd is the backward's
     # reference
-    _, postact = gemm_swiglu(A=x, B=weight.mT, layout=layout, coda_accumulator=coda_accumulator)
+    _, postact = gemm_swiglu(A=x, B=weight.mT, layout=layout, use_quack=use_quack)
     return postact
 
 
@@ -473,10 +477,10 @@ def gemm_rmsnorm(
     A: torch.Tensor,
     B: torch.Tensor,
     rstd: torch.Tensor,
-    coda_accumulator: bool = False,
+    use_quack: bool = False,
 ) -> torch.Tensor:
     # (A @ B) rstd, B (K, N): the input norm's row scale deferred onto the accumulator
-    D = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
+    D = gemm(A=A, B=B, use_quack=use_quack)
     rstd = rearrange(rstd, "m -> m 1")
     return D * rstd
 
@@ -499,11 +503,11 @@ def gemm_residual_partial_rmsnorm(
     C: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
-    coda_accumulator: bool = False,
+    use_quack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # pre = A @ B + C, B (K, N), the partial norm post = pre * weight, and rstd of the unrounded pre, which the GEMM
     # consuming post applies
-    D = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
+    D = gemm(A=A, B=B, use_quack=use_quack)
     pre = D + C
     post = pre * weight
     rstd = rmsnorm_rstd(x=pre, eps=eps)
@@ -519,11 +523,11 @@ def gemm_residual_partial_rmsnorm_bwd(
     rstd: torch.Tensor,
     alpha: torch.Tensor | None = None,
     dX: torch.Tensor | None = None,
-    coda_accumulator: bool = False,
+    use_quack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # dnormed = A @ B^T, B (N, K), the consuming GEMM's dgrad, times alpha (the LM head's loss scale); then
     # drmsnorm against the stored pre and rstd, dpre added to dX when given
-    dnormed = gemm(A=A, B=B.mT, coda_accumulator=coda_accumulator)
+    dnormed = gemm(A=A, B=B.mT, use_quack=use_quack)
     if alpha is not None:
         dnormed = dnormed * alpha
     dpre, dweight, normed = drmsnorm(pre=pre, grad=dnormed, weight=weight, ZdZ=ZdZ, rstd=rstd)
@@ -543,20 +547,21 @@ def gemm_rope(
     B: torch.Tensor,
     positions: torch.Tensor | None,
     frequencies: torch.Tensor | None,
+    cos: torch.Tensor | None,
+    sin: torch.Tensor | None,
     layout: PairLayout,
     head_dim: int | None = None,
-    cos: torch.Tensor | None = None,
-    sin: torch.Tensor | None = None,
     size_qk: int | None = None,
-    coda_accumulator: bool = False,
+    use_quack: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     # rope(A @ B), B (K, N); zero-frequency columns (a packed v) pass through; split relabels B's q | k columns
     # per head
     if cos is None:
         cos, sin = rope_tables(positions=positions, frequencies=frequencies)
-        D = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
+        D = gemm(A=A, B=B, use_quack=use_quack)
         return rope(x=D, cos=cos, sin=sin, layout=layout, head_dim=head_dim)
-    qkv = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
+
+    qkv = gemm(A=A, B=B, use_quack=use_quack)
     size_v = qkv.shape[1] - size_qk
     qk, v = torch.split(qkv, (size_qk, size_v), dim=1)
     rotated_qk = rope(x=qk, cos=cos, sin=sin, layout=layout, head_dim=head_dim)
@@ -569,10 +574,10 @@ def gemm_rmsnorm_rope(
     rstd: torch.Tensor,
     positions: torch.Tensor,
     frequencies: torch.Tensor,
-    coda_accumulator: bool = False,
+    use_quack: bool = False,
 ) -> torch.Tensor:
     # rope((A @ B) rstd), the input norm's row scale deferred onto the accumulator
-    D = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
+    D = gemm(A=A, B=B, use_quack=use_quack)
     rstd = rearrange(rstd, "m -> m 1")
     z = D * rstd
     cos, sin = rope_tables(positions=positions, frequencies=frequencies)
@@ -592,11 +597,11 @@ def gemm_qknorm_rope(
     cos: torch.Tensor | None,
     sin: torch.Tensor | None,
     layout: PairLayout,
-    coda_accumulator: bool = False,
+    use_quack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # rope(qknorm(A @ B)), B (K, N) with N = [q | k] heads, and the saved preact and head_mean_sq; split relabels
     # B's columns and gamma per head, head_mean_sq the same in either layout
-    preact = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
+    preact = gemm(A=A, B=B, use_quack=use_quack)
     head_mean_sq = head_mean_square(x=preact, head_dim=head_dim)
     normed = qknorm(
         x=preact,
@@ -624,10 +629,10 @@ def gemm_rmsnorm_qknorm_rope(
     num_heads_q: int,
     num_heads_k: int,
     eps: float,
-    coda_accumulator: bool = False,
+    use_quack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # rotated_normed and head_mean_sq are of z = rstd (A @ B), but preact is the raw A @ B; the backward rebuilds z
-    preact = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
+    preact = gemm(A=A, B=B, use_quack=use_quack)
     rstd = rearrange(rstd, "m -> m 1")
     z = preact * rstd
     head_mean_sq = head_mean_square(x=z, head_dim=head_dim)
@@ -694,10 +699,10 @@ def qknorm_rope_bwd_zdz(
     num_heads_k: int,
     eps: float,
     scale: float,
+    cos: torch.Tensor | None,
+    sin: torch.Tensor | None,
     layout: PairLayout,
     dv: torch.Tensor | None = None,
-    cos: torch.Tensor | None = None,
-    sin: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     # gemm_rmsnorm_qknorm_rope's epilogue backward, dy and dz [q | k | v]: q and k through rope and qknorm at
     # z = rstd preact, v at z = v with dz = dy + dv when given; zdz = scale * sum(z dz), its q | k part from dqknorm
@@ -725,12 +730,15 @@ def qknorm_rope_bwd_zdz(
     if dv is not None:
         dz_v = dz_v + dv
     dz_qk = dz_qk.to(dtype=dy.dtype)
-    dz = torch.cat((dz_qk, dz_v), dim=1)
     v_dz_v = v * dz_v
     zdz_v = reduce(v_dz_v, "m n -> m", "sum")
     zdz_unscaled = zdz_v + zdz_qk
     zdz = zdz_unscaled * scale
-    return dz, zdz, dgamma
+    if cached:
+        return dz_qk, dz_v, zdz, dgamma
+    else:
+        dz = torch.cat((dz_qk, dz_v), dim=1)
+        return dz, zdz, dgamma
 
 
 def linear_qknorm_rope(
@@ -743,10 +751,10 @@ def linear_qknorm_rope(
     num_heads_q: int,
     num_heads_k: int,
     eps: float,
+    cos: torch.Tensor | None,
+    sin: torch.Tensor | None,
     layout: PairLayout,
-    cos: torch.Tensor | None = None,
-    sin: torch.Tensor | None = None,
-    coda_accumulator: bool = False,
+    use_quack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # weight rows [q | k | v]: q, k normed per head and rotated, v plain; its autograd is the backward's reference;
     # split relabels weight's q | k rows and gamma per head
@@ -768,10 +776,10 @@ def linear_qknorm_rope(
         layout=layout,
         cos=cos,
         sin=sin,
-        coda_accumulator=coda_accumulator,
+        use_quack=use_quack,
     )
     q, k = torch.split(rotated_qk, (size_q, size_k), dim=-1)
-    v = gemm(A=x, B=weight_v.mT, coda_accumulator=coda_accumulator)
+    v = gemm(A=x, B=weight_v.mT, use_quack=use_quack)
     return q, k, v
 
 
@@ -841,10 +849,10 @@ def gemm_xsa_bwd(
     x: torch.Tensor,
     v: torch.Tensor,
     head_dim: int,
-    coda_accumulator: bool = False,
+    use_quack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # the output projection's dgrad through xsa: dz = A @ B^T, B (N, K), then dxsa
-    dz = gemm(A=A, B=B.mT, coda_accumulator=coda_accumulator)
+    dz = gemm(A=A, B=B.mT, use_quack=use_quack)
     dx, dv = dxsa(grad=dz, x=x, v=v, head_dim=head_dim)
     return dx.to(dtype=x.dtype), dv.to(dtype=v.dtype)
 
@@ -903,10 +911,10 @@ def gemm_cross_entropy_fwd_bwd(
     target: torch.Tensor,
     ignore_index: int,
     return_zdz: bool = False,
-    coda_accumulator: bool = False,
+    use_quack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     # logits = A @ B, B (K, V); CODA forms zdz over its rounded dlogits, so a test checks it with those as dZ
-    logits = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
+    logits = gemm(A=A, B=B, use_quack=use_quack)
     return _fused_cross_entropy(logits=logits, target=target, ignore_index=ignore_index, return_zdz=return_zdz)
 
 
@@ -929,10 +937,10 @@ def gemm_rmsnorm_cross_entropy_fwd_bwd(
     target: torch.Tensor,
     ignore_index: int,
     return_zdz: bool = False,
-    coda_accumulator: bool = False,
+    use_quack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     # logits = (A @ B) rstd, the final norm's row scale deferred onto the accumulator
-    D = gemm(A=A, B=B, coda_accumulator=coda_accumulator)
+    D = gemm(A=A, B=B, use_quack=use_quack)
     rstd = rearrange(rstd, "m -> m 1")
     logits = D * rstd
     return _fused_cross_entropy(logits=logits, target=target, ignore_index=ignore_index, return_zdz=return_zdz)
@@ -957,10 +965,10 @@ def linear_cross_entropy(
     target: torch.Tensor,
     ignore_index: int = -100,
     reduction: str = "mean",
-    coda_accumulator: bool = False,
+    use_quack: bool = False,
 ) -> torch.Tensor:
     # weight (V, K) as nn.Linear holds it, target int64; its autograd is the backward's reference
-    logits = gemm(A=x, B=weight.mT, coda_accumulator=coda_accumulator)
+    logits = gemm(A=x, B=weight.mT, use_quack=use_quack)
     return torch.nn.functional.cross_entropy(
         input=logits,
         target=target,
