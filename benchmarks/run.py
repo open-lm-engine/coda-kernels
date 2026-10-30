@@ -9,13 +9,16 @@ import statistics
 from typing import NamedTuple
 from unittest import mock
 
-from benchmarks import arms as competitors
 from benchmarks import bench_utils
+from benchmarks.backends import cublas_ops
+from benchmarks.backends import fla_ops
+from benchmarks.backends import liger_ops
+from benchmarks.backends import quack_ops
 from tests import registry
 from tests.utils import compare
 from tests.utils import data
 from tests.utils import truth
-from tests.utils.forms import Case, Form
+from tests.utils.cases import Case, Implementation
 
 
 class Model(NamedTuple):
@@ -89,6 +92,13 @@ VOCAB_SIZES = (
     GPT_OSS_VOCAB_SIZE,
     QWEN3_5_VOCAB_SIZE,
 )
+# the libraries timed beside CODA and torch
+OTHER_LIBRARIES = (
+    cublas_ops,
+    quack_ops,
+    fla_ops,
+    liger_ops,
+)
 
 
 def parse_options() -> argparse.Namespace:
@@ -109,19 +119,19 @@ def parse_options() -> argparse.Namespace:
         "--rounds",
         type=int,
         default=21,
-        help="paired timing rounds",
+        help="interleaved timing rounds",
     )
     parser.add_argument(
         "--warmup",
         type=int,
         default=10,
-        help="untimed launches per version and round",
+        help="untimed launches per implementation and round",
     )
     parser.add_argument(
         "--repeats",
         type=int,
         default=30,
-        help="timed launches per version and round",
+        help="timed launches per implementation and round",
     )
     parser.add_argument(
         "--json",
@@ -226,7 +236,40 @@ def input_shapes(case: Case) -> tuple:
     # the shapes of an op's inputs: an op with no
     # token or vocab axis (an optimizer's weight) has the
     # same ones at every token count, and runs once
-    found = []
+    shapes = []
     for value in case.inputs.values():
-        found.append(str(getattr(value, "shape", value)))
-    return tuple(found)
+        shapes.append(str(getattr(value, "shape", value)))
+    return tuple(shapes)
+
+
+def compared_implementations(
+    op_name: str,
+    case: Case,
+) -> dict[str, Implementation]:
+    # every implementation compared: torch's (eager and
+    # both compile modes, in each pair layout), CODA's,
+    # and the other libraries' for this op
+    implementations = case.torch_implementations(modes=("eager", "default", "maa"))
+    implementations["coda"] = case.coda_implementation()
+    for library in OTHER_LIBRARIES:
+        if op_name in library.IMPLEMENTATIONS:
+            build = library.IMPLEMENTATIONS[op_name]
+            implementations.update(build(case=case))
+    return implementations
+
+
+def fastest_torch(
+    medians: dict[str, float],
+    families: dict[str, str],
+) -> str | None:
+    # the fastest torch implementation, which CODA's
+    # speedup is read against; None when none ran
+    labels = []
+    for label in medians:
+        if families.get(label) == "torch":
+            labels.append(label)
+
+    if len(labels) > 0:
+        return min(labels, key=medians.get)
+    else:
+        return None
