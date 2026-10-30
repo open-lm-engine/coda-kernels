@@ -3,10 +3,16 @@ import torch
 from typing import NamedTuple
 from einops import rearrange, reduce
 
-from coda.core.ops.rope_utils import expand_frequencies
+from coda.core.ops.rope_utils import make_rope_frequencies
 from tests import refs_ops
 
 NORM_EPS = 1e-5
+# fixed seeds, so every run sees the same inputs, one
+# per builder; builders whose draws meet in one case
+# take different seeds, so they never repeat values
+SEED_PROJECTION = 0
+SEED_FP8 = 1
+SEED_ROW_MULTIPLIERS = 2
 IGNORE_INDEX = -100
 # pretraining ignores about 1 label in 2048 and
 # SFT ignores whole prompts; 5% is in between
@@ -16,6 +22,15 @@ ROPE_BASE = 500000.0
 # roughly between 0.2 and 4
 NORM_WEIGHT_LOW = 0.2
 NORM_WEIGHT_HIGH = 4.0
+# a plain rstd draw, uniform over this range
+RSTD_LOW = 0.5
+RSTD_HIGH = 1.5
+# fp8 operands are N(0, FP8_STD) rounded to e4m3, so
+# about 5% land in its subnormals, where a kernel that
+# flushes them to zero shows; FP8_SCALE is not a power
+# of two, so a dropped or rounded scale shows too
+FP8_STD = 0.2
+FP8_SCALE = 0.91
 
 
 class Pairs(NamedTuple):
@@ -239,6 +254,127 @@ class Shape(NamedTuple):
             group=2 * self.ffn,
         )
 
+    def positions(self) -> torch.Tensor:
+        # rope positions of the tokens
+        return torch.arange(
+            self.position_offset,
+            self.position_offset + self.tokens,
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+    def inv_freq(self) -> torch.Tensor:
+        # rope's inverse frequency for each pair of
+        # a head, base^(-2j / head_dim) for pair j,
+        # in fp32 as Llama-3 computes it
+        exponents = torch.arange(
+            start=0,
+            end=self.head_dim,
+            step=2,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        exponents = exponents / self.head_dim
+        return 1.0 / (ROPE_BASE**exponents)
+
+    def rope(self) -> dict:
+        # what the rope ops take, under both of CODA's
+        # names (positions and frequencies in the
+        # forward ops, pos and freq in the backward
+        # ones), plus the widths and qk-norm's settings
+        size_q = self.heads * self.head_dim
+        size_k = self.kv_heads * self.head_dim
+        size_v = self.kv_heads * self.head_dim
+        # CODA's table has one entry per [q | k | v]
+        # column: q's and k's heads get each pair's
+        # frequency, and v's columns get 0, which
+        # leaves them unrotated
+        frequencies_qk = make_rope_frequencies(
+            inv_freq=self.inv_freq(),
+            num_heads=self.heads + self.kv_heads,
+        )
+        frequencies_v = torch.zeros(
+            size_v,
+            dtype=frequencies_qk.dtype,
+            device=frequencies_qk.device,
+        )
+        frequencies = torch.cat(
+            tensors=(frequencies_qk, frequencies_v),
+            dim=0,
+        )
+        positions = self.positions()
+        return {
+            "positions": positions,
+            "frequencies": frequencies,
+            "pos": positions,
+            "freq": frequencies,
+            "head_dim": self.head_dim,
+            "size_q": size_q,
+            "size_k": size_k,
+            "size_v": size_v,
+            "num_heads_q": self.heads,
+            "num_heads_k": self.kv_heads,
+            "eps": NORM_EPS,
+        }
+
+    def rmsnorm_linear(
+        self,
+        out_features: int,
+    ) -> dict:
+        # a linear layer on the activations: A is
+        # (tokens, dim), B the weight, (dim,
+        # out_features) in nn.Linear's k-major
+        # layout, and rstd an input norm's row scale
+        sampler = Sampler(seed=SEED_PROJECTION)
+        # nn.Linear's (out_features, dim) weight;
+        # B is its k-major transpose
+        weight = sampler.weight(
+            shape=(out_features, self.dim),
+            dtype=torch.bfloat16,
+        )
+        B = weight.mT
+        A = sampler.randn(
+            shape=(self.tokens, self.dim),
+            dtype=torch.bfloat16,
+        )
+        uniform = sampler.rand(size=self.tokens)
+        rstd = RSTD_LOW + (RSTD_HIGH - RSTD_LOW) * uniform
+        return {
+            "A": A,
+            "B": B,
+            "rstd": rstd,
+        }
+
+    def fp8(
+        self,
+        width: int,
+    ) -> dict:
+        # fp8 inputs for the GEMM, with CODA's single
+        # scale and torch's per-input scales
+        sampler = Sampler(seed=SEED_FP8)
+        A = FP8_STD * sampler.randn(
+            shape=(self.tokens, self.dim),
+            dtype=torch.float32,
+        )
+        weight = FP8_STD * sampler.randn(
+            shape=(width, self.dim),
+            dtype=torch.float32,
+        )
+        scale = torch.full(
+            (),
+            FP8_SCALE,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        fp8_weight = weight.to(dtype=torch.float8_e4m3fn)
+        return {
+            "A": A.to(dtype=torch.float8_e4m3fn),
+            "B": fp8_weight.mT,
+            "scale": scale,
+            "scale_a": scale,
+            "scale_b": torch.ones_like(scale),
+        }
+
 
 class Model(NamedTuple):
     # one Llama-3 model size
@@ -247,6 +383,27 @@ class Model(NamedTuple):
     heads: int
     kv_heads: int
     head_dim: int
+
+    def shape(
+        self,
+        tokens: int,
+        vocab_size: int,
+        kv_heads: int,
+    ) -> Shape:
+        # this model at a token count, with plain
+        # inputs at a typical layer's statistics
+        return Shape(
+            tokens=tokens,
+            dim=self.dim,
+            ffn=self.ffn,
+            heads=self.heads,
+            kv_heads=kv_heads,
+            head_dim=self.head_dim,
+            vocab_size=vocab_size,
+            position_offset=0,
+            distribution="random",
+            statistics=TYPICAL,
+        )
 
 
 LLAMA3 = {
@@ -277,7 +434,7 @@ VOCABS = (65536, 128256, 262144)
 # small shapes; tokens odd, so the last row tile
 # is partial, and together they cover each
 # statistic's real range
-TEST_SHAPES = {
+SHAPES = {
     # GQA with head_dim 64, a vocab that is not
     # a multiple of 128, and a middle layer
     "gqa64": Shape(
@@ -367,39 +524,3 @@ TEST_SHAPES = {
         statistics=TYPICAL,
     ),
 }
-
-
-def bench_shapes(
-    models: tuple[str, ...],
-    vocabs: tuple[int, ...],
-    mha: bool = False,
-) -> list[tuple[str, Shape]]:
-    # every model at every token count and vocab
-    # size, with its 8 kv heads, or with mha=True
-    # as many as q heads (the qk-norm ops need it)
-    found = []
-    for name, model in LLAMA3.items():
-        if mha:
-            kv_heads = model.heads
-            attention = "mha"
-        else:
-            kv_heads = model.kv_heads
-            attention = f"gqa{model.kv_heads}"
-
-        for tokens in TOKENS:
-            for vocab in vocabs:
-                if name in models:
-                    shape = Shape(
-                        tokens=tokens,
-                        dim=model.dim,
-                        ffn=model.ffn,
-                        heads=model.heads,
-                        kv_heads=kv_heads,
-                        head_dim=model.head_dim,
-                        vocab_size=vocab,
-                        position_offset=0,
-                        distribution="random",
-                        statistics=TYPICAL,
-                    )
-                    found.append((f"llama3 {name} {attention} M={tokens} V={vocab}", shape))
-    return found
