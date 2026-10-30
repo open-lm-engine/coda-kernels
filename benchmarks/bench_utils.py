@@ -1,5 +1,5 @@
-import time
-import triton
+import statistics
+from collections import defaultdict
 from triton import runtime
 from triton.testing import _summarize_statistics
 
@@ -42,25 +42,36 @@ def do_bench_count(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, re
     return _summarize_statistics(times, quantiles, return_mode)
 
 
-def do_bench_dict(fn_dict: dict, warmup: int, repeats: int) -> dict:
-    results = {}
-    for name, fn in fn_dict.items():
-        if fn is None:
-            results[f"{name}/time"] = None
-            results[f"{name}/count"] = None
-            continue
-        time.sleep(0.5)
-        results[f"{name}/time"] = triton.testing.do_bench(
-            fn,
-            warmup=warmup,
-            rep=repeats,
-        )
-        time.sleep(0.5)
-        results[f"{name}/count"] = do_bench_count(
-            fn,
-            warmup=warmup,
-            rep=repeats,
-        )
+def do_bench_interleaved(
+    fn_dict: dict,
+    passes: int,
+    warmup: int,
+    repeats: int,
+) -> dict[str, float]:
+    # each function's median time in ms, over passes that
+    # vary the order, as clocks follow the previous load
+    names = list(fn_dict)
+    # passes cycle through every rotation of the names,
+    # forward then reversed (ABC, CBA, BCA, ACB, ...)
+    orders = []
+    for shift in range(len(names)):
+        rotated = names[shift:] + names[:shift]
+        orders.append(rotated)
+        orders.append(rotated[::-1])
 
-    time.sleep(0.5)
-    return results
+    times = defaultdict(list)
+    for pass_index in range(passes):
+        order = orders[pass_index % len(orders)]
+        for name in order:
+            median_ms = do_bench_count(
+                fn=fn_dict[name],
+                warmup=warmup,
+                rep=repeats,
+                return_mode="median",
+            )
+            times[name].append(median_ms)
+
+    medians = {}
+    for name, values in times.items():
+        medians[name] = statistics.median(values)
+    return medians
