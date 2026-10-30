@@ -181,14 +181,19 @@ TYPICAL = Statistics(
 
 
 class Shape(NamedTuple):
-    # M tokens through a model of these sizes
-    M: int
+    # tokens through a model of these sizes
+    tokens: int
     dim: int
     ffn: int
     heads: int
     kv_heads: int
     head_dim: int
     vocab_size: int
+    # rope loses precision at large positions,
+    # where fp32 angles lose digits; this checks
+    # that without a long sequence: the tokens
+    # take the positions from position_offset up
+    position_offset: int
     # the kind of inputs: "random" (plain),
     # "diffuse" (an LM head at initialization),
     # or a hard case: "outlier" (a few huge
@@ -269,21 +274,21 @@ LLAMA3 = {
 }
 TOKENS = (2048, 8192, 32768)
 VOCABS = (65536, 128256, 262144)
-# small shapes; M is odd so the last row tile
+# small shapes; tokens odd, so the last row tile
 # is partial, and together they cover each
 # statistic's real range
 TEST_SHAPES = {
     # GQA with head_dim 64, a vocab that is not
     # a multiple of 128, and a middle layer
     "gqa64": Shape(
-        M=1025,
+        tokens=1025,
         dim=512,
         ffn=1152,
         heads=8,
         kv_heads=2,
         head_dim=64,
         vocab_size=1000,
-        offset=0,
+        position_offset=0,
         distribution="random",
         statistics=Statistics(
             rstd=5.0,
@@ -296,14 +301,14 @@ TEST_SHAPES = {
     # position 2^20 (where fp32 angles lose
     # precision), and a last layer
     "mha128-far": Shape(
-        M=777,
+        tokens=777,
         dim=1024,
         ffn=1408,
         heads=8,
         kv_heads=8,
         head_dim=128,
         vocab_size=4104,
-        offset=2**20,
+        position_offset=2**20,
         distribution="diffuse",
         statistics=Statistics(
             rstd=0.05,
@@ -313,14 +318,14 @@ TEST_SHAPES = {
         ),
     ),
     "mha128-outlier": Shape(
-        M=1031,
+        tokens=1031,
         dim=1024,
         ffn=1408,
         heads=8,
         kv_heads=8,
         head_dim=128,
         vocab_size=4104,
-        offset=0,
+        position_offset=0,
         distribution="outlier",
         statistics=Statistics(
             rstd=0.5,
@@ -333,14 +338,14 @@ TEST_SHAPES = {
     # eps is 2.4% of the mean square, and the
     # residual still small, 0.15 (Qwen3's)
     "mha128-floor": Shape(
-        M=1027,
+        tokens=1027,
         dim=1024,
         ffn=1408,
         heads=8,
         kv_heads=8,
         head_dim=128,
         vocab_size=4104,
-        offset=0,
+        position_offset=0,
         distribution="floor",
         statistics=Statistics(
             rstd=35.0,
@@ -350,14 +355,14 @@ TEST_SHAPES = {
         ),
     ),
     "mha128-stress": Shape(
-        M=1029,
+        tokens=1029,
         dim=1024,
         ffn=1408,
         heads=8,
         kv_heads=8,
         head_dim=128,
         vocab_size=4104,
-        offset=0,
+        position_offset=0,
         distribution="stress",
         statistics=TYPICAL,
     ),
@@ -381,20 +386,20 @@ def bench_shapes(
             kv_heads = model.kv_heads
             attention = f"gqa{model.kv_heads}"
 
-        for M in TOKENS:
+        for tokens in TOKENS:
             for vocab in vocabs:
                 if name in models:
                     shape = Shape(
-                        M=M,
+                        tokens=tokens,
                         dim=model.dim,
                         ffn=model.ffn,
                         heads=model.heads,
                         kv_heads=kv_heads,
                         head_dim=model.head_dim,
                         vocab_size=vocab,
-                        offset=0,
+                        position_offset=0,
                         distribution="random",
                         statistics=TYPICAL,
                     )
-                    found.append((f"llama3 {name} {attention} M={M} V={vocab}", shape))
+                    found.append((f"llama3 {name} {attention} M={tokens} V={vocab}", shape))
     return found
