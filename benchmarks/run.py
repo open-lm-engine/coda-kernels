@@ -3,17 +3,19 @@ import json
 import math
 import torch
 import argparse
+import itertools
 import operator
 import statistics
 from typing import NamedTuple
+from unittest import mock
 
 from benchmarks import arms as competitors
 from benchmarks import bench_utils
 from tests import registry
-from tests.core import compare
-from tests.core import data
-from tests.core import truth
-from tests.core.forms import Entry, Form
+from tests.utils import compare
+from tests.utils import data
+from tests.utils import truth
+from tests.utils.forms import Entry, Form
 
 
 class Model(NamedTuple):
@@ -135,3 +137,40 @@ def parse_options() -> argparse.Namespace:
         options.models = list(LLAMA3)
 
     return options
+
+
+def configure_torch() -> None:
+    # one inductor cache per campaign: the directory alone
+    # moved identical code by 2.9%
+    assert "TORCHINDUCTOR_CACHE_DIR" in os.environ, "set TORCHINDUCTOR_CACHE_DIR"
+    # fp32 matmuls stay fp32
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    # never run eager in place of a compile: past dynamo's
+    # recompile limit a compile without fullgraph falls
+    # back to eager with only a warning, and with
+    # suppress_errors a failed compile does too; raise
+    torch._dynamo.config.recompile_limit = 64
+    torch._dynamo.config.fail_on_recompile_limit_hit = True
+    torch._dynamo.config.suppress_errors = False
+
+
+def entry_vocab_sizes(entry_name: str) -> tuple[int, ...]:
+    # every vocab size for an entry that reads the vocab,
+    # and Llama-3's own for the rest
+    if entry_name in registry.VOCAB_READERS:
+        return VOCAB_SIZES
+    else:
+        return (LLAMA3_VOCAB_SIZE,)
+
+
+def entry_kv_heads(
+    entry_name: str,
+    model: Model,
+) -> int:
+    # the model's own k and v heads, or as many as q heads
+    # for the entries whose kernels take no fewer (qk-norm's)
+    if entry_name in registry.MHA:
+        return model.heads
+    else:
+        return model.kv_heads
