@@ -8,28 +8,30 @@ from tests import refs_ops
 
 NORM_EPS = 1e-5
 IGNORE_INDEX = -100
-# pretraining ignores ~1 in 2048,
-# SFT whole prompts
+# pretraining ignores about 1 label in 2048 and
+# SFT ignores whole prompts; 5% is in between
 IGNORED_FRACTION = 0.05
 ROPE_BASE = 500000.0
-# trained Llama-3 and Qwen3 norm
-# weights span about 0.2 to 4
+# trained Llama-3 and Qwen3 norm weights fall
+# roughly between 0.2 and 4
 NORM_WEIGHT_LOW = 0.2
 NORM_WEIGHT_HIGH = 4.0
 
 
 class Pairs(NamedTuple):
-    # where a tensor's rope or swiglu pairs sit
-    # along dim
+    # where a tensor's rope or swiglu pairs sit, to
+    # convert between CODA's and a model's layouts;
+    # dim is the axis holding them
     dim: int
-    # the unit whose halves pair up: a head,
-    # or all of [gate | up]
+    # the unit whose two halves form the pairs:
+    # one head, or all of [gate | up]
     group: int
 
 
 class QKVPairs(NamedTuple):
-    # a [q | k | v]'s columns: q's and k's
-    # heads paired, v's columns as they are
+    # the pairs of a [q | k | v] tensor along dim:
+    # q's and k's heads hold pairs, v is left as it is
+    dim: int
     head_dim: int
     size_q: int
     size_k: int
@@ -61,8 +63,8 @@ class Sampler(object):
         shape: tuple[int, int],
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        # an (out, in) weight at a model's init
-        # scale, 1 / sqrt(in)
+        # a random (out, in) weight at the usual
+        # init scale, 1 / sqrt(in)
         values = self.randn(
             shape=shape,
             dtype=torch.float32,
@@ -74,7 +76,7 @@ class Sampler(object):
         self,
         size: int,
     ) -> torch.Tensor:
-        # fp32 in [0, 1)
+        # uniform in [0, 1)
         return torch.rand(
             size,
             generator=self.generator,
@@ -88,7 +90,7 @@ class Sampler(object):
         low: float,
         high: float,
     ) -> torch.Tensor:
-        # fp32 log-uniform over [low, high)
+        # log-uniform in [low, high)
         uniform = self.rand(size=size)
         exponent = math.log(low) + uniform * math.log(high / low)
         return torch.exp(exponent)
@@ -98,8 +100,8 @@ class Sampler(object):
         size: int,
         ratio: float,
     ) -> torch.Tensor:
-        # fp32 random factors around 1, log-uniform
-        # over [1 / sqrt(ratio), sqrt(ratio))
+        # random factors near 1; the largest is at
+        # most ratio times the smallest
         return self.log_uniform(
             size=size,
             low=ratio**-0.5,
@@ -111,8 +113,8 @@ class Sampler(object):
         size: int,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        # a norm's weight, log-uniform over
-        # [NORM_WEIGHT_LOW, NORM_WEIGHT_HIGH)
+        # a norm weight in the range trained
+        # models use
         values = self.log_uniform(
             size=size,
             low=NORM_WEIGHT_LOW,
@@ -125,8 +127,7 @@ class Sampler(object):
         shape: tuple[int, ...],
         vocab_size: int,
     ) -> torch.Tensor:
-        # int64 token ids, uniform
-        # over [0, vocab_size)
+        # random token ids in [0, vocab_size)
         return torch.randint(
             vocab_size,
             shape,
@@ -140,8 +141,8 @@ class Sampler(object):
         size: int,
         vocab_size: int,
     ) -> torch.Tensor:
-        # int64 labels in [0, vocab_size), IGNORED_FRACTION
-        # of them ignored, so that a mean divides by the rest
+        # random labels, with IGNORED_FRACTION of
+        # them set to IGNORE_INDEX
         values = self.tokens(
             shape=(size,),
             vocab_size=vocab_size,
@@ -154,18 +155,33 @@ class Sampler(object):
 
 
 class Statistics(NamedTuple):
-    # a case's input statistics, within the
-    # ranges measured over Llama-3.2-1B's and
-    # Qwen3-0.6B's layers on wikitext
-    # the input norm's rstd: 0.05 to 50
+    # how large the inputs are; each range was
+    # measured on Llama-3.2-1B and Qwen3-0.6B
+
+    # rstd of the input norm, 0.05 to 50
     rstd: float
-    # the final norm's rstd: 0.04 to 3
+    # rstd of the final norm, 0.04 to 3
     final_rstd: float
-    # a qk-norm head's mean square: 0.02 to 350
+    # mean square of a q or k head before
+    # qk-norm, 0.02 to 350
     head_mean_sq: float
+    # the scale of the residual C in A @ B + C,
+    # relative to A @ B: 0.15 to 10 in real
+    # models
+    residual_scale: float
+
+
+# a typical middle layer
+TYPICAL = Statistics(
+    rstd=2.6,
+    final_rstd=1.7,
+    head_mean_sq=3.6,
+    residual_scale=1.0,
+)
 
 
 class Shape(NamedTuple):
+    # M tokens through a model of these sizes
     M: int
     dim: int
     ffn: int
@@ -173,32 +189,35 @@ class Shape(NamedTuple):
     kv_heads: int
     head_dim: int
     vocab_size: int
-
-    # the inputs' distribution: "random";
-    # "outlier" (one feature many times the
-    # rest, gradients along the outputs);
-    # "floor" (norm inputs near eps,
-    # confident CE rows); "stress" (blocks:
-    # 50x every token)
+    # the kind of inputs: "random" (plain),
+    # "diffuse" (an LM head at initialization),
+    # or a hard case: "outlier" (a few huge
+    # features, gradients aligned with outputs),
+    # "floor" (values near eps, confident
+    # predictions) or "stress" (extreme values,
+    # blocks only)
     distribution: str
-    # where its statistics sit, typical
-    # ones by default
+    # how large the inputs are
     statistics: Statistics
 
     def per_head(
         self,
         dim: int,
     ) -> Pairs:
-        # each head's pairs along dim: q | k
-        # columns, or weight or gamma rows
+        # pairs inside each head, along dim
         return Pairs(
             dim=dim,
             group=self.head_dim,
         )
 
-    def qk_heads(self) -> QKVPairs:
-        # q's and k's heads paired in [q | k | v]
+    def qk_heads(
+        self,
+        dim: int,
+    ) -> QKVPairs:
+        # pairs inside q's and k's heads along dim;
+        # v has none
         return QKVPairs(
+            dim=dim,
             head_dim=self.head_dim,
             size_q=self.heads * self.head_dim,
             size_k=self.kv_heads * self.head_dim,
@@ -209,17 +228,15 @@ class Shape(NamedTuple):
         self,
         dim: int,
     ) -> Pairs:
-        # [gate | up] halves along dim, as
-        # a model packing w1 | w3 holds them
+        # gate and up halves, along dim
         return Pairs(
             dim=dim,
             group=2 * self.ffn,
         )
 
 
-
 class Model(NamedTuple):
-    # a Llama-3 size
+    # one Llama-3 model size
     dim: int
     ffn: int
     heads: int
@@ -252,14 +269,12 @@ LLAMA3 = {
 }
 TOKENS = (2048, 8192, 32768)
 VOCABS = (65536, 128256, 262144)
-# small test shapes, every M odd so it
-# overhangs every row tile; together
-# their statistics span the real ranges,
-# no norm's rstd near 1
+# small shapes; M is odd so the last row tile
+# is partial, and together they cover each
+# statistic's real range
 TEST_SHAPES = {
-    # GQA at head_dim 64; M one row past a
-    # 1024-row tile; vocab a multiple of 8,
-    # not of 128; a middle layer
+    # GQA with head_dim 64, a vocab that is not
+    # a multiple of 128, and a middle layer
     "gqa64": Shape(
         M=1025,
         dim=512,
@@ -274,13 +289,12 @@ TEST_SHAPES = {
             rstd=5.0,
             final_rstd=3.0,
             head_mean_sq=3.6,
-            branch_to_residual=1.0,
+            residual_scale=1.0,
         ),
     ),
-    # MHA at head_dim 128; ffn 1408, half a
-    # 256-wide tile over; rope from 2^20,
-    # where a model's fp32 angle moves bf16
-    # outputs across ties; a last layer
+    # ffn not a multiple of 256, rope from
+    # position 2^20 (where fp32 angles lose
+    # precision), and a last layer
     "mha128-far": Shape(
         M=777,
         dim=1024,
@@ -290,12 +304,12 @@ TEST_SHAPES = {
         head_dim=128,
         vocab_size=4104,
         offset=2**20,
-        distribution="random",
+        distribution="diffuse",
         statistics=Statistics(
             rstd=0.05,
             final_rstd=0.04,
             head_mean_sq=0.03,
-            branch_to_residual=1.0,
+            residual_scale=1.0,
         ),
     ),
     "mha128-outlier": Shape(
@@ -312,9 +326,12 @@ TEST_SHAPES = {
             rstd=0.5,
             final_rstd=0.3,
             head_mean_sq=100.0,
-            branch_to_residual=1.0,
+            residual_scale=1.0,
         ),
     ),
+    # a first layer: activations so small that
+    # eps is 2.4% of the mean square, and the
+    # residual still small, 0.15 (Qwen3's)
     "mha128-floor": Shape(
         M=1027,
         dim=1024,
@@ -329,7 +346,7 @@ TEST_SHAPES = {
             rstd=35.0,
             final_rstd=0.12,
             head_mean_sq=1.0,
-            branch_to_residual=7.0,
+            residual_scale=0.15,
         ),
     ),
     "mha128-stress": Shape(
@@ -342,6 +359,42 @@ TEST_SHAPES = {
         vocab_size=4104,
         offset=0,
         distribution="stress",
+        statistics=TYPICAL,
     ),
 }
 
+
+def bench_shapes(
+    models: tuple[str, ...],
+    vocabs: tuple[int, ...],
+    mha: bool = False,
+) -> list[tuple[str, Shape]]:
+    # every model at every token count and vocab
+    # size, with its 8 kv heads, or with mha=True
+    # as many as q heads (the qk-norm ops need it)
+    found = []
+    for name, model in LLAMA3.items():
+        if mha:
+            kv_heads = model.heads
+            attention = "mha"
+        else:
+            kv_heads = model.kv_heads
+            attention = f"gqa{model.kv_heads}"
+
+        for M in TOKENS:
+            for vocab in vocabs:
+                if name in models:
+                    shape = Shape(
+                        M=M,
+                        dim=model.dim,
+                        ffn=model.ffn,
+                        heads=model.heads,
+                        kv_heads=kv_heads,
+                        head_dim=model.head_dim,
+                        vocab_size=vocab,
+                        offset=0,
+                        distribution="random",
+                        statistics=TYPICAL,
+                    )
+                    found.append((f"llama3 {name} {attention} M={M} V={vocab}", shape))
+    return found
