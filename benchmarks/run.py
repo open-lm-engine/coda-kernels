@@ -5,7 +5,6 @@ import torch
 import argparse
 import itertools
 import operator
-import statistics
 from typing import NamedTuple
 from unittest import mock
 
