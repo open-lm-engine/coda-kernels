@@ -1,4 +1,3 @@
-import math
 import torch
 from einops import rearrange, reduce
 from coda.core.gemm import functional as gemm_functional
@@ -16,9 +15,6 @@ def gemm_rmsnorm(
     seed: int,
     dtype: torch.dtype,
 ) -> Case:
-    # a projection with the rmsnorm before it folded in: each row's norm
-    # scale, rstd, multiplies the GEMM's output instead of its input,
-    # which gives the same result
     sampler = Sampler(seed=seed)
     samples = operands.linear_operands(
         shape=shape,
@@ -79,11 +75,8 @@ def gemm_residual_partial_rmsnorm(
     seed: int,
     dtype: torch.dtype,
 ) -> Case:
-    # the MLP's down projection added onto the residual stream; returns
-    # the sum, the sum times the next rmsnorm's weight, and each row's
-    # rstd, which the next GEMM applies
     sampler = Sampler(seed=seed)
-    down = sampler.weight(
+    weight = sampler.weight(
         shape=(shape.dim, shape.ffn),
         dtype=dtype,
     )
@@ -95,19 +88,19 @@ def gemm_residual_partial_rmsnorm(
         shape=(shape.tokens, shape.dim),
         dtype=torch.float32,
     )
-    weight = sampler.norm_weight(
+    gamma = sampler.norm_weight(
         size=shape.dim,
         dtype=dtype,
     )
-    # size the residual against A @ B, whose values are about 1
+    # scale the residual against A @ B
     residual_scaled = residual * shape.statistics.residual_scale
     C = residual_scaled.to(dtype=dtype)
-    B = down.mT
+    B = weight.mT
     inputs = {
         "A": A,
         "B": B,
         "C": C,
-        "weight": weight,
+        "weight": gamma,
         "eps": data.NORM_EPS,
     }
     oracle_impl = Implementation(
@@ -148,11 +141,8 @@ def gemm_residual_partial_rmsnorm_bwd(
     seed: int,
     dtype: torch.dtype,
 ) -> Case:
-    # backward pass from the MLP's gate_up projection into the rmsnorm
-    # before it: the norm's input and weight gradients, plus the normed
-    # input recomputed for gate_up's own weight gradient
     sampler = Sampler(seed=seed)
-    gate_up = sampler.weight(
+    weight = sampler.weight(
         shape=(2 * shape.ffn, shape.dim),
         dtype=dtype,
     )
@@ -164,11 +154,10 @@ def gemm_residual_partial_rmsnorm_bwd(
         shape=(shape.tokens, shape.dim),
         dtype=dtype,
     )
-    weight = sampler.norm_weight(
+    gamma = sampler.norm_weight(
         size=shape.dim,
         dtype=dtype,
     )
-    # TODO: check why fp32
     pre_fp32 = pre.to(dtype=torch.float32)
     rstd = torch_ops.rmsnorm_rstd(
         x=pre_fp32,
@@ -178,26 +167,27 @@ def gemm_residual_partial_rmsnorm_bwd(
     # the other inputs, so derive it from them rather than draw it
     dnormed = torch.mm(
         input=A,
-        mat2=gate_up,
+        mat2=weight,
         out_dtype=torch.float32,
     )
     rstd_column = rearrange(
         tensor=rstd,
         pattern="m -> m 1",
     )
-    # each element of dnormed times the norm's output, pre * rstd * weight
-    ZdZ_terms = dnormed * pre_fp32 * rstd_column * weight
+    # each element of dnormed times the norm's output,
+    # pre * rstd * gamma
+    ZdZ_terms = dnormed * pre_fp32 * rstd_column * gamma
     ZdZ = reduce(
         tensor=ZdZ_terms,
         pattern="m n -> m",
         reduction="mean",
     )
-    # B is the gate_up weight transposed, as the forward GEMM reads it
-    B = gate_up.mT
+    # B is the projection's weight transposed, as the forward GEMM reads it
+    B = weight.mT
     inputs = {
         "A": A,
         "B": B,
-        "weight": weight,
+        "weight": gamma,
         "pre": pre,
         "ZdZ": ZdZ,
         "rstd": rstd,
@@ -243,8 +233,6 @@ def gemm_swiglu(
     seed: int,
     dtype: torch.dtype,
 ) -> Case:
-    # the MLP's gate_up projection followed by SwiGLU, silu(gate) * up;
-    # returns the values before and after SwiGLU
     sampler = Sampler(seed=seed)
     samples = operands.linear_operands(
         shape=shape,
@@ -261,7 +249,7 @@ def gemm_swiglu(
         tensor=weight,
         pattern="(pair two) k -> (two pair) k",
         two=2,
-    )
+    ).contiguous()
     split_B = split_weight.mT
     interleaved = {
         "A": A,
@@ -307,19 +295,19 @@ def gemm_swiglu(
                 fn=gemm_functional.gemm_swiglu,
                 inputs=coda_inputs,
             ),
-            "torch interleaved": Implementation(
+            "torch/interleaved": Implementation(
                 fn=torch_ops.gemm_swiglu,
                 inputs=interleaved,
             ),
-            "torch split": Implementation(
+            "torch/split": Implementation(
                 fn=torch_ops.gemm_swiglu,
                 inputs=split,
             ),
         },
         oracles={
             "coda": interleaved_oracle_impl,
-            "torch interleaved": interleaved_oracle_impl,
-            "torch split": split_oracle_impl,
+            "torch/interleaved": interleaved_oracle_impl,
+            "torch/split": split_oracle_impl,
         },
         outputs=("preact", "postact"),
     )
@@ -330,8 +318,6 @@ def gemm_rmsnorm_swiglu(
     seed: int,
     dtype: torch.dtype,
 ) -> Case:
-    # gemm_swiglu with the rmsnorm before the MLP folded in: each row's
-    # rstd scales the GEMM's output instead of its input
     sampler = Sampler(seed=seed)
     samples = operands.linear_operands(
         shape=shape,
@@ -355,7 +341,7 @@ def gemm_rmsnorm_swiglu(
         tensor=weight,
         pattern="(pair two) k -> (two pair) k",
         two=2,
-    )
+    ).contiguous()
     split_B = split_weight.mT
     interleaved = {
         "A": A,
@@ -406,19 +392,19 @@ def gemm_rmsnorm_swiglu(
                 fn=gemm_functional.gemm_rmsnorm_swiglu,
                 inputs=coda_inputs,
             ),
-            "torch interleaved": Implementation(
+            "torch/interleaved": Implementation(
                 fn=torch_ops.gemm_rmsnorm_swiglu,
                 inputs=interleaved,
             ),
-            "torch split": Implementation(
+            "torch/split": Implementation(
                 fn=torch_ops.gemm_rmsnorm_swiglu,
                 inputs=split,
             ),
         },
         oracles={
             "coda": interleaved_oracle_impl,
-            "torch interleaved": interleaved_oracle_impl,
-            "torch split": split_oracle_impl,
+            "torch/interleaved": interleaved_oracle_impl,
+            "torch/split": split_oracle_impl,
         },
         outputs=("preact", "postact"),
     )
@@ -429,9 +415,6 @@ def gemm_swiglu_bwd_zdz(
     seed: int,
     dtype: torch.dtype,
 ) -> Case:
-    # backward pass from the MLP's down projection through SwiGLU, at its
-    # saved input Z; returns Z's gradient, the per-row ZdZ that the
-    # rmsnorm backward needs, and SwiGLU's output again
     sampler = Sampler(seed=seed)
     down = sampler.weight(
         shape=(shape.dim, shape.ffn),
@@ -454,7 +437,7 @@ def gemm_swiglu_bwd_zdz(
         tensor=Z,
         pattern="m (pair two) -> m (two pair)",
         two=2,
-    )
+    ).contiguous()
     interleaved = {
         "A": A,
         "B": B,
@@ -507,19 +490,19 @@ def gemm_swiglu_bwd_zdz(
                 fn=gemm_functional.gemm_swiglu_bwd_zdz,
                 inputs=coda_inputs,
             ),
-            "torch interleaved": Implementation(
+            "torch/interleaved": Implementation(
                 fn=torch_ops.gemm_swiglu_bwd_zdz,
                 inputs=interleaved,
             ),
-            "torch split": Implementation(
+            "torch/split": Implementation(
                 fn=torch_ops.gemm_swiglu_bwd_zdz,
                 inputs=split,
             ),
         },
         oracles={
             "coda": interleaved_oracle_impl,
-            "torch interleaved": interleaved_oracle_impl,
-            "torch split": split_oracle_impl,
+            "torch/interleaved": interleaved_oracle_impl,
+            "torch/split": split_oracle_impl,
         },
         outputs=("dZ", "ZdZ", "out"),
     )
