@@ -11,3 +11,525 @@ from benchmarks.utils.cases import Case, Implementation, make_oracle_fn
 from benchmarks.utils.data import Sampler, Shape
 
 
+def gemm_rmsnorm(
+    shape: Shape,
+    seed: int,
+    dtype: torch.dtype,
+) -> Case:
+    # a projection with the rmsnorm before it folded in: each row's norm
+    # scale, rstd, multiplies the GEMM's output instead of its input,
+    # which gives the same result
+    sampler = Sampler(seed=seed)
+    samples = operands.linear_operands(
+        shape=shape,
+        out_features=shape.dim,
+        sampler=sampler,
+        dtype=dtype,
+    )
+    # rescale A to the size a real norm input has, and compute its rstd
+    norm = operands.rmsnorm_operands(
+        shape=shape,
+        x=samples["A"],
+        rstd_nominal=shape.statistics.rstd,
+        sampler=sampler,
+        dtype=dtype,
+    )
+    A = norm["A"]
+    B = samples["B"]
+    rstd = norm["rstd"]
+    inputs = {
+        "A": A,
+        "B": B,
+        "rstd": rstd,
+    }
+    oracle_impl = Implementation(
+        fn=make_oracle_fn(
+            fn=torch_ops.gemm_rmsnorm,
+            in_dims={
+                "A": 0,
+                "B": None,
+                "rstd": 0,
+            },
+            out_dims=(0,),
+            reduce_dims=(None,),
+        ),
+        inputs=inputs,
+    )
+    return Case(
+        implementations={
+            "coda": Implementation(
+                fn=gemm_functional.gemm_rmsnorm,
+                inputs=inputs,
+            ),
+            "torch": Implementation(
+                fn=torch_ops.gemm_rmsnorm,
+                inputs=inputs,
+            ),
+        },
+        oracles={
+            "coda": oracle_impl,
+            "torch": oracle_impl,
+        },
+        outputs=("out",),
+    )
+
+
+def gemm_residual_partial_rmsnorm(
+    shape: Shape,
+    seed: int,
+    dtype: torch.dtype,
+) -> Case:
+    # the MLP's down projection added onto the residual stream; returns
+    # the sum, the sum times the next rmsnorm's weight, and each row's
+    # rstd, which the next GEMM applies
+    sampler = Sampler(seed=seed)
+    down = sampler.weight(
+        shape=(shape.dim, shape.ffn),
+        dtype=dtype,
+    )
+    A = sampler.randn(
+        shape=(shape.tokens, shape.ffn),
+        dtype=dtype,
+    )
+    residual = sampler.randn(
+        shape=(shape.tokens, shape.dim),
+        dtype=torch.float32,
+    )
+    weight = sampler.norm_weight(
+        size=shape.dim,
+        dtype=dtype,
+    )
+    # size the residual against A @ B, whose values are about 1
+    residual_scaled = residual * shape.statistics.residual_scale
+    C = residual_scaled.to(dtype=dtype)
+    B = down.mT
+    inputs = {
+        "A": A,
+        "B": B,
+        "C": C,
+        "weight": weight,
+        "eps": data.NORM_EPS,
+    }
+    oracle_impl = Implementation(
+        fn=make_oracle_fn(
+            fn=torch_ops.gemm_residual_partial_rmsnorm,
+            in_dims={
+                "A": 0,
+                "B": None,
+                "C": 0,
+                "weight": None,
+            },
+            out_dims=(0, 0, 0),
+            reduce_dims=(None, None, None),
+        ),
+        inputs=inputs,
+    )
+    return Case(
+        implementations={
+            "coda": Implementation(
+                fn=gemm_functional.gemm_residual_partial_rmsnorm,
+                inputs=inputs,
+            ),
+            "torch": Implementation(
+                fn=torch_ops.gemm_residual_partial_rmsnorm,
+                inputs=inputs,
+            ),
+        },
+        oracles={
+            "coda": oracle_impl,
+            "torch": oracle_impl,
+        },
+        outputs=("pre", "post", "rstd"),
+    )
+
+
+def gemm_residual_partial_rmsnorm_bwd(
+    shape: Shape,
+    seed: int,
+    dtype: torch.dtype,
+) -> Case:
+    # backward pass from the MLP's gate_up projection into the rmsnorm
+    # before it: the norm's input and weight gradients, plus the normed
+    # input recomputed for gate_up's own weight gradient
+    sampler = Sampler(seed=seed)
+    gate_up = sampler.weight(
+        shape=(2 * shape.ffn, shape.dim),
+        dtype=dtype,
+    )
+    A = sampler.randn(
+        shape=(shape.tokens, 2 * shape.ffn),
+        dtype=dtype,
+    )
+    pre = sampler.randn(
+        shape=(shape.tokens, shape.dim),
+        dtype=dtype,
+    )
+    weight = sampler.norm_weight(
+        size=shape.dim,
+        dtype=dtype,
+    )
+    # TODO: check why fp32
+    pre_fp32 = pre.to(dtype=torch.float32)
+    rstd = torch_ops.rmsnorm_rstd(
+        x=pre_fp32,
+        eps=data.NORM_EPS,
+    )
+    # ZdZ, a per-row mean the rmsnorm backward needs, must agree with
+    # the other inputs, so derive it from them rather than draw it
+    dnormed = torch.mm(
+        input=A,
+        mat2=gate_up,
+        out_dtype=torch.float32,
+    )
+    rstd_column = rearrange(
+        tensor=rstd,
+        pattern="m -> m 1",
+    )
+    # each element of dnormed times the norm's output, pre * rstd * weight
+    ZdZ_terms = dnormed * pre_fp32 * rstd_column * weight
+    ZdZ = reduce(
+        tensor=ZdZ_terms,
+        pattern="m n -> m",
+        reduction="mean",
+    )
+    # B is the gate_up weight transposed, as the forward GEMM reads it
+    B = gate_up.mT
+    inputs = {
+        "A": A,
+        "B": B,
+        "weight": weight,
+        "pre": pre,
+        "ZdZ": ZdZ,
+        "rstd": rstd,
+    }
+    outputs = ("dpre", "dW", "post")
+    oracle_impl = Implementation(
+        fn=make_oracle_fn(
+            fn=torch_ops.gemm_residual_partial_rmsnorm_bwd,
+            in_dims={
+                "A": 0,
+                "B": None,
+                "weight": None,
+                "pre": 0,
+                "ZdZ": 0,
+                "rstd": 0,
+            },
+            out_dims=(0, 0, 0),
+            reduce_dims=(None, 0, None),
+        ),
+        inputs=inputs,
+    )
+    return Case(
+        implementations={
+            "coda": Implementation(
+                fn=gemm_functional.gemm_residual_partial_rmsnorm_bwd,
+                inputs=inputs,
+            ),
+            "torch": Implementation(
+                fn=torch_ops.gemm_residual_partial_rmsnorm_bwd,
+                inputs=inputs,
+            ),
+        },
+        oracles={
+            "coda": oracle_impl,
+            "torch": oracle_impl,
+        },
+        outputs=outputs,
+    )
+
+
+def gemm_swiglu(
+    shape: Shape,
+    seed: int,
+    dtype: torch.dtype,
+) -> Case:
+    # the MLP's gate_up projection followed by SwiGLU, silu(gate) * up;
+    # returns the values before and after SwiGLU
+    sampler = Sampler(seed=seed)
+    samples = operands.linear_operands(
+        shape=shape,
+        out_features=2 * shape.ffn,
+        sampler=sampler,
+        dtype=dtype,
+    )
+    A = samples["A"]
+    B = samples["B"]
+    # two layouts of the gate and up columns: interleaved, as CODA takes
+    # them, and split, all gates first, then all ups; torch runs both
+    weight = B.mT
+    split_weight = rearrange(
+        tensor=weight,
+        pattern="(pair two) k -> (two pair) k",
+        two=2,
+    )
+    split_B = split_weight.mT
+    interleaved = {
+        "A": A,
+        "B": B,
+        "layout": PairLayout.interleaved,
+    }
+    split = {
+        "A": A,
+        "B": split_B,
+        "layout": PairLayout.split,
+    }
+    coda_inputs = {
+        "A": A,
+        "B": B,
+    }
+    interleaved_oracle_impl = Implementation(
+        fn=make_oracle_fn(
+            fn=torch_ops.gemm_swiglu,
+            in_dims={
+                "A": 0,
+                "B": None,
+            },
+            out_dims=(0, 0),
+            reduce_dims=(None, None),
+        ),
+        inputs=interleaved,
+    )
+    split_oracle_impl = Implementation(
+        fn=make_oracle_fn(
+            fn=torch_ops.gemm_swiglu,
+            in_dims={
+                "A": 0,
+                "B": None,
+            },
+            out_dims=(0, 0),
+            reduce_dims=(None, None),
+        ),
+        inputs=split,
+    )
+    return Case(
+        implementations={
+            "coda": Implementation(
+                fn=gemm_functional.gemm_swiglu,
+                inputs=coda_inputs,
+            ),
+            "torch interleaved": Implementation(
+                fn=torch_ops.gemm_swiglu,
+                inputs=interleaved,
+            ),
+            "torch split": Implementation(
+                fn=torch_ops.gemm_swiglu,
+                inputs=split,
+            ),
+        },
+        oracles={
+            "coda": interleaved_oracle_impl,
+            "torch interleaved": interleaved_oracle_impl,
+            "torch split": split_oracle_impl,
+        },
+        outputs=("preact", "postact"),
+    )
+
+
+def gemm_rmsnorm_swiglu(
+    shape: Shape,
+    seed: int,
+    dtype: torch.dtype,
+) -> Case:
+    # gemm_swiglu with the rmsnorm before the MLP folded in: each row's
+    # rstd scales the GEMM's output instead of its input
+    sampler = Sampler(seed=seed)
+    samples = operands.linear_operands(
+        shape=shape,
+        out_features=2 * shape.ffn,
+        sampler=sampler,
+        dtype=dtype,
+    )
+    norm = operands.rmsnorm_operands(
+        shape=shape,
+        x=samples["A"],
+        rstd_nominal=shape.statistics.rstd,
+        sampler=sampler,
+        dtype=dtype,
+    )
+    A = norm["A"]
+    B = samples["B"]
+    rstd = norm["rstd"]
+    # reorder the weight for torch's split layout, as in gemm_swiglu
+    weight = B.mT
+    split_weight = rearrange(
+        tensor=weight,
+        pattern="(pair two) k -> (two pair) k",
+        two=2,
+    )
+    split_B = split_weight.mT
+    interleaved = {
+        "A": A,
+        "B": B,
+        "rstd": rstd,
+        "layout": PairLayout.interleaved,
+    }
+    split = {
+        "A": A,
+        "B": split_B,
+        "rstd": rstd,
+        "layout": PairLayout.split,
+    }
+    coda_inputs = {
+        "A": A,
+        "B": B,
+        "rstd": rstd,
+    }
+    interleaved_oracle_impl = Implementation(
+        fn=make_oracle_fn(
+            fn=torch_ops.gemm_rmsnorm_swiglu,
+            in_dims={
+                "A": 0,
+                "B": None,
+                "rstd": 0,
+            },
+            out_dims=(0, 0),
+            reduce_dims=(None, None),
+        ),
+        inputs=interleaved,
+    )
+    split_oracle_impl = Implementation(
+        fn=make_oracle_fn(
+            fn=torch_ops.gemm_rmsnorm_swiglu,
+            in_dims={
+                "A": 0,
+                "B": None,
+                "rstd": 0,
+            },
+            out_dims=(0, 0),
+            reduce_dims=(None, None),
+        ),
+        inputs=split,
+    )
+    return Case(
+        implementations={
+            "coda": Implementation(
+                fn=gemm_functional.gemm_rmsnorm_swiglu,
+                inputs=coda_inputs,
+            ),
+            "torch interleaved": Implementation(
+                fn=torch_ops.gemm_rmsnorm_swiglu,
+                inputs=interleaved,
+            ),
+            "torch split": Implementation(
+                fn=torch_ops.gemm_rmsnorm_swiglu,
+                inputs=split,
+            ),
+        },
+        oracles={
+            "coda": interleaved_oracle_impl,
+            "torch interleaved": interleaved_oracle_impl,
+            "torch split": split_oracle_impl,
+        },
+        outputs=("preact", "postact"),
+    )
+
+
+def gemm_swiglu_bwd_zdz(
+    shape: Shape,
+    seed: int,
+    dtype: torch.dtype,
+) -> Case:
+    # backward pass from the MLP's down projection through SwiGLU, at its
+    # saved input Z; returns Z's gradient, the per-row ZdZ that the
+    # rmsnorm backward needs, and SwiGLU's output again
+    sampler = Sampler(seed=seed)
+    down = sampler.weight(
+        shape=(shape.dim, shape.ffn),
+        dtype=dtype,
+    )
+    A = sampler.randn(
+        shape=(shape.tokens, shape.dim),
+        dtype=dtype,
+    )
+    Z = sampler.randn(
+        shape=(shape.tokens, 2 * shape.ffn),
+        dtype=dtype,
+    )
+    # B is the down weight transposed, as the forward GEMM reads it
+    B = down.mT
+    # ZdZ sums over Z's columns but divides by dim, the rmsnorm's width
+    scale = 1.0 / shape.dim
+    # torch's split layout needs Z's columns as all gates, then all ups
+    split_Z = rearrange(
+        tensor=Z,
+        pattern="m (pair two) -> m (two pair)",
+        two=2,
+    )
+    interleaved = {
+        "A": A,
+        "B": B,
+        "Z": Z,
+        "scale": scale,
+        "layout": PairLayout.interleaved,
+    }
+    split = {
+        "A": A,
+        "B": B,
+        "Z": split_Z,
+        "scale": scale,
+        "layout": PairLayout.split,
+    }
+    coda_inputs = {
+        "A": A,
+        "B": B,
+        "Z": Z,
+        "scale": scale,
+    }
+    interleaved_oracle_impl = Implementation(
+        fn=make_oracle_fn(
+            fn=torch_ops.gemm_swiglu_bwd_zdz,
+            in_dims={
+                "A": 0,
+                "B": None,
+                "Z": 0,
+            },
+            out_dims=(0, 0, 0),
+            reduce_dims=(None, None, None),
+        ),
+        inputs=interleaved,
+    )
+    split_oracle_impl = Implementation(
+        fn=make_oracle_fn(
+            fn=torch_ops.gemm_swiglu_bwd_zdz,
+            in_dims={
+                "A": 0,
+                "B": None,
+                "Z": 0,
+            },
+            out_dims=(0, 0, 0),
+            reduce_dims=(None, None, None),
+        ),
+        inputs=split,
+    )
+    return Case(
+        implementations={
+            "coda": Implementation(
+                fn=gemm_functional.gemm_swiglu_bwd_zdz,
+                inputs=coda_inputs,
+            ),
+            "torch interleaved": Implementation(
+                fn=torch_ops.gemm_swiglu_bwd_zdz,
+                inputs=interleaved,
+            ),
+            "torch split": Implementation(
+                fn=torch_ops.gemm_swiglu_bwd_zdz,
+                inputs=split,
+            ),
+        },
+        oracles={
+            "coda": interleaved_oracle_impl,
+            "torch interleaved": interleaved_oracle_impl,
+            "torch split": split_oracle_impl,
+        },
+        outputs=("dZ", "ZdZ", "out"),
+    )
+
+
+OPS = {
+    "gemm_rmsnorm": gemm_rmsnorm,
+    "gemm_residual_partial_rmsnorm": gemm_residual_partial_rmsnorm,
+    "gemm_residual_partial_rmsnorm_bwd": gemm_residual_partial_rmsnorm_bwd,
+    "gemm_swiglu": gemm_swiglu,
+    "gemm_rmsnorm_swiglu": gemm_rmsnorm_swiglu,
+    "gemm_swiglu_bwd_zdz": gemm_swiglu_bwd_zdz,
+}
