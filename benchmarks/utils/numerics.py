@@ -1,8 +1,14 @@
-import math
 import torch
-import inspect
-import operator
-import functools
+from typing import NamedTuple
 from collections import defaultdict
-from typing import Callable, NamedTuple
-from torch.utils._pytree import tree_map
+
+# each dtype's significand bits after the leading one
+SIGNIFICAND_BITS = {
+    torch.bfloat16: 7,
+    torch.float32: 23,
+}
+# each dtype's smallest normal exponent
+SMALLEST_EXPONENT = {
+    torch.bfloat16: -126,
+    torch.float32: -126,
+}
