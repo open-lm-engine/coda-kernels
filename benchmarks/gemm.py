@@ -574,6 +574,53 @@ def gemm_swiglu_bwd_zdz(
     )
 
 
+def gemm_xsa_bwd(
+    shape: Shape,
+    seed: int,
+    dtype: torch.dtype,
+) -> Case:
+    sampler = Sampler(seed=seed)
+    inputs = operands.xsa_operands(
+        shape=shape,
+        sampler=sampler,
+        dtype=dtype,
+    )
+    # torch takes v as a tensor of its own; CODA reads it in place
+    torch_inputs = inputs.copy()
+    torch_inputs["v"] = inputs["v"].contiguous()
+    oracle_impl = Implementation(
+        fn=make_oracle_fn(
+            fn=torch_ops.gemm_xsa_bwd,
+            in_dims={
+                "x": 0,
+                "v": 0,
+                "A": 0,
+                "B": None,
+            },
+            out_dims=(0, 0),
+            reduce_dims=(None, None),
+        ),
+        inputs=inputs,
+    )
+    return Case(
+        implementations={
+            "coda": Implementation(
+                fn=gemm_functional.gemm_xsa_bwd,
+                inputs=inputs,
+            ),
+            "torch": Implementation(
+                fn=torch_ops.gemm_xsa_bwd,
+                inputs=torch_inputs,
+            ),
+        },
+        oracles={
+            "coda": oracle_impl,
+            "torch": oracle_impl,
+        },
+        outputs=("dx", "dv"),
+    )
+
+
 OPS = {
     "gemm_sigmoid_fp32": gemm_sigmoid_fp32,
     "gemm_rmsnorm": gemm_rmsnorm,
@@ -582,4 +629,5 @@ OPS = {
     "gemm_swiglu": gemm_swiglu,
     "gemm_rmsnorm_swiglu": gemm_rmsnorm_swiglu,
     "gemm_swiglu_bwd_zdz": gemm_swiglu_bwd_zdz,
+    "gemm_xsa_bwd": gemm_xsa_bwd,
 }
