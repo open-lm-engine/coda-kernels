@@ -10,6 +10,72 @@ from benchmarks.utils.cases import Case, Implementation, make_oracle_fn
 from benchmarks.utils.data import Sampler, Shape
 
 
+def gemm_sigmoid_fp32(
+    shape: Shape,
+    seed: int,
+    dtype: torch.dtype,
+) -> Case:
+    sampler = Sampler(seed=seed)
+    # N is the head count, one gate per head
+    samples = operands.linear_operands(
+        shape=shape,
+        out_features=shape.heads,
+        sampler=sampler,
+        dtype=dtype,
+    )
+    A = samples["A"]
+    B = samples["B"]
+    # both CODA and torch return the gates in fp32
+    out_dtype = torch.float32
+    out = sampler.randn(
+        shape=(shape.tokens, shape.heads),
+        dtype=out_dtype,
+    )
+    inputs = {
+        "A": A,
+        "B": B,
+    }
+    torch_inputs = {
+        "A": A,
+        "B": B,
+        "out_dtype": out_dtype,
+    }
+    coda_inputs = {
+        "A": A,
+        "B": B,
+        "out": out,
+    }
+    oracle_impl = Implementation(
+        fn=make_oracle_fn(
+            fn=torch_ops.gemm_sigmoid,
+            in_dims={
+                "A": 0,
+                "B": None,
+            },
+            out_dims=(0,),
+            reduce_dims=(None,),
+        ),
+        inputs=inputs,
+    )
+    return Case(
+        implementations={
+            "coda": Implementation(
+                fn=gemm_functional.gemm_sigmoid,
+                inputs=coda_inputs,
+            ),
+            "torch": Implementation(
+                fn=torch_ops.gemm_sigmoid,
+                inputs=torch_inputs,
+            ),
+        },
+        oracles={
+            "coda": oracle_impl,
+            "torch": oracle_impl,
+        },
+        outputs=("out",),
+    )
+
+
 def gemm_rmsnorm(
     shape: Shape,
     seed: int,
@@ -509,6 +575,7 @@ def gemm_swiglu_bwd_zdz(
 
 
 OPS = {
+    "gemm_sigmoid_fp32": gemm_sigmoid_fp32,
     "gemm_rmsnorm": gemm_rmsnorm,
     "gemm_residual_partial_rmsnorm": gemm_residual_partial_rmsnorm,
     "gemm_residual_partial_rmsnorm_bwd": gemm_residual_partial_rmsnorm_bwd,
