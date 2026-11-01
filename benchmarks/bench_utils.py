@@ -47,12 +47,14 @@ def do_bench_interleaved(
     passes: int,
     warmup: int,
     repeats: int,
-) -> dict[str, float]:
-    # each function's median time in ms, over passes that
-    # vary the order, as clocks follow the previous load
+    return_mode: str,
+) -> dict[str, float] | dict[str, list[float]]:
+    # returns each function's median time in ms over the passes, or with
+    # return_mode "all" its time in every pass
+    assert return_mode in ("median", "all")
+
     names = list(fn_dict)
-    # passes cycle through every rotation of the names,
-    # forward then reversed (ABC, CBA, BCA, ACB, ...)
+    # each pass runs the functions in a different order: ABC, CBA, BCA, ACB, ...
     orders = []
     for shift in range(len(names)):
         rotated = names[shift:] + names[:shift]
@@ -71,7 +73,10 @@ def do_bench_interleaved(
             )
             times[name].append(median_ms)
 
-    medians = {}
-    for name, values in times.items():
-        medians[name] = statistics.median(values)
-    return medians
+    if return_mode == "all":
+        return dict(times)
+    else:
+        medians = {}
+        for name, values in times.items():
+            medians[name] = statistics.median(values)
+        return medians
