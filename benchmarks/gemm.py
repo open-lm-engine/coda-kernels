@@ -310,13 +310,9 @@ def gemm_swiglu(
     B = samples["B"]
     # two layouts of the gate and up columns: interleaved, as CODA takes
     # them, and split, all gates first, then all ups; torch runs both
-    weight = B.mT
-    split_weight = rearrange(
-        tensor=weight,
-        pattern="(pair two) k -> (two pair) k",
-        two=2,
-    ).contiguous()
-    split_B = split_weight.mT
+    split_B = operands.split_swiglu_weight(
+        B=B,
+    )
     interleaved = {
         "A": A,
         "B": B,
@@ -402,13 +398,9 @@ def gemm_rmsnorm_swiglu(
     B = samples_linear["B"]
     rstd = samples_rmsnorm["rstd"]
     # reorder the weight for torch's split layout, as in gemm_swiglu
-    weight = B.mT
-    split_weight = rearrange(
-        tensor=weight,
-        pattern="(pair two) k -> (two pair) k",
-        two=2,
-    ).contiguous()
-    split_B = split_weight.mT
+    split_B = operands.split_swiglu_weight(
+        B=B,
+    )
     interleaved = {
         "A": A,
         "B": B,
