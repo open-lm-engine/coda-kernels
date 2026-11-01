@@ -129,8 +129,10 @@ def gemm_lse_select_logits(
         "ignore_index": data.IGNORE_INDEX,
     }
     # CODA returns the lse only when asked for it
-    coda_inputs = inputs.copy()
-    coda_inputs["return_lse"] = True
+    coda_inputs = {
+        **inputs,
+        "return_lse": True,
+    }
     oracle_impl = Implementation(
         fn=make_oracle_fn(
             fn=torch_ops.gemm_lse_select_logits,
