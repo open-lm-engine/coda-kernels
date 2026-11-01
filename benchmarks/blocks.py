@@ -122,10 +122,10 @@ def coda_gemm_residual_rmsnorm_gemm_qknorm_rope(
         weight=wn,
         eps=eps,
     )
-    # q and k are normed per head and rotated; v is a GEMM of its own
+    # as the transformer block runs it: q and k normed per head and
+    # rotated, and v a GEMM of its own, into one [q | k | v]
     size_qk = head_dim * (num_heads_q + num_heads_k)
     size_v = w1.shape[0] - size_qk
-
     qkv = torch.empty(
         size=(residual.shape[0], w1.shape[0]),
         dtype=residual.dtype,
@@ -468,12 +468,12 @@ def gemm_residual_rmsnorm_gemm_qknorm_rope(
         size=2 * shape.head_dim,
         dtype=dtype,
     )
-    tensors = {
+    shared_inputs = {
         **samples,
         "gamma_qk": gamma_qk,
     }
     coda_inputs = {
-        **tensors,
+        **shared_inputs,
         "positions": samples_rope["positions"],
         "frequencies": samples_rope["frequencies_qk"],
         "head_dim": shape.head_dim,
@@ -481,22 +481,22 @@ def gemm_residual_rmsnorm_gemm_qknorm_rope(
         "num_heads_k": shape.kv_heads,
         "eps": data.NORM_EPS,
     }
-    # torch takes fp32 angles; the oracle takes exact fp64 ones, as in
-    # transformer.block
+    # rope's angles: torch gets them in fp32, not its inputs' 16-bit
+    # dtype, and the oracle in fp64
     pair_frequencies = operands.inv_freq(shape=shape)
-    angles = torch_ops.rope_angles(
+    angles_fp64 = torch_ops.rope_angles(
         positions=samples_rope["positions"],
         inv_freq=pair_frequencies,
     )
-    angles_fp32 = angles.to(dtype=torch.float32)
+    angles_fp32 = angles_fp64.to(dtype=torch.float32)
     torch_inputs = {
-        **tensors,
+        **shared_inputs,
         "angles": angles_fp32,
         "head_dim": shape.head_dim,
         "eps": data.NORM_EPS,
     }
     oracle_inputs = torch_inputs.copy()
-    oracle_inputs["angles"] = angles
+    oracle_inputs["angles"] = angles_fp64
     oracle_impl = Implementation(
         fn=make_oracle_fn(
             fn=torch_blocks.gemm_residual_rmsnorm_gemm_qknorm_rope,
@@ -621,13 +621,14 @@ def llama3_block_pre(
         "frequencies": samples["frequencies"],
         "eps": data.NORM_EPS,
     }
-    # torch takes fp32 angles; the oracle takes exact fp64 ones
+    # rope's angles: torch gets them in fp32, not its inputs' 16-bit
+    # dtype, and the oracle in fp64
     pair_frequencies = operands.inv_freq(shape=shape)
-    angles = torch_ops.rope_angles(
+    angles_fp64 = torch_ops.rope_angles(
         positions=samples["positions"],
         inv_freq=pair_frequencies,
     )
-    angles_fp32 = angles.to(dtype=torch.float32)
+    angles_fp32 = angles_fp64.to(dtype=torch.float32)
     torch_inputs = {
         **shared_inputs,
         "angles": angles_fp32,
@@ -636,7 +637,7 @@ def llama3_block_pre(
     }
     oracle_inputs = {
         **shared_inputs,
-        "angles": angles,
+        "angles": angles_fp64,
         "head_dim": shape.head_dim,
         "eps": data.NORM_EPS,
     }
@@ -679,6 +680,521 @@ def llama3_block_pre(
             ),
             "torch/interleaved": TrainingImplementation(
                 forward=torch_blocks.block_pre_bench,
+                inputs=torch_inputs,
+                leaves=leaves,
+                cotangents=cotangents,
+                copies_cotangents=False,
+            ),
+        },
+        oracles={
+            "coda": oracle_impl,
+            "torch/interleaved": oracle_impl,
+        },
+        outputs=outputs,
+    )
+
+
+def llama3_block(
+    shape: Shape,
+    seed: int,
+    dtype: torch.dtype,
+) -> Case:
+    sampler = Sampler(seed=seed)
+    samples = operands.block_operands(
+        shape=shape,
+        name="llama3.block",
+        sampler=sampler,
+        dtype=dtype,
+    )
+    leaves = ("x0", "y0", "w0", "w1", "w2", "w3", "wn0", "wn1")
+    cotangents = ("grad_x2", "grad_qkv")
+    # the forward outputs, then one grad per leaf
+    forward_outputs = ("x2", "qkv")
+    grads = ("dx0", "dy0", "dw0", "dw1", "dw2", "dw3", "dwn0", "dwn1")
+    outputs = (*forward_outputs, *grads)
+    # every implementation takes the same leaves and cotangents
+    shared_inputs = {}
+    for name in (*leaves, *cotangents):
+        shared_inputs[name] = samples[name]
+
+    coda_inputs = {
+        **shared_inputs,
+        "positions": samples["positions"],
+        "frequencies": samples["frequencies"],
+        "eps": data.NORM_EPS,
+    }
+    # rope's angles: torch gets them in fp32, not its inputs' 16-bit
+    # dtype, and the oracle in fp64
+    pair_frequencies = operands.inv_freq(shape=shape)
+    angles_fp64 = torch_ops.rope_angles(
+        positions=samples["positions"],
+        inv_freq=pair_frequencies,
+    )
+    angles_fp32 = angles_fp64.to(dtype=torch.float32)
+    torch_inputs = {
+        **shared_inputs,
+        "angles": angles_fp32,
+        "head_dim": shape.head_dim,
+        "eps": data.NORM_EPS,
+    }
+    oracle_inputs = {
+        **shared_inputs,
+        "angles": angles_fp64,
+        "head_dim": shape.head_dim,
+        "eps": data.NORM_EPS,
+    }
+
+    coda_forward = make_unbatched_fn(
+        op=llama3.block,
+        activations=("x0", "y0"),
+    )
+    oracle_step = make_step_fn(
+        forward=torch_blocks.block,
+        leaves=leaves,
+        cotangents=cotangents,
+        copies_cotangents=False,
+    )
+    oracle_impl = Implementation(
+        fn=make_oracle_fn(
+            fn=oracle_step,
+            in_dims={
+                "x0": 0,
+                "y0": 0,
+                "w0": None,
+                "w1": None,
+                "w2": None,
+                "w3": None,
+                "wn0": None,
+                "wn1": None,
+                "grad_x2": 0,
+                "grad_qkv": 0,
+                "angles": 0,
+            },
+            out_dims=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            reduce_dims=(None, None, None, None, 0, 0, 0, 0, 0, 0),
+        ),
+        inputs=oracle_inputs,
+    )
+    return Case(
+        implementations={
+            # CODA's backward overwrites its cotangents, so its step copies them
+            "coda": TrainingImplementation(
+                forward=coda_forward,
+                inputs=coda_inputs,
+                leaves=leaves,
+                cotangents=cotangents,
+                copies_cotangents=True,
+            ),
+            "torch/interleaved": TrainingImplementation(
+                forward=torch_blocks.block_bench,
+                inputs=torch_inputs,
+                leaves=leaves,
+                cotangents=cotangents,
+                copies_cotangents=False,
+            ),
+        },
+        oracles={
+            "coda": oracle_impl,
+            "torch/interleaved": oracle_impl,
+        },
+        outputs=outputs,
+    )
+
+
+def llama3_block_post(
+    shape: Shape,
+    seed: int,
+    dtype: torch.dtype,
+) -> Case:
+    sampler = Sampler(seed=seed)
+    samples = operands.block_operands(
+        shape=shape,
+        name="llama3.block_post",
+        sampler=sampler,
+        dtype=dtype,
+    )
+    leaves = ("x0", "y0", "w0", "w1", "w2", "w3", "wn0", "wn1")
+    cotangents = ("grad_loss",)
+    # the loss, then one grad per leaf
+    grads = ("dx0", "dy0", "dw0", "dw1", "dw2", "dw3", "dwn0", "dwn1")
+    outputs = ("loss", *grads)
+    # every implementation takes the same leaves and cotangent
+    shared_inputs = {}
+    for name in (*leaves, *cotangents):
+        shared_inputs[name] = samples[name]
+
+    inputs = {
+        **shared_inputs,
+        "targets": samples["targets"],
+        "eps": data.NORM_EPS,
+    }
+    # the oracle sums its row chunks' losses, so each chunk divides by
+    # the count of targets not ignored in the whole batch
+    oracle_inputs = {
+        **inputs,
+        "count": operands.count_non_ignored_targets(
+            target=samples["targets"],
+        ),
+    }
+
+    coda_forward = make_unbatched_fn(
+        op=llama3.block_post,
+        activations=("x0", "y0"),
+    )
+    oracle_forward = make_batch_mean_loss_fn(
+        fn=torch_blocks.block_post,
+    )
+    oracle_step = make_step_fn(
+        forward=oracle_forward,
+        leaves=leaves,
+        cotangents=cotangents,
+        copies_cotangents=False,
+    )
+    oracle_impl = Implementation(
+        fn=make_oracle_fn(
+            fn=oracle_step,
+            in_dims={
+                "x0": 0,
+                "y0": 0,
+                "w0": None,
+                "w1": None,
+                "w2": None,
+                "w3": None,
+                "wn0": None,
+                "wn1": None,
+                "grad_loss": None,
+                "targets": 0,
+            },
+            out_dims=(0, 0, 0, 0, 0, 0, 0, 0, 0),
+            reduce_dims=(0, None, None, 0, 0, 0, 0, 0, 0),
+        ),
+        inputs=oracle_inputs,
+    )
+    return Case(
+        implementations={
+            # CODA's backward overwrites its cotangents, so its step copies them
+            "coda": TrainingImplementation(
+                forward=coda_forward,
+                inputs=inputs,
+                leaves=leaves,
+                cotangents=cotangents,
+                copies_cotangents=True,
+            ),
+            "torch/interleaved": TrainingImplementation(
+                forward=torch_blocks.block_post_bench,
+                inputs=inputs,
+                leaves=leaves,
+                cotangents=cotangents,
+                copies_cotangents=False,
+            ),
+        },
+        oracles={
+            "coda": oracle_impl,
+            "torch/interleaved": oracle_impl,
+        },
+        outputs=outputs,
+    )
+
+
+def transformer_block_pre(
+    shape: Shape,
+    seed: int,
+    dtype: torch.dtype,
+) -> Case:
+    # llama3's block_pre with the per-head q and k norm wn2, also
+    # returning v for the first xsa
+
+    sampler = Sampler(seed=seed)
+    samples = operands.block_operands(
+        shape=shape,
+        name="transformer.block_pre",
+        sampler=sampler,
+        dtype=dtype,
+    )
+    leaves = ("x", "w", "wn", "wn2")
+    cotangents = ("grad_residual", "grad_qkv", "grad_v")
+    # the forward outputs, then one grad per leaf
+    forward_outputs = ("residual", "qkv", "v")
+    grads = ("dx", "dw", "dwn", "dwn2")
+    outputs = (*forward_outputs, *grads)
+    # every implementation takes the same leaves and cotangents
+    shared_inputs = {}
+    for name in (*leaves, *cotangents):
+        shared_inputs[name] = samples[name]
+
+    coda_inputs = {
+        **shared_inputs,
+        "positions": samples["positions"],
+        "frequencies": samples["frequencies"],
+        "head_dim": shape.head_dim,
+        "eps": data.NORM_EPS,
+    }
+    # rope's angles: torch gets them in fp32, not its inputs' 16-bit
+    # dtype, and the oracle in fp64
+    pair_frequencies = operands.inv_freq(shape=shape)
+    angles_fp64 = torch_ops.rope_angles(
+        positions=samples["positions"],
+        inv_freq=pair_frequencies,
+    )
+    angles_fp32 = angles_fp64.to(dtype=torch.float32)
+    torch_inputs = {
+        **shared_inputs,
+        "angles": angles_fp32,
+        "head_dim": shape.head_dim,
+        "eps": data.NORM_EPS,
+    }
+    oracle_inputs = {
+        **shared_inputs,
+        "angles": angles_fp64,
+        "head_dim": shape.head_dim,
+        "eps": data.NORM_EPS,
+    }
+
+    coda_forward = make_unbatched_fn(
+        op=transformer.block_pre,
+        activations=("x",),
+    )
+    oracle_step = make_step_fn(
+        forward=torch_blocks.transformer_block_pre,
+        leaves=leaves,
+        cotangents=cotangents,
+        copies_cotangents=False,
+    )
+    oracle_impl = Implementation(
+        fn=make_oracle_fn(
+            fn=oracle_step,
+            in_dims={
+                "x": 0,
+                "w": None,
+                "wn": None,
+                "wn2": None,
+                "grad_residual": 0,
+                "grad_qkv": 0,
+                "grad_v": 0,
+                "angles": 0,
+            },
+            out_dims=(0, 0, 0, 0, 0, 0, 0),
+            reduce_dims=(None, None, None, None, 0, 0, 0),
+        ),
+        inputs=oracle_inputs,
+    )
+    return Case(
+        implementations={
+            # CODA's backward overwrites its cotangents, so its step copies them
+            "coda": TrainingImplementation(
+                forward=coda_forward,
+                inputs=coda_inputs,
+                leaves=leaves,
+                cotangents=cotangents,
+                copies_cotangents=True,
+            ),
+            "torch/interleaved": TrainingImplementation(
+                forward=torch_blocks.transformer_block_pre_bench,
+                inputs=torch_inputs,
+                leaves=leaves,
+                cotangents=cotangents,
+                copies_cotangents=False,
+            ),
+        },
+        oracles={
+            "coda": oracle_impl,
+            "torch/interleaved": oracle_impl,
+        },
+        outputs=outputs,
+    )
+
+
+def transformer_block(
+    shape: Shape,
+    seed: int,
+    dtype: torch.dtype,
+) -> Case:
+    # attention's output o0 and value v0 to the next [q | k | v] and v,
+    # through xsa, the MLP and the per-head norm
+
+    sampler = Sampler(seed=seed)
+    samples = operands.block_operands(
+        shape=shape,
+        name="transformer.block",
+        sampler=sampler,
+        dtype=dtype,
+    )
+    leaves = ("x0", "o0", "v0", "w0", "w1", "w2", "w3", "wn0", "wn1", "wn2")
+    cotangents = ("grad_x2", "grad_qkv", "grad_v")
+    # the forward outputs, then one grad per leaf
+    forward_outputs = ("x2", "qkv", "v")
+    grads = ("dx0", "do0", "dv0", "dw0", "dw1", "dw2", "dw3", "dwn0", "dwn1", "dwn2")
+    outputs = (*forward_outputs, *grads)
+    # every implementation takes the same leaves and cotangents
+    shared_inputs = {}
+    for name in (*leaves, *cotangents):
+        shared_inputs[name] = samples[name]
+
+    coda_inputs = {
+        **shared_inputs,
+        "positions": samples["positions"],
+        "frequencies": samples["frequencies"],
+        "head_dim": shape.head_dim,
+        "eps": data.NORM_EPS,
+    }
+    # rope's angles: torch gets them in fp32, not its inputs' 16-bit
+    # dtype, and the oracle in fp64
+    pair_frequencies = operands.inv_freq(shape=shape)
+    angles_fp64 = torch_ops.rope_angles(
+        positions=samples["positions"],
+        inv_freq=pair_frequencies,
+    )
+    angles_fp32 = angles_fp64.to(dtype=torch.float32)
+    torch_inputs = shared_inputs.copy()
+
+
+    coda_forward = make_unbatched_fn(
+        op=transformer.block,
+        activations=("x0", "o0", "v0"),
+    )
+    oracle_step = make_step_fn(
+        forward=torch_blocks.transformer_block,
+        leaves=leaves,
+        cotangents=cotangents,
+        copies_cotangents=False,
+    )
+    oracle_impl = Implementation(
+        fn=make_oracle_fn(
+            fn=oracle_step,
+            in_dims={
+                "x0": 0,
+                "o0": 0,
+                "v0": 0,
+                "w0": None,
+                "w1": None,
+                "w2": None,
+                "w3": None,
+                "wn0": None,
+                "wn1": None,
+                "wn2": None,
+                "grad_x2": 0,
+                "grad_qkv": 0,
+                "grad_v": 0,
+                "angles": 0,
+            },
+            out_dims=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            reduce_dims=(None, None, None, None, None, None, 0, 0, 0, 0, 0, 0, 0),
+        ),
+        inputs=oracle_inputs,
+    )
+    return Case(
+        implementations={
+            # CODA's backward overwrites its cotangents, so its step copies them
+            "coda": TrainingImplementation(
+                forward=coda_forward,
+                inputs=coda_inputs,
+                leaves=leaves,
+                cotangents=cotangents,
+                copies_cotangents=True,
+            ),
+            "torch/interleaved": TrainingImplementation(
+                forward=torch_blocks.transformer_block_bench,
+                inputs=torch_inputs,
+                leaves=leaves,
+                cotangents=cotangents,
+                copies_cotangents=False,
+            ),
+        },
+        oracles={
+            "coda": oracle_impl,
+            "torch/interleaved": oracle_impl,
+        },
+        outputs=outputs,
+    )
+
+
+def transformer_block_post(
+    shape: Shape,
+    seed: int,
+    dtype: torch.dtype,
+) -> Case:
+    # o0 and v0 in, the LM head w3's mean loss over the targets not ignored out
+
+    sampler = Sampler(seed=seed)
+    samples = operands.block_operands(
+        shape=shape,
+        name="transformer.block_post",
+        sampler=sampler,
+        dtype=dtype,
+    )
+    leaves = ("x0", "o0", "v0", "w0", "w1", "w2", "w3", "wn0", "wn1")
+    cotangents = ("grad_loss",)
+    # the loss, then one grad per leaf
+    grads = ("dx0", "do0", "dv0", "dw0", "dw1", "dw2", "dw3", "dwn0", "dwn1")
+    outputs = ("loss", *grads)
+    # every implementation takes the same leaves and cotangent
+    shared_inputs = {}
+    for name in (*leaves, *cotangents):
+        shared_inputs[name] = samples[name]
+
+    inputs = {
+        **shared_inputs,
+        "targets": samples["targets"],
+        "head_dim": shape.head_dim,
+        "eps": data.NORM_EPS,
+    }
+    # torch takes v0 as a tensor of its own; CODA reads it in place
+    torch_inputs = inputs.copy()
+    # the oracle sums its row chunks' losses, so each chunk divides by
+    # the count of targets not ignored in the whole batch
+    oracle_inputs = {
+        **inputs,
+        "count": operands.count_non_ignored_targets(
+            target=samples["targets"],
+        ),
+    }
+
+    coda_forward = make_unbatched_fn(
+        op=transformer.block_post,
+        activations=("x0", "o0", "v0"),
+    )
+    oracle_forward = make_batch_mean_loss_fn(
+        fn=torch_blocks.transformer_block_post,
+    )
+    oracle_step = make_step_fn(
+        forward=oracle_forward,
+        leaves=leaves,
+        cotangents=cotangents,
+        copies_cotangents=False,
+    )
+    oracle_impl = Implementation(
+        fn=make_oracle_fn(
+            fn=oracle_step,
+            in_dims={
+                "x0": 0,
+                "o0": 0,
+                "v0": 0,
+                "w0": None,
+                "w1": None,
+                "w2": None,
+                "w3": None,
+                "wn0": None,
+                "wn1": None,
+                "grad_loss": None,
+                "targets": 0,
+            },
+            out_dims=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            reduce_dims=(0, None, None, None, 0, 0, 0, 0, 0, 0),
+        ),
+        inputs=oracle_inputs,
+    )
+    return Case(
+        implementations={
+            # CODA's backward overwrites its cotangents, so its step copies them
+            "coda": TrainingImplementation(
+                forward=coda_forward,
+                inputs=inputs,
+                leaves=leaves,
+                cotangents=cotangents,
+                copies_cotangents=True,
+            ),
+            "torch/interleaved": TrainingImplementation(
+                forward=torch_blocks.transformer_block_post_bench,
                 inputs=torch_inputs,
                 leaves=leaves,
                 cotangents=cotangents,
