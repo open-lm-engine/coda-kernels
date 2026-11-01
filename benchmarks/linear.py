@@ -39,16 +39,16 @@ def linear_sigmoid(
         "weight": weight,
         "grad_out": grad_out,
     }
-    # the oracle runs torch's step too, widened to fp64
+    # the oracle: torch's step in fp64
     torch_step = make_step_fn(
         forward=torch_linear.linear_sigmoid,
         leaves=leaves,
         cotangents=cotangents,
         copies_cotangents=False,
     )
-    # what every step returns, in order
+    # every step's outputs, in order
     outputs = ("out", "dx", "dweight")
-    # a weight's grad sums over tokens, so the oracle adds up its chunks
+    # a weight's grad sums over M, so the oracle adds up its chunks
     oracle_impl = Implementation(
         fn=make_oracle_fn(
             fn=torch_step,
@@ -130,14 +130,14 @@ def linear_swiglu(
         "grad_out": grad_out,
         "layout": PairLayout.split,
     }
-    # the oracles run torch's step too, widened to fp64
+    # the oracles: torch's step in fp64
     torch_step = make_step_fn(
         forward=torch_linear.linear_swiglu,
         leaves=leaves,
         cotangents=cotangents,
         copies_cotangents=False,
     )
-    # what every step returns, in order
+    # every step's outputs, in order
     outputs = ("out", "dx", "dweight")
     interleaved_oracle_impl = Implementation(
         fn=make_oracle_fn(
@@ -195,6 +195,306 @@ def linear_swiglu(
             "torch/split": split_oracle_impl,
         },
         outputs=outputs,
+    )
+
+
+def linear_qknorm_rope(
+    shape: Shape,
+    seed: int,
+    dtype: torch.dtype,
+) -> Case:
+    sampler = Sampler(seed=seed)
+    samples_rope = operands.rope_operands(shape=shape)
+    size_q = samples_rope["size_q"]
+    size_k = samples_rope["size_k"]
+    size_v = samples_rope["size_v"]
+    size_qk = size_q + size_k
+    samples_linear = operands.linear_qknorm_rope_operands(
+        shape=shape,
+        size_q=size_q,
+        size_k=size_k,
+        size_v=size_v,
+        sampler=sampler,
+        dtype=dtype,
+    )
+    weight = samples_linear["weight"]
+    x = samples_linear["x"]
+    gamma = samples_linear["gamma"]
+    dq = samples_linear["dq"]
+    dk = samples_linear["dk"]
+    dv = samples_linear["dv"]
+    # q and k only: v is not rotated
+    frequencies = samples_rope["frequencies_qk"]
+    # the split layout keeps each head's pairs as two halves: q's and k's
+    # rows, gamma, dq and dk are reordered per head
+    split_weight = operands.split_weight(
+        B=weight.mT,
+        size_qk=size_qk,
+        head_dim=shape.head_dim,
+    )
+    split_gamma = operands.split_pairs(
+        x=gamma,
+        head_dim=shape.head_dim,
+    )
+    split_dq = operands.split_pairs(
+        x=dq,
+        head_dim=shape.head_dim,
+    )
+    split_dk = operands.split_pairs(
+        x=dk,
+        head_dim=shape.head_dim,
+    )
+    leaves = ("x", "weight", "gamma")
+    cotangents = ("dq", "dk", "dv")
+    # rope's and qk-norm's inputs, shared by every layout
+    shared_inputs = {
+        "positions": samples_rope["positions"],
+        "frequencies": frequencies,
+        "head_dim": shape.head_dim,
+        "num_heads_q": shape.heads,
+        "num_heads_k": shape.kv_heads,
+        "eps": data.NORM_EPS,
+    }
+    coda_inputs = {
+        "x": x,
+        "weight": weight,
+        "gamma": gamma,
+        "dq": dq,
+        "dk": dk,
+        "dv": dv,
+        **shared_inputs,
+    }
+    # torch builds its cos and sin from positions and frequencies
+    interleaved = {
+        **coda_inputs,
+        "cos": None,
+        "sin": None,
+        "layout": PairLayout.interleaved,
+    }
+    split = {
+        "x": x,
+        "weight": split_weight.mT,
+        "gamma": split_gamma,
+        "dq": split_dq,
+        "dk": split_dk,
+        "dv": dv,
+        **shared_inputs,
+        "cos": None,
+        "sin": None,
+        "layout": PairLayout.split,
+    }
+    # the oracles: torch's step in fp64
+    torch_step = make_step_fn(
+        forward=torch_linear.linear_qknorm_rope,
+        leaves=leaves,
+        cotangents=cotangents,
+        copies_cotangents=False,
+    )
+    # every step's outputs, in order
+    outputs = ("q", "k", "v", "dx", "dweight", "dgamma")
+    oracle_fn = make_oracle_fn(
+        fn=torch_step,
+        in_dims={
+            "x": 0,
+            "weight": None,
+            "gamma": None,
+            "dq": 0,
+            "dk": 0,
+            "dv": 0,
+            "positions": 0,
+            "frequencies": None,
+        },
+        out_dims=(0, 0, 0, 0, 0, 0),
+        reduce_dims=(None, None, None, None, 0, 0),
+    )
+    interleaved_oracle_impl = Implementation(
+        fn=oracle_fn,
+        inputs=interleaved,
+    )
+    split_oracle_impl = Implementation(
+        fn=oracle_fn,
+        inputs=split,
+    )
+    return Case(
+        implementations={
+            "coda": TrainingImplementation(
+                forward=qknorm_rope_functional.linear_qknorm_rope,
+                inputs=coda_inputs,
+                leaves=leaves,
+                cotangents=cotangents,
+                copies_cotangents=False,
+            ),
+            "torch/interleaved": TrainingImplementation(
+                forward=torch_linear.linear_qknorm_rope,
+                inputs=interleaved,
+                leaves=leaves,
+                cotangents=cotangents,
+                copies_cotangents=False,
+            ),
+            "torch/split": TrainingImplementation(
+                forward=torch_linear.linear_qknorm_rope,
+                inputs=split,
+                leaves=leaves,
+                cotangents=cotangents,
+                copies_cotangents=False,
+            ),
+        },
+        oracles={
+            "coda": interleaved_oracle_impl,
+            "torch/interleaved": interleaved_oracle_impl,
+            "torch/split": split_oracle_impl,
+        },
+        outputs=outputs,
+    )
+
+
+def linear_cross_entropy(
+    shape: Shape,
+    seed: int,
+    dtype: torch.dtype,
+) -> Case:
+    sampler = Sampler(seed=seed)
+    samples = operands.lm_head(
+        shape=shape,
+        rmsnorm=False,
+        sampler=sampler,
+        dtype=dtype,
+    )
+    x = samples["A"]
+    weight = samples["B"].mT
+    target = samples["target"]
+    # the loss's cotangent is 1
+    grad_loss = torch.ones(
+        size=(),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    leaves = ("x", "weight")
+    cotangents = ("grad_loss",)
+    inputs = {
+        "x": x,
+        "weight": weight,
+        "target": target,
+        "grad_loss": grad_loss,
+    }
+    # the oracle's mean: its summed loss over the kept targets
+    oracle_inputs = {
+        **inputs,
+        "count": operands.kept_count(
+            target=target,
+        ),
+    }
+    oracle_forward = functools.partial(
+        mean_loss,
+        fn=torch_linear.linear_cross_entropy,
+    )
+    oracle_step = make_step_fn(
+        forward=oracle_forward,
+        leaves=leaves,
+        cotangents=cotangents,
+        copies_cotangents=False,
+    )
+    # every step's outputs, in order
+    outputs = ("loss", "dx", "dweight")
+    oracle_impl = Implementation(
+        fn=make_oracle_fn(
+            fn=oracle_step,
+            in_dims={
+                "x": 0,
+                "weight": None,
+                "target": 0,
+                "grad_loss": None,
+            },
+            out_dims=(0, 0, 0),
+            reduce_dims=(0, None, 0),
+        ),
+        inputs=oracle_inputs,
+    )
+    return Case(
+        implementations={
+            "coda": TrainingImplementation(
+                forward=cross_entropy_functional.linear_cross_entropy,
+                inputs=inputs,
+                leaves=leaves,
+                cotangents=cotangents,
+                copies_cotangents=False,
+            ),
+            "torch": TrainingImplementation(
+                forward=torch_linear.linear_cross_entropy,
+                inputs=inputs,
+                leaves=leaves,
+                cotangents=cotangents,
+                copies_cotangents=False,
+            ),
+        },
+        oracles={
+            "coda": oracle_impl,
+            "torch": oracle_impl,
+        },
+        outputs=outputs,
+    )
+
+
+def linear_cross_entropy_forward(
+    shape: Shape,
+    seed: int,
+    dtype: torch.dtype,
+) -> Case:
+    sampler = Sampler(seed=seed)
+    samples = operands.lm_head(
+        shape=shape,
+        rmsnorm=False,
+        sampler=sampler,
+        dtype=dtype,
+    )
+    x = samples["A"]
+    weight = samples["B"].mT
+    target = samples["target"]
+    inputs = {
+        "x": x,
+        "weight": weight,
+        "target": target,
+    }
+    oracle_inputs = {
+        **inputs,
+        "count": operands.kept_count(
+            target=target,
+        ),
+    }
+    oracle_forward = functools.partial(
+        mean_loss,
+        fn=torch_linear.linear_cross_entropy,
+    )
+    oracle_impl = Implementation(
+        fn=make_oracle_fn(
+            fn=oracle_forward,
+            in_dims={
+                "x": 0,
+                "weight": None,
+                "target": 0,
+            },
+            out_dims=(0,),
+            # the loss sums over the oracle's chunks
+            reduce_dims=(0,),
+        ),
+        inputs=oracle_inputs,
+    )
+    return Case(
+        implementations={
+            "coda": Implementation(
+                fn=cross_entropy_functional.linear_cross_entropy_forward,
+                inputs=inputs,
+            ),
+            "torch": Implementation(
+                fn=torch_linear.linear_cross_entropy,
+                inputs=inputs,
+            ),
+        },
+        oracles={
+            "coda": oracle_impl,
+            "torch": oracle_impl,
+        },
+        outputs=("loss",),
     )
 
 
