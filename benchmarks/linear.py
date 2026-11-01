@@ -1,5 +1,4 @@
 import torch
-import functools
 from einops import rearrange
 from coda.kernels.functional import cross_entropy as cross_entropy_functional
 from coda.kernels.functional import qknorm_rope as qknorm_rope_functional
@@ -10,7 +9,14 @@ from benchmarks.backends import torch_linear
 from benchmarks.backends.torch_ops import PairLayout
 from benchmarks.utils import data
 from benchmarks.utils import operands
-from benchmarks.utils.cases import Case, Implementation, TrainingImplementation, make_oracle_fn, make_step_fn, mean_loss
+from benchmarks.utils.cases import (
+    Case,
+    Implementation,
+    TrainingImplementation,
+    make_batch_mean_loss_fn,
+    make_oracle_fn,
+    make_step_fn,
+)
 from benchmarks.utils.data import Sampler, Shape
 
 
@@ -225,7 +231,8 @@ def linear_qknorm_rope(
     frequencies = samples_rope["frequencies_qk"]
     # reorder q's and k's weight rows, gamma, dq and dk for torch's split
     # layout, which pairs element j with j + head_dim / 2
-    # split_weight takes the weight transposed, as the GEMM ops do
+    # split_weight works on (K, N) weights, the layout GEMMs use; this
+    # weight is (N, K), so transpose it before and after the call
     split_weight = operands.split_weight(
         B=weight.mT,
         size_qk=size_qk,
@@ -380,12 +387,11 @@ def linear_cross_entropy(
     # the count of targets not ignored in the whole batch
     oracle_inputs = {
         **inputs,
-        "count": operands.kept_count(
+        "count": operands.count_non_ignored_targets(
             target=target,
         ),
     }
-    oracle_forward = functools.partial(
-        mean_loss,
+    oracle_forward = make_batch_mean_loss_fn(
         fn=torch_linear.linear_cross_entropy,
     )
     oracle_step = make_step_fn(
@@ -459,12 +465,11 @@ def linear_cross_entropy_forward(
     # the count of targets not ignored in the whole batch
     oracle_inputs = {
         **inputs,
-        "count": operands.kept_count(
+        "count": operands.count_non_ignored_targets(
             target=target,
         ),
     }
-    oracle_forward = functools.partial(
-        mean_loss,
+    oracle_forward = make_batch_mean_loss_fn(
         fn=torch_linear.linear_cross_entropy,
     )
     oracle_impl = Implementation(
