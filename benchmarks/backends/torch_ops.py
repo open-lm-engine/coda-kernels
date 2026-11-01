@@ -373,7 +373,8 @@ def gemm_scalar_scale(
     alpha: torch.Tensor,
     use_quack: bool = False,
 ) -> torch.Tensor:
-    # alpha: a 0-d fp32 device tensor, so a bf16 product stays bf16
+    # alpha is a 0-d fp32 tensor on the GPU; being 0-d, it does not change
+    # the product's dtype, so D * alpha stays in D's dtype
     D = gemm(
         A=A,
         B=B,
@@ -842,7 +843,6 @@ def rope_bwd_zdz(
     if cos is None:
         cos, sin = rope_tables(
             positions=pos,
-            # TODO: check this
             frequencies=freq[:size_qk],
         )
     dz_qk = rope(
@@ -909,13 +909,11 @@ def qknorm_rope_bwd_zdz(
     dz_v = dy_v
     if dv is not None:
         dz_v = dz_v + dv
-    # TODO: check this
-    dz_qk = dz_qk.to(dtype=dy.dtype)
     v_dz_v = v * dz_v
     zdz_v = reduce(v_dz_v, "m n -> m", "sum")
     zdz_unscaled = zdz_v + zdz_qk
     zdz = zdz_unscaled * scale
-    return dz_qk, dz_v, zdz, dgamma
+    return dz_qk.to(dtype=dy.dtype), dz_v, zdz, dgamma
 
 
 # ---- xsa: each head's output minus its component along v
@@ -1074,7 +1072,6 @@ def gemm_rmsnorm_lse(
         use_quack=use_quack,
     )
     rstd = rearrange(rstd, "m -> m 1")
-    # TODO: check
     scaled = D * rstd
     logits = scaled.to(dtype=logits_dtype)
     lses = torch.logsumexp(
@@ -1105,7 +1102,14 @@ def gemm_lse_select_logits(
         A.shape[0],
         device=A.device,
     )
-    target_logits = logits[rows, target.clamp_min(0)] * non_ignored
+    # ignored rows have no target column, so they read column 0, and
+    # multiplying by non_ignored zeroes them
+    safe_target = torch.where(
+        condition=non_ignored,
+        input=target,
+        other=0,
+    )
+    target_logits = logits[rows, safe_target] * non_ignored
     margins = lses - target_logits
     return margins * non_ignored, lses, target_logits
 
@@ -1224,7 +1228,6 @@ def gemm_rmsnorm_cross_entropy_fwd_bwd(
         use_quack=use_quack,
     )
     rstd = rearrange(rstd, "m -> m 1")
-    # TODO: check
     scaled = D * rstd
     logits = scaled.to(dtype=logits_dtype)
     return cross_entropy_fwd_bwd(
