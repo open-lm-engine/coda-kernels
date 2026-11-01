@@ -39,16 +39,15 @@ def linear_sigmoid(
         "weight": weight,
         "grad_out": grad_out,
     }
-    # the oracle: torch's step in fp64
+    # the oracle runs torch's forward and backward in fp64
     torch_step = make_step_fn(
         forward=torch_linear.linear_sigmoid,
         leaves=leaves,
         cotangents=cotangents,
         copies_cotangents=False,
     )
-    # every step's outputs, in order
     outputs = ("out", "dx", "dweight")
-    # a weight's grad sums over M, so the oracle adds up its chunks
+    # the oracle runs in chunks of rows and sums dweight over them
     oracle_impl = Implementation(
         fn=make_oracle_fn(
             fn=torch_step,
@@ -105,7 +104,7 @@ def linear_swiglu(
         shape=(shape.tokens, shape.ffn),
         dtype=dtype,
     )
-    # the split layout: all gate rows, then all up rows
+    # reorder the weight for torch's split layout: all gates, then all ups
     split_weight = rearrange(
         tensor=weight,
         pattern="(pair two) k -> (two pair) k",
@@ -130,14 +129,13 @@ def linear_swiglu(
         "grad_out": grad_out,
         "layout": PairLayout.split,
     }
-    # the oracles: torch's step in fp64
+    # the oracles run torch's forward and backward in fp64
     torch_step = make_step_fn(
         forward=torch_linear.linear_swiglu,
         leaves=leaves,
         cotangents=cotangents,
         copies_cotangents=False,
     )
-    # every step's outputs, in order
     outputs = ("out", "dx", "dweight")
     interleaved_oracle_impl = Implementation(
         fn=make_oracle_fn(
@@ -223,15 +221,16 @@ def linear_qknorm_rope(
     dq = samples_linear["dq"]
     dk = samples_linear["dk"]
     dv = samples_linear["dv"]
-    # q and k only: v is not rotated
+    # only q and k are rotated, not v
     frequencies = samples_rope["frequencies_qk"]
-    # the split layout keeps each head's pairs as two halves: q's and k's
-    # rows, gamma, dq and dk are reordered per head
+    # reorder q's and k's weight rows, gamma, dq and dk for torch's split
+    # layout, which pairs element j with j + head_dim / 2
+    # split_weight takes the weight transposed, as the GEMM ops do
     split_weight = operands.split_weight(
         B=weight.mT,
         size_qk=size_qk,
         head_dim=shape.head_dim,
-    )
+    ).mT
     split_gamma = operands.split_pairs(
         x=gamma,
         head_dim=shape.head_dim,
@@ -246,7 +245,7 @@ def linear_qknorm_rope(
     )
     leaves = ("x", "weight", "gamma")
     cotangents = ("dq", "dk", "dv")
-    # rope's and qk-norm's inputs, shared by every layout
+    # rope and qk-norm arguments shared by every implementation
     shared_inputs = {
         "positions": samples_rope["positions"],
         "frequencies": frequencies,
@@ -256,15 +255,15 @@ def linear_qknorm_rope(
         "eps": data.NORM_EPS,
     }
     coda_inputs = {
+        **shared_inputs,
         "x": x,
         "weight": weight,
         "gamma": gamma,
         "dq": dq,
         "dk": dk,
         "dv": dv,
-        **shared_inputs,
     }
-    # torch builds its cos and sin from positions and frequencies
+    # torch computes cos and sin from positions and frequencies
     interleaved = {
         **coda_inputs,
         "cos": None,
@@ -272,25 +271,24 @@ def linear_qknorm_rope(
         "layout": PairLayout.interleaved,
     }
     split = {
+        **shared_inputs,
         "x": x,
-        "weight": split_weight.mT,
+        "weight": split_weight,
         "gamma": split_gamma,
         "dq": split_dq,
         "dk": split_dk,
         "dv": dv,
-        **shared_inputs,
         "cos": None,
         "sin": None,
         "layout": PairLayout.split,
     }
-    # the oracles: torch's step in fp64
+    # the oracles run torch's forward and backward in fp64
     torch_step = make_step_fn(
         forward=torch_linear.linear_qknorm_rope,
         leaves=leaves,
         cotangents=cotangents,
         copies_cotangents=False,
     )
-    # every step's outputs, in order
     outputs = ("q", "k", "v", "dx", "dweight", "dgamma")
     oracle_fn = make_oracle_fn(
         fn=torch_step,
@@ -361,9 +359,10 @@ def linear_cross_entropy(
         dtype=dtype,
     )
     x = samples["A"]
+    # B is (dim, vocab); linear_cross_entropy takes the (vocab, dim) weight
     weight = samples["B"].mT
     target = samples["target"]
-    # the loss's cotangent is 1
+    # backward starts from a loss gradient of 1
     grad_loss = torch.ones(
         size=(),
         dtype=torch.float32,
@@ -377,7 +376,8 @@ def linear_cross_entropy(
         "target": target,
         "grad_loss": grad_loss,
     }
-    # the oracle's mean: its summed loss over the kept targets
+    # the oracle sums its row chunks' losses, so each chunk divides by
+    # the count of targets not ignored in the whole batch
     oracle_inputs = {
         **inputs,
         "count": operands.kept_count(
@@ -394,7 +394,6 @@ def linear_cross_entropy(
         cotangents=cotangents,
         copies_cotangents=False,
     )
-    # every step's outputs, in order
     outputs = ("loss", "dx", "dweight")
     oracle_impl = Implementation(
         fn=make_oracle_fn(
@@ -448,6 +447,7 @@ def linear_cross_entropy_forward(
         dtype=dtype,
     )
     x = samples["A"]
+    # B is (dim, vocab); linear_cross_entropy takes the (vocab, dim) weight
     weight = samples["B"].mT
     target = samples["target"]
     inputs = {
@@ -455,6 +455,8 @@ def linear_cross_entropy_forward(
         "weight": weight,
         "target": target,
     }
+    # the oracle sums its row chunks' losses, so each chunk divides by
+    # the count of targets not ignored in the whole batch
     oracle_inputs = {
         **inputs,
         "count": operands.kept_count(
@@ -474,7 +476,7 @@ def linear_cross_entropy_forward(
                 "target": 0,
             },
             out_dims=(0,),
-            # the loss sums over the oracle's chunks
+            # sum the chunks' losses
             reduce_dims=(0,),
         ),
         inputs=oracle_inputs,
