@@ -1,4 +1,5 @@
 import math
+import functools
 import torch
 from enum import Enum
 from einops import rearrange, reduce, repeat
@@ -20,7 +21,7 @@ def swiglu(
 ) -> torch.Tensor:
     # silu(gate) * up, interleaved or split as [gate | up]
     if layout == PairLayout.interleaved:
-        pairs = rearrange(preact, "m (n two) -> m n two", two=2)
+        pairs = rearrange(preact, "... (n two) -> ... n two", two=2)
         gate, up = torch.unbind(pairs, dim=-1)
     else:
         assert layout == PairLayout.split
@@ -70,7 +71,7 @@ def rmsnorm_rstd(
 ) -> torch.Tensor:
     # each row's 1 / sqrt(mean(x^2) + eps)
     square = torch.square(x)
-    mean_square = reduce(square, "m n -> m", "mean")
+    mean_square = reduce(square, "... n -> ...", "mean")
     return torch.rsqrt(mean_square + eps)
 
 
@@ -84,7 +85,7 @@ def rmsnorm(
         x=x,
         eps=eps,
     )
-    rstd = rearrange(rstd, "m -> m 1")
+    rstd = rearrange(rstd, "... -> ... 1")
     x_rstd = x * rstd
     normed = x_rstd * weight
     return normed.to(dtype=x.dtype)
@@ -156,29 +157,29 @@ def rope(
     if layout == PairLayout.interleaved:
         pairs = rearrange(
             x,
-            "m (h p two) -> m h p two",
+            "... (h p two) -> ... h p two",
             p=cos.shape[-1],
             two=2,
         )
         x0, x1 = torch.unbind(pairs, dim=-1)
         cos = cos.to(dtype=x.dtype)
-        cos = rearrange(cos, "m p -> m 1 p")
+        cos = rearrange(cos, "... p -> ... 1 p")
         sin = sin.to(dtype=x.dtype)
-        sin = rearrange(sin, "m p -> m 1 p")
+        sin = rearrange(sin, "... p -> ... 1 p")
     else:
         assert layout == PairLayout.split
         half = head_dim // 2
         halves = rearrange(
             x,
-            "m (h two p) -> m h two p",
+            "... (h two p) -> ... h two p",
             two=2,
             p=half,
         )
-        x0, x1 = torch.unbind(halves, dim=2)
+        x0, x1 = torch.unbind(halves, dim=-2)
         cos = cos.to(dtype=x.dtype)
-        cos = rearrange(cos, "m (h p) -> m h p", p=half)
+        cos = rearrange(cos, "... (h p) -> ... h p", p=half)
         sin = sin.to(dtype=x.dtype)
-        sin = rearrange(sin, "m (h p) -> m h p", p=half)
+        sin = rearrange(sin, "... (h p) -> ... h p", p=half)
 
     x0_cos = x0 * cos
     x1_sin = x1 * sin
@@ -189,20 +190,20 @@ def rope(
 
     if layout == PairLayout.interleaved:
         rotated = torch.stack((rotated_x0, rotated_x1), dim=-1)
-        return rearrange(rotated, "m h p two -> m (h p two)")
+        return rearrange(rotated, "... h p two -> ... (h p two)")
     else:
-        rotated = torch.stack((rotated_x0, rotated_x1), dim=2)
-        return rearrange(rotated, "m h two p -> m (h two p)")
+        rotated = torch.stack((rotated_x0, rotated_x1), dim=-2)
+        return rearrange(rotated, "... h two p -> ... (h two p)")
 
 
 def head_mean_square(
     x: torch.Tensor,
     head_dim: int,
 ) -> torch.Tensor:
-    # (M, heads) mean square per head, qknorm's statistic
-    x_heads = rearrange(x, "m (h d) -> m h d", d=head_dim)
+    # (..., heads) mean square per head, qknorm's statistic
+    x_heads = rearrange(x, "... (h d) -> ... h d", d=head_dim)
     square = torch.square(x_heads)
-    return reduce(square, "m h d -> m h", "mean")
+    return reduce(square, "... h d -> ... h", "mean")
 
 
 def qknorm(
@@ -215,9 +216,9 @@ def qknorm(
     eps: float,
 ) -> torch.Tensor:
     # each head times rsqrt(head_mean_sq + eps) and its gamma
-    x_heads = rearrange(x, "m (h d) -> m h d", d=head_dim)
+    x_heads = rearrange(x, "... (h d) -> ... h d", d=head_dim)
     rstd_per_head = torch.rsqrt(head_mean_sq + eps)
-    rstd_per_head = rearrange(rstd_per_head, "m h -> m h 1")
+    rstd_per_head = rearrange(rstd_per_head, "... h -> ... h 1")
     # gamma_q weights the first num_heads_q heads, gamma_k the rest
     gamma_q, gamma_k = torch.split(gamma, (head_dim, head_dim))
     gamma_q = repeat(gamma_q, "d -> h d", h=num_heads_q)
@@ -225,7 +226,7 @@ def qknorm(
     gamma_heads = torch.cat((gamma_q, gamma_k))
     x_rstd = x_heads * rstd_per_head
     normed_heads = x_rstd * gamma_heads
-    normed = rearrange(normed_heads, "m h d -> m (h d)")
+    normed = rearrange(normed_heads, "... h d -> ... (h d)")
     return normed.to(dtype=x.dtype)
 
 
@@ -281,7 +282,7 @@ def cross_entropy(
     ignore_index: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # dlogits = softmax - onehot, rows with target == ignore_index
-    # zeroed; the target entry is minus the off-target mass, as
+    # zeroed; the target op is minus the off-target mass, as
     # p_t - 1 rounds to 0 at p_t ~ 1
     kept = target != ignore_index
     safe_target = torch.where(
@@ -323,6 +324,9 @@ def gemm(
     # with use_quack, the fp32 accumulator CODA's epilogues read;
     # untuned, since at split_k=1 every config gives the same bits
     if not use_quack:
+        # B is the transposed view of an (N, K) weight, as nn.Linear stores
+        # it, so torch.mm runs the same cuBLAS kernel as F.linear, with no
+        # copy, in eager and compiled; torch pays no layout cost
         return torch.matmul(
             input=A,
             other=B,
@@ -402,6 +406,7 @@ def gemm_add_dual_precision(
 def gemm_sigmoid(
     A: torch.Tensor,
     B: torch.Tensor,
+    out_dtype: torch.dtype | None = None,
     use_quack: bool = False,
 ) -> torch.Tensor:
     D = gemm(
@@ -441,8 +446,6 @@ def gemm_rmsnorm_swiglu(
     layout: PairLayout,
     use_quack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # preact = (A @ B) rstd in D's dtype: a model's bf16 rounding,
-    # a no-op on the fp32 accumulator or in fp64; and postact
     D = gemm(
         A=A,
         B=B,
@@ -508,8 +511,6 @@ def gemm_rmsnorm(
     rstd: torch.Tensor,
     use_quack: bool = False,
 ) -> torch.Tensor:
-    # (A @ B) rstd, the input norm's row scale deferred, in D's dtype:
-    # a model's bf16 rounding, a no-op on the fp32 accumulator or in fp64
     D = gemm(
         A=A,
         B=B,
@@ -580,8 +581,8 @@ def gemm_residual_partial_rmsnorm_bwd(
 
 
 # ---- rope: q and k heads rotated, v passed through
-# q | k and v return apart; the angles come as a model's
-# cos and sin cache, or as positions and frequencies
+# q | k and v return apart; the angles come as cached cos
+# and sin tables, or as positions and frequencies
 
 
 def gemm_rope(
@@ -638,7 +639,7 @@ def gemm_rmsnorm_rope(
     use_quack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # rope((A @ B) rstd), the input norm deferred; z in D's dtype,
-    # a model's bf16 rounding and a no-op on fp32 or fp64; q | k and
+    # torch's bf16 rounding and a no-op on fp32 or fp64; q | k and
     # v scale apart, so compile never stores z_qk
     D = gemm(
         A=A,
@@ -734,8 +735,8 @@ def gemm_rmsnorm_qknorm_rope(
     use_quack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # the rotated output and head_mean_sq use z = rstd (A @ B) in
-    # preact's dtype (a model's bf16, a no-op on fp32 or fp64); preact
-    # is saved without rstd, and the backward rebuilds z
+    # preact's dtype (torch's bf16 rounding, a no-op on fp32 or fp64);
+    # preact is saved without rstd, and the backward rebuilds z
     preact = gemm(
         A=A,
         B=B,
@@ -1013,16 +1014,106 @@ def gemm_xsa_bwd(
 
 
 # ---- cross entropy: the LM head's loss, its gradient formed in the forward
+# the logits in logits_dtype: fp32 for torch, as CODA's epilogues read them
+# off the accumulator, and fp64 for the oracle; zdz over dlogits as CODA
+# stores them, in bf16
 
 
-def _fused_cross_entropy(
+def cross_entropy_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    ignore_index: int,
+    reduction: str,
+    logits_dtype: torch.dtype,
+) -> torch.Tensor:
+    return torch.nn.functional.cross_entropy(
+        input=logits.to(dtype=logits_dtype),
+        target=target,
+        ignore_index=ignore_index,
+        reduction=reduction,
+    )
+
+
+def gemm_lse(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    logits_dtype: torch.dtype,
+    use_quack: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # the logits A @ B and each row's lse
+    D = gemm(
+        A=A,
+        B=B,
+        use_quack=use_quack,
+    )
+    logits = D.to(dtype=logits_dtype)
+    lses = torch.logsumexp(
+        input=logits,
+        dim=-1,
+    )
+    return logits, lses
+
+
+def gemm_rmsnorm_lse(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    rstd: torch.Tensor,
+    logits_dtype: torch.dtype,
+    use_quack: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # the logits (A @ B) rstd, the final norm's scale deferred, and
+    # each row's lse
+    D = gemm(
+        A=A,
+        B=B,
+        use_quack=use_quack,
+    )
+    rstd = rearrange(rstd, "m -> m 1")
+    # TODO: check
+    scaled = D * rstd
+    logits = scaled.to(dtype=logits_dtype)
+    lses = torch.logsumexp(
+        input=logits,
+        dim=-1,
+    )
+    return logits, lses
+
+
+def gemm_lse_select_logits(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    target: torch.Tensor,
+    ignore_index: int,
+    logits_dtype: torch.dtype,
+    use_quack: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # each row's loss lse - target logit, its lse and its target
+    # logit; an ignored row's loss and logit 0
+    logits, lses = gemm_lse(
+        A=A,
+        B=B,
+        logits_dtype=logits_dtype,
+        use_quack=use_quack,
+    )
+    kept = target != ignore_index
+    rows = torch.arange(
+        A.shape[0],
+        device=A.device,
+    )
+    target_logits = logits[rows, target.clamp_min(0)] * kept
+    margins = lses - target_logits
+    return margins * kept, lses, target_logits
+
+
+def cross_entropy_fwd_bwd(
     logits: torch.Tensor,
     target: torch.Tensor,
     ignore_index: int,
     return_zdz: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    # with return_zdz, also zdz = sum(logits dlogits) for the
-    # final norm's backward
+    # with return_zdz, also zdz = sum(logits dlogits) for the final
+    # norm's backward, over dlogits rounded once to bf16, as CODA
+    # stores them and that backward reads them
     losses, dlogits = cross_entropy(
         logits=logits,
         target=target,
@@ -1030,10 +1121,38 @@ def _fused_cross_entropy(
     )
     if return_zdz:
         logits_dlogits = logits * dlogits
-        zdz = reduce(logits_dlogits, "m n -> m", "sum")
+        zdz = reduce(logits_dlogits, "m v -> m", "sum")
     else:
         zdz = None
     return losses, dlogits, zdz
+
+
+def cross_entropy_fwd_bwd_bench(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    ignore_index: int,
+    return_zdz: bool,
+    logits_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    # torch's path in bf16: the loss over the logits cast to logits_dtype,
+    # and autograd's gradient back in the logits' dtype (vjp, so it
+    # compiles to one graph); target int64
+    loss_fn = functools.partial(
+        cross_entropy_loss,
+        target=target,
+        ignore_index=ignore_index,
+        reduction="none",
+        logits_dtype=logits_dtype,
+    )
+    losses, pullback = torch.func.vjp(loss_fn, logits)
+    ones = torch.ones_like(losses)
+    (dlogits,) = pullback(ones)
+    if return_zdz:
+        row_dot_terms = logits * dlogits
+        row_dot = reduce(row_dot_terms, "m v -> m", "sum")
+    else:
+        row_dot = None
+    return losses, dlogits, row_dot
 
 
 def gemm_cross_entropy_fwd_bwd(
@@ -1041,21 +1160,45 @@ def gemm_cross_entropy_fwd_bwd(
     B: torch.Tensor,
     target: torch.Tensor,
     ignore_index: int,
+    logits_dtype: torch.dtype,
     return_zdz: bool = False,
     use_quack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    # logits = A @ B; CODA's zdz is over its rounded
-    # dlogits, so a test checks it with those as dZ
-    logits = gemm(
+    # the loss over the logits A @ B
+    D = gemm(
         A=A,
         B=B,
         use_quack=use_quack,
     )
-    return _fused_cross_entropy(
+    logits = D.to(dtype=logits_dtype)
+    return cross_entropy_fwd_bwd(
         logits=logits,
         target=target,
         ignore_index=ignore_index,
         return_zdz=return_zdz,
+    )
+
+
+def gemm_cross_entropy_fwd_bwd_bench(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    target: torch.Tensor,
+    ignore_index: int,
+    logits_dtype: torch.dtype,
+    return_zdz: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    # torch's LM head: the GEMM stores bf16 logits, then the loss over
+    # them cast to logits_dtype and autograd's gradient
+    logits = gemm(
+        A=A,
+        B=B,
+    )
+    return cross_entropy_fwd_bwd_bench(
+        logits=logits,
+        target=target,
+        ignore_index=ignore_index,
+        return_zdz=return_zdz,
+        logits_dtype=logits_dtype,
     )
 
 
@@ -1065,10 +1208,12 @@ def gemm_rmsnorm_cross_entropy_fwd_bwd(
     rstd: torch.Tensor,
     target: torch.Tensor,
     ignore_index: int,
+    logits_dtype: torch.dtype,
     return_zdz: bool = False,
     use_quack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    # logits = (A @ B) rstd, the final norm's scale deferred
+    # the loss over the logits (A @ B) rstd, the final norm's scale
+    # deferred
     D = gemm(
         A=A,
         B=B,
@@ -1076,10 +1221,36 @@ def gemm_rmsnorm_cross_entropy_fwd_bwd(
     )
     rstd = rearrange(rstd, "m -> m 1")
     # TODO: check
-    logits = D * rstd
-    return _fused_cross_entropy(
+    scaled = D * rstd
+    logits = scaled.to(dtype=logits_dtype)
+    return cross_entropy_fwd_bwd(
         logits=logits,
         target=target,
         ignore_index=ignore_index,
         return_zdz=return_zdz,
+    )
+
+
+def gemm_rmsnorm_cross_entropy_fwd_bwd_bench(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    rstd: torch.Tensor,
+    target: torch.Tensor,
+    ignore_index: int,
+    logits_dtype: torch.dtype,
+    return_zdz: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    # the logits stored in bf16, then the loss over them cast to
+    # logits_dtype and autograd's gradient
+    logits = gemm_rmsnorm(
+        A=A,
+        B=B,
+        rstd=rstd,
+    )
+    return cross_entropy_fwd_bwd_bench(
+        logits=logits,
+        target=target,
+        ignore_index=ignore_index,
+        return_zdz=return_zdz,
+        logits_dtype=logits_dtype,
     )
