@@ -6,6 +6,12 @@ from benchmarks.backends import torch_ops
 from benchmarks.utils.cases import Case, Implementation, make_oracle_fn
 from benchmarks.utils.data import Sampler, Shape
 
+# Muon's Newton-Schulz coefficients (a, b, c); bf16 cannot hold them
+# exactly, so rounding one to 16 bits shows up as error
+NS_A = 3.4445
+NS_B = -4.7750
+NS_C = 2.0315
+
 
 def gemm_symmetric(
     shape: Shape,
@@ -17,12 +23,12 @@ def gemm_symmetric(
         shape=(shape.dim, shape.ffn),
         dtype=dtype,
     )
-    # a stack of one, as Newton-Schulz calls it on stacks of matrices
-    X_stack = rearrange(
+    # a batch of one, as Newton-Schulz runs on batches of matrices
+    X_batched = rearrange(
         tensor=X,
         pattern="m k -> 1 m k",
     )
-    inputs = {"A": X_stack}
+    inputs = {"A": X_batched}
     oracle_impl = Implementation(
         fn=make_oracle_fn(
             fn=torch_ops.gemm_symmetric,
@@ -61,12 +67,12 @@ def gemm_symmetric_polynomial(
         shape=(shape.dim, shape.ffn),
         dtype=dtype,
     )
-    # a stack of one, as Newton-Schulz calls it on stacks of matrices
-    X_stack = rearrange(
+    # a batch of one, as Newton-Schulz runs on batches of matrices
+    X_batched = rearrange(
         tensor=X,
         pattern="m k -> 1 m k",
     )
-    A = gemm_functional.gemm_symmetric(A=X_stack)
+    A = gemm_functional.gemm_symmetric(A=X_batched)
     inputs = {
         "A": A,
         "B": A,
