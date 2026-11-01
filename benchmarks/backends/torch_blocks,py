@@ -1,0 +1,383 @@
+import torch
+import functools
+from einops import rearrange
+
+from benchmarks.backends import torch_ops
+
+
+def block_pre(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    wn: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    head_dim: int,
+    rope_layout: torch_ops.PairLayout,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # nn.RMSNorm, then rope with the cos and sin cache
+    normed = torch.nn.functional.rms_norm(
+        x,
+        (x.shape[-1],),
+        weight=wn,
+        eps=eps,
+    )
+    qkv = torch.nn.functional.linear(
+        input=normed,
+        weight=w,
+    )
+    width = qkv.shape[-1] // 3
+    # q and k are neighbouring columns of qkv, so qk is a view, not a copy
+    qk, v = torch.split(qkv, (2 * width, width), dim=-1)
+    rotated_qk = torch_ops.rope(
+        x=qk,
+        cos=cos,
+        sin=sin,
+        layout=rope_layout,
+        head_dim=head_dim,
+    )
+    return x, rotated_qk, v
+
+
+def block(
+    x0: torch.Tensor,
+    y0: torch.Tensor,
+    w0: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w3: torch.Tensor,
+    wn0: torch.Tensor,
+    wn1: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    head_dim: int,
+    rope_layout: torch_ops.PairLayout,
+    swiglu_layout: torch_ops.PairLayout,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # nn.RMSNorm, then rope with the cos and sin cache
+    attention_out = torch.nn.functional.linear(
+        input=y0,
+        weight=w0,
+    )
+    x1 = x0 + attention_out
+    normed = torch.nn.functional.rms_norm(
+        x1,
+        (x1.shape[-1],),
+        weight=wn0,
+        eps=eps,
+    )
+    preact = torch.nn.functional.linear(
+        input=normed,
+        weight=w1,
+    )
+    postact = torch_ops.swiglu(
+        preact=preact,
+        layout=swiglu_layout,
+    )
+    mlp_out = torch.nn.functional.linear(
+        input=postact,
+        weight=w2,
+    )
+    x2 = x1 + mlp_out
+    qkv_input = torch.nn.functional.rms_norm(
+        x2,
+        (x2.shape[-1],),
+        weight=wn1,
+        eps=eps,
+    )
+    qkv = torch.nn.functional.linear(
+        input=qkv_input,
+        weight=w3,
+    )
+    width = qkv.shape[-1] // 3
+    # q and k are neighbouring columns of qkv, so qk is a view, not a copy
+    qk, v = torch.split(qkv, (2 * width, width), dim=-1)
+    rotated_qk = torch_ops.rope(
+        x=qk,
+        cos=cos,
+        sin=sin,
+        layout=rope_layout,
+        head_dim=head_dim,
+    )
+    return x2, rotated_qk, v
+
+
+def block_post(
+    x0: torch.Tensor,
+    y0: torch.Tensor,
+    w0: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w3: torch.Tensor,
+    wn0: torch.Tensor,
+    wn1: torch.Tensor,
+    targets: torch.Tensor,
+    swiglu_layout: torch_ops.PairLayout,
+    eps: float,
+    logits_dtype: torch.dtype,
+    ignore_index: int = -100,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    # nn.RMSNorm, then the loss over the logits cast to logits_dtype
+    attention_out = torch.nn.functional.linear(
+        input=y0,
+        weight=w0,
+    )
+    x1 = x0 + attention_out
+    normed = torch.nn.functional.rms_norm(
+        x1,
+        (x1.shape[-1],),
+        weight=wn0,
+        eps=eps,
+    )
+    preact = torch.nn.functional.linear(
+        input=normed,
+        weight=w1,
+    )
+    postact = torch_ops.swiglu(
+        preact=preact,
+        layout=swiglu_layout,
+    )
+    mlp_out = torch.nn.functional.linear(
+        input=postact,
+        weight=w2,
+    )
+    x2 = x1 + mlp_out
+    head_input = torch.nn.functional.rms_norm(
+        x2,
+        (x2.shape[-1],),
+        weight=wn1,
+        eps=eps,
+    )
+    logits = torch.nn.functional.linear(
+        input=head_input,
+        weight=w3,
+    )
+    # one row of logits per token, the batch flattened as TorchTitan's loss flattens it
+    logits_flat = rearrange(logits, "... v -> (...) v")
+    targets_flat = rearrange(targets, "... -> (...)")
+    return torch_ops.cross_entropy_loss(
+        logits=logits_flat,
+        target=targets_flat,
+        ignore_index=ignore_index,
+        reduction=reduction,
+        logits_dtype=logits_dtype,
+    )
+
+
+def _qknorm_rope(
+    qk: torch.Tensor,
+    gamma: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    head_dim: int,
+    rope_layout: torch_ops.PairLayout,
+    eps: float,
+) -> torch.Tensor:
+    # an nn.RMSNorm over each q and k head, then rope with the cos and sin cache
+    half = qk.shape[-1] // 2
+    q, k = torch.split(qk, (half, half), dim=-1)
+    q_heads = rearrange(q, "... (h d) -> ... h d", d=head_dim)
+    k_heads = rearrange(k, "... (h d) -> ... h d", d=head_dim)
+    normed_q = torch.nn.functional.rms_norm(
+        q_heads,
+        (head_dim,),
+        weight=gamma_q,
+        eps=eps,
+    )
+    normed_k = torch.nn.functional.rms_norm(
+        k_heads,
+        (head_dim,),
+        weight=gamma_k,
+        eps=eps,
+    )
+    normed_heads = torch.stack((normed_q, normed_k))
+    normed = rearrange(normed_heads, "two ... h d -> ... (two h d)")
+    return torch_ops.rope(
+        x=normed,
+        cos=cos,
+        sin=sin,
+        layout=rope_layout,
+        head_dim=head_dim,
+    )
+
+
+def transformer_block_pre(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    wn: torch.Tensor,
+    wn2: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    head_dim: int,
+    rope_layout: torch_ops.PairLayout,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # nn.RMSNorm, per-head q and k norms, then rope with the cos and sin cache
+    normed = torch.nn.functional.rms_norm(
+        x,
+        (x.shape[-1],),
+        weight=wn,
+        eps=eps,
+    )
+    qkv = torch.nn.functional.linear(
+        input=normed,
+        weight=w,
+    )
+    width = qkv.shape[-1] // 3
+    # q and k are neighbouring columns of qkv, so qk is a view, not a copy
+    qk, v = torch.split(qkv, (2 * width, width), dim=-1)
+    rotated_qk = _qknorm_rope(
+        qk=qk,
+        gamma=wn2,
+        cos=cos,
+        sin=sin,
+        rope_layout=rope_layout,
+        head_dim=head_dim,
+        eps=eps,
+    )
+    return x, rotated_qk, v
+
+
+def transformer_block(
+    x0: torch.Tensor,
+    o0: torch.Tensor,
+    v0: torch.Tensor,
+    w0: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w3: torch.Tensor,
+    wn0: torch.Tensor,
+    wn1: torch.Tensor,
+    wn2: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    head_dim: int,
+    rope_layout: torch_ops.PairLayout,
+    swiglu_layout: torch_ops.PairLayout,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # xsa_fwd, nn.RMSNorm, per-head q and k norms, then rope with the cos and sin cache
+    xsa_out = torch_ops.xsa_fwd(
+        x=o0,
+        v=v0,
+        head_dim=head_dim,
+    )
+    attention_out = torch.nn.functional.linear(
+        input=xsa_out,
+        weight=w0,
+    )
+    x1 = x0 + attention_out
+    normed = torch.nn.functional.rms_norm(
+        x1,
+        (x1.shape[-1],),
+        weight=wn0,
+        eps=eps,
+    )
+    preact = torch.nn.functional.linear(
+        input=normed,
+        weight=w1,
+    )
+    postact = torch_ops.swiglu(
+        preact=preact,
+        layout=swiglu_layout,
+    )
+    mlp_out = torch.nn.functional.linear(
+        input=postact,
+        weight=w2,
+    )
+    x2 = x1 + mlp_out
+    qkv_input = torch.nn.functional.rms_norm(
+        x2,
+        (x2.shape[-1],),
+        weight=wn1,
+        eps=eps,
+    )
+    qkv = torch.nn.functional.linear(
+        input=qkv_input,
+        weight=w3,
+    )
+    width = qkv.shape[-1] // 3
+    # q and k are neighbouring columns of qkv, so qk is a view, not a copy
+    qk, v = torch.split(qkv, (2 * width, width), dim=-1)
+    rotated_qk = _qknorm_rope(
+        qk=qk,
+        gamma=wn2,
+        cos=cos,
+        sin=sin,
+        rope_layout=rope_layout,
+        head_dim=head_dim,
+        eps=eps,
+    )
+    return x2, rotated_qk, v
+
+
+def transformer_block_post(
+    x0: torch.Tensor,
+    o0: torch.Tensor,
+    v0: torch.Tensor,
+    w0: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w3: torch.Tensor,
+    wn0: torch.Tensor,
+    wn1: torch.Tensor,
+    targets: torch.Tensor,
+    head_dim: int,
+    swiglu_layout: torch_ops.PairLayout,
+    eps: float,
+    logits_dtype: torch.dtype,
+    ignore_index: int = -100,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    # xsa_fwd, nn.RMSNorm, then the loss over the logits cast to logits_dtype
+    xsa_out = torch_ops.xsa_fwd(
+        x=o0,
+        v=v0,
+        head_dim=head_dim,
+    )
+    attention_out = torch.nn.functional.linear(
+        input=xsa_out,
+        weight=w0,
+    )
+    x1 = x0 + attention_out
+    normed = torch.nn.functional.rms_norm(
+        x1,
+        (x1.shape[-1],),
+        weight=wn0,
+        eps=eps,
+    )
+    preact = torch.nn.functional.linear(
+        input=normed,
+        weight=w1,
+    )
+    postact = torch_ops.swiglu(
+        preact=preact,
+        layout=swiglu_layout,
+    )
+    mlp_out = torch.nn.functional.linear(
+        input=postact,
+        weight=w2,
+    )
+    x2 = x1 + mlp_out
+    head_input = torch.nn.functional.rms_norm(
+        x2,
+        (x2.shape[-1],),
+        weight=wn1,
+        eps=eps,
+    )
+    logits = torch.nn.functional.linear(
+        input=head_input,
+        weight=w3,
+    )
+    # one row of logits per token, the batch flattened as TorchTitan's loss flattens it
+    logits_flat = rearrange(logits, "... v -> (...) v")
+    targets_flat = rearrange(targets, "... -> (...)")
+    return torch_ops.cross_entropy_loss(
+        logits=logits_flat,
+        target=targets_flat,
+        ignore_index=ignore_index,
+        reduction=reduction,
+        logits_dtype=logits_dtype,
+    )
