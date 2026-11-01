@@ -130,7 +130,7 @@ def gemm_rope(
     A = samples_linear["A"]
     B = samples_linear["B"]
     positions = samples_rope["positions"]
-    frequencies = samples_rope["frequencies"]
+    frequencies = samples_rope["frequencies_qkv"]
     interleaved = {
         "A": A,
         "B": B,
@@ -256,7 +256,7 @@ def gemm_rmsnorm_rope(
     B = samples_linear["B"]
     rstd = samples_rmsnorm["rstd"]
     positions = samples_rope["positions"]
-    frequencies = samples_rope["frequencies"]
+    frequencies = samples_rope["frequencies_qkv"]
     interleaved = {
         "A": A,
         "B": B,
@@ -378,7 +378,7 @@ def rope_bwd_zdz(
         dtype=dtype,
     )
     positions = samples_rope["positions"]
-    frequencies = samples_rope["frequencies"]
+    frequencies = samples_rope["frequencies_qkv"]
     # zdz, the row dot product of z and its gradient, is scaled by 1 / dim
     # as the input norm's backward uses it
     scale = 1.0 / shape.dim
@@ -495,7 +495,7 @@ def gemm_qknorm_rope(
 ) -> Case:
     sampler = Sampler(seed=seed)
     samples_rope = operands.rope_operands(shape=shape)
-    size_qk = 2 * samples_rope["size_q"]
+    size_qk = samples_rope["size_q"] + samples_rope["size_k"]
     samples_linear = operands.linear_operands(
         shape=shape,
         out_features=size_qk,
@@ -628,6 +628,7 @@ def gemm_rmsnorm_qknorm_rope(
 ) -> Case:
     sampler = Sampler(seed=seed)
     samples_rope = operands.rope_operands(shape=shape)
+    size_qk = samples_rope["size_q"] + samples_rope["size_k"]
     samples_linear = operands.linear_operands(
         shape=shape,
         out_features=size_qk,
@@ -773,6 +774,7 @@ def qknorm_rope_bwd(
     sampler = Sampler(seed=seed)
     samples_rope = operands.rope_operands(shape=shape)
     size_q = samples_rope["size_q"]
+    size_k = samples_rope["size_k"]
     samples_qknorm = operands.qknorm_bwd_operands(
         shape=shape,
         rmsnorm=False,
@@ -785,6 +787,7 @@ def qknorm_rope_bwd(
     # dq and dk, the gradients attention's backward hands back, drawn as
     # one cotangent for the rotated q and k heads and then split into two
     # separate tensors, as attention returns them
+    size_qk = size_q + size_k
     random = sampler.randn(
         shape=(shape.tokens, size_qk),
         dtype=dtype,
@@ -800,8 +803,7 @@ def qknorm_rope_bwd(
     dq = cotangent[:, :size_q].contiguous()
     dk = cotangent[:, size_q:].contiguous()
     positions = samples_rope["positions"]
-    frequencies_qkv = samples_rope["frequencies"]
-    frequencies = frequencies_qkv[:size_qk]
+    frequencies = samples_rope["frequencies_qk"]
     interleaved = {
         "dq": dq,
         "dk": dk,
