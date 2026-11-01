@@ -7,15 +7,13 @@ from benchmarks.utils import operands
 from benchmarks.utils.cases import Case, Implementation, make_oracle_fn
 from benchmarks.utils.data import Sampler, Shape
 
-# Muon's Newton-Schulz coefficients (a, b, c), from the original Muon
-# (github.com/KellerJordan/Muon, zeropower_via_newtonschulz5) and the
-# defaults of torch.optim.Muon; bf16 cannot hold them exactly, so
-# rounding one to 16 bits shows up as error
+# Muon's Newton-Schulz coefficients (a, b, c), as in the original Muon
+# (github.com/KellerJordan/Muon) and torch.optim.Muon's defaults
 NS_A = 3.4445
 NS_B = -4.7750
 NS_C = 2.0315
-# X is Muon's iterate after this many Newton-Schulz steps, the one its
-# fourth step works on
+# X is the matrix Muon's fourth Newton-Schulz step works on, made by
+# running the first three
 X_STEPS = 3
 
 
@@ -29,7 +27,7 @@ def gemm_symmetric(
         shape=(shape.dim, shape.ffn),
         dtype=dtype,
     )
-    # a batch of one, as Newton-Schulz runs on batches of matrices
+    # a batch of one matrix, as the op takes batches
     X_batched = rearrange(
         tensor=X,
         pattern="m k -> 1 m k",
@@ -73,11 +71,12 @@ def gemm_symmetric_polynomial(
         shape=(shape.dim, shape.ffn),
         dtype=dtype,
     )
-    # a batch of one, as Newton-Schulz runs on batches of matrices
+    # a batch of one matrix, as the op takes batches
     X_batched = rearrange(
         tensor=X,
         pattern="m k -> 1 m k",
     )
+    # the Gram matrix G = X X^T, from which the op forms b G + c G G
     A = gemm_functional.gemm_symmetric(A=X_batched)
     inputs = {
         "A": A,
@@ -123,6 +122,33 @@ def gemm_add_dual_precision(
     seed: int,
     dtype: torch.dtype,
 ) -> Case:
+    sampler = Sampler(seed=seed)
+    weight = sampler.weight(
+        shape=(shape.dim, shape.ffn),
+        dtype=torch.float32,
+    )
+    iterate = operands.muon_iterate(
+        weight=weight,
+        steps=X_STEPS,
+        coefficients=(NS_A, NS_B, NS_C),
+    )
+    # the step's polynomial P = b G + c G G with G = X X^T, from the fp64
+    # iterate
+    gram = torch.mm(
+        input=iterate,
+        mat2=iterate.mT,
+    )
+    gram_squared = torch.mm(
+        input=gram,
+        mat2=gram,
+    )
+    polynomial = NS_B * gram + NS_C * gram_squared
+    X = iterate.to(dtype=torch.float32)
+    # the op computes a X + P X: P and X enter the GEMM in dtype, and X is
+    # added in fp32
+    A = polynomial.to(dtype=dtype)
+    B = X.to(dtype=dtype)
+    # batches of one matrix, as the op takes batches
     A_batched = rearrange(
         tensor=A,
         pattern="m k -> 1 m k",
