@@ -1,10 +1,8 @@
 import torch
-import functools
 from coda.core.elementwise import functional as elementwise_functional
 from coda.core.gemm import functional as gemm_functional
 from coda.kernels.functional import cross_entropy as cross_entropy_functional
 
-from benchmarks.backends import torch_composites
 from benchmarks.backends import torch_ops
 from benchmarks.utils import data
 from benchmarks.utils import operands
@@ -165,27 +163,6 @@ def gemm_lse_select_logits(
     )
 
 
-def coda_cross_entropy_fwd_bwd(
-    logits: torch.Tensor,
-    lses: torch.Tensor,
-    target: torch.Tensor,
-    ignore_index: int,
-    dlogits: torch.Tensor,
-    return_zdz: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    # CODA writes the logits gradient into the buffer it is given; return
-    # that buffer between the losses and zdz, in the order torch returns them
-    losses, zdz = elementwise_functional.cross_entropy_fwd_bwd(
-        logits=logits,
-        lses=lses,
-        target=target,
-        ignore_index=ignore_index,
-        dlogits=dlogits,
-        return_zdz=return_zdz,
-    )
-    return losses, dlogits, zdz
-
-
 def cross_entropy_fwd_bwd(
     shape: Shape,
     seed: int,
@@ -220,6 +197,7 @@ def cross_entropy_fwd_bwd(
         "lses": lses,
         "target": target_int32,
         "ignore_index": data.IGNORE_INDEX,
+        "dlogits_dtype": dtype,
         "return_zdz": True,
     }
     torch_inputs = {
@@ -245,7 +223,7 @@ def cross_entropy_fwd_bwd(
     return Case(
         implementations={
             "coda": Implementation(
-                fn=coda_cross_entropy_fwd_bwd,
+                fn=elementwise_functional.cross_entropy_fwd_bwd,
                 inputs=coda_inputs,
             ),
             "torch": Implementation(
@@ -437,5 +415,4 @@ OPS = {
     "gemm_cross_entropy_fwd_bwd": gemm_cross_entropy_fwd_bwd,
     "gemm_rmsnorm_cross_entropy_fwd_bwd": gemm_rmsnorm_cross_entropy_fwd_bwd,
     "gemm_scalar_scale_lm_head": gemm_scalar_scale_lm_head,
-    "linear_cross_entropy_forward": linear_cross_entropy_forward,
 }
