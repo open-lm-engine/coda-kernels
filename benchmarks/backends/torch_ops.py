@@ -284,9 +284,9 @@ def cross_entropy(
     # dlogits = softmax - onehot, rows with target == ignore_index
     # zeroed; the target op is minus the off-target mass, as
     # p_t - 1 rounds to 0 at p_t ~ 1
-    kept = target != ignore_index
+    non_ignored = target != ignore_index
     safe_target = torch.where(
-        condition=kept,
+        condition=non_ignored,
         input=target,
         other=0,
     )
@@ -300,13 +300,13 @@ def cross_entropy(
     dlogits_target = -off_target_mass
     dlogits[row_index, safe_target] = dlogits_target
     losses = torch.where(
-        condition=kept,
+        condition=non_ignored,
         input=losses,
         other=0,
     )
-    kept = rearrange(kept, "m -> m 1")
+    non_ignored = rearrange(non_ignored, "m -> m 1")
     dlogits = torch.where(
-        condition=kept,
+        condition=non_ignored,
         input=dlogits,
         other=0,
     )
@@ -325,8 +325,8 @@ def gemm(
     # untuned, since at split_k=1 every config gives the same bits
     if not use_quack:
         # B is the transposed view of an (N, K) weight, as nn.Linear stores
-        # it, so torch.mm runs the same cuBLAS kernel as F.linear, with no
-        # copy, in eager and compiled; torch pays no layout cost
+        # it, so torch.matmul runs the same cuBLAS kernel as F.linear, with
+        # no copy, in eager and compiled; torch pays no layout cost
         return torch.matmul(
             input=A,
             other=B,
@@ -374,7 +374,6 @@ def gemm_scalar_scale(
     use_quack: bool = False,
 ) -> torch.Tensor:
     # alpha: a 0-d fp32 device tensor, so a bf16 product stays bf16
-    # TODO: check
     D = gemm(
         A=A,
         B=B,
@@ -446,6 +445,8 @@ def gemm_rmsnorm_swiglu(
     layout: PairLayout,
     use_quack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # preact = (A @ B) * rstd, and postact = swiglu(preact)
+    # rstd is fp32, so the product is cast back to the GEMM output's dtype
     D = gemm(
         A=A,
         B=B,
@@ -511,13 +512,14 @@ def gemm_rmsnorm(
     rstd: torch.Tensor,
     use_quack: bool = False,
 ) -> torch.Tensor:
+    # (A @ B) * rstd: the input norm's row scale, applied after the GEMM
+    # rstd is fp32, so the product is cast back to the GEMM output's dtype
     D = gemm(
         A=A,
         B=B,
         use_quack=use_quack,
     )
     rstd = rearrange(rstd, "m -> m 1")
-    # TODO: check
     scaled = D * rstd
     return scaled.to(dtype=D.dtype)
 
@@ -638,9 +640,10 @@ def gemm_rmsnorm_rope(
     layout: PairLayout,
     use_quack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # rope((A @ B) rstd), the input norm deferred; z in D's dtype,
-    # torch's bf16 rounding and a no-op on fp32 or fp64; q | k and
-    # v scale apart, so compile never stores z_qk
+    # rope((A @ B) * rstd): the input norm's row scale, applied after the GEMM
+    # rstd is fp32, so the product is cast back to the GEMM output's dtype
+    # q | k and v are scaled separately, so that compiled, the scaled q | k
+    # goes straight into rope without being stored
     D = gemm(
         A=A,
         B=B,
@@ -734,9 +737,9 @@ def gemm_rmsnorm_qknorm_rope(
     layout: PairLayout,
     use_quack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # the rotated output and head_mean_sq use z = rstd (A @ B) in
-    # preact's dtype (torch's bf16 rounding, a no-op on fp32 or fp64);
-    # preact is saved without rstd, and the backward rebuilds z
+    # the rotated output and head_mean_sq use z = (A @ B) * rstd
+    # rstd is fp32, so z is cast back to preact's dtype
+    # preact is saved without rstd, and the backward rebuilds z from it
     preact = gemm(
         A=A,
         B=B,
@@ -1026,6 +1029,8 @@ def cross_entropy_loss(
     reduction: str,
     logits_dtype: torch.dtype,
 ) -> torch.Tensor:
+    # the loss over the logits cast to logits_dtype, as in TorchTitan's
+    # cross_entropy_loss (torchtitan/components/loss.py)
     return torch.nn.functional.cross_entropy(
         input=logits.to(dtype=logits_dtype),
         target=target,
@@ -1095,14 +1100,14 @@ def gemm_lse_select_logits(
         logits_dtype=logits_dtype,
         use_quack=use_quack,
     )
-    kept = target != ignore_index
+    non_ignored = target != ignore_index
     rows = torch.arange(
         A.shape[0],
         device=A.device,
     )
-    target_logits = logits[rows, target.clamp_min(0)] * kept
+    target_logits = logits[rows, target.clamp_min(0)] * non_ignored
     margins = lses - target_logits
-    return margins * kept, lses, target_logits
+    return margins * non_ignored, lses, target_logits
 
 
 def cross_entropy_fwd_bwd(
@@ -1111,9 +1116,8 @@ def cross_entropy_fwd_bwd(
     ignore_index: int,
     return_zdz: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    # with return_zdz, also zdz = sum(logits dlogits) for the final
-    # norm's backward, over dlogits rounded once to bf16, as CODA
-    # stores them and that backward reads them
+    # with return_zdz, also zdz: each row's sum of logits * dlogits, which
+    # the final norm's backward needs
     losses, dlogits = cross_entropy(
         logits=logits,
         target=target,
@@ -1161,7 +1165,7 @@ def gemm_cross_entropy_fwd_bwd(
     target: torch.Tensor,
     ignore_index: int,
     logits_dtype: torch.dtype,
-    return_zdz: bool = False,
+    return_zdz: bool,
     use_quack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     # the loss over the logits A @ B
@@ -1185,7 +1189,7 @@ def gemm_cross_entropy_fwd_bwd_bench(
     target: torch.Tensor,
     ignore_index: int,
     logits_dtype: torch.dtype,
-    return_zdz: bool = False,
+    return_zdz: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     # torch's LM head: the GEMM stores bf16 logits, then the loss over
     # them cast to logits_dtype and autograd's gradient
@@ -1209,7 +1213,7 @@ def gemm_rmsnorm_cross_entropy_fwd_bwd(
     target: torch.Tensor,
     ignore_index: int,
     logits_dtype: torch.dtype,
-    return_zdz: bool = False,
+    return_zdz: bool,
     use_quack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     # the loss over the logits (A @ B) rstd, the final norm's scale
@@ -1238,7 +1242,7 @@ def gemm_rmsnorm_cross_entropy_fwd_bwd_bench(
     target: torch.Tensor,
     ignore_index: int,
     logits_dtype: torch.dtype,
-    return_zdz: bool = False,
+    return_zdz: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     # the logits stored in bf16, then the loss over them cast to
     # logits_dtype and autograd's gradient
