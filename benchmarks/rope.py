@@ -144,7 +144,7 @@ def gemm_rope(
         "layout": PairLayout.interleaved,
     }
     split = interleaved.copy()
-    split["B"] = operands.split_weight(
+    split["B"] = operands.split_rope_weight(
         B=B,
         size_qk=size_qk,
         head_dim=shape.head_dim,
@@ -271,7 +271,7 @@ def gemm_rmsnorm_rope(
         "layout": PairLayout.interleaved,
     }
     split = interleaved.copy()
-    split["B"] = operands.split_weight(
+    split["B"] = operands.split_rope_weight(
         B=B,
         size_qk=size_qk,
         head_dim=shape.head_dim,
@@ -524,7 +524,7 @@ def gemm_qknorm_rope(
         "layout": PairLayout.interleaved,
     }
     split = interleaved.copy()
-    split["B"] = operands.split_weight(
+    split["B"] = operands.split_rope_weight(
         B=B,
         size_qk=size_qk,
         head_dim=shape.head_dim,
@@ -666,7 +666,7 @@ def gemm_rmsnorm_qknorm_rope(
         "layout": PairLayout.interleaved,
     }
     split = interleaved.copy()
-    split["B"] = operands.split_weight(
+    split["B"] = operands.split_rope_weight(
         B=B,
         size_qk=size_qk,
         head_dim=shape.head_dim,
