@@ -1,8 +1,219 @@
 import torch
-import functools
 from einops import rearrange
 
 from benchmarks.backends import torch_ops
+
+
+def _gemm_residual_rmsnorm(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    w0: torch.Tensor,
+    wn: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # the residual stream x + y @ w0^T, and its norm
+    linear_out = torch.nn.functional.linear(
+        input=y,
+        weight=w0,
+    )
+    residual = x + linear_out
+    normed = torch.nn.functional.rms_norm(
+        residual,
+        (residual.shape[-1],),
+        weight=wn,
+        eps=eps,
+    )
+    return residual, normed
+
+
+def _qknorm_rope(
+    qk: torch.Tensor,
+    gamma_q: torch.Tensor,
+    gamma_k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    head_dim: int,
+    rope_layout: torch_ops.PairLayout,
+    eps: float,
+) -> torch.Tensor:
+    # an nn.RMSNorm over each q and k head, then rope with the cos and sin cache
+    half = qk.shape[-1] // 2
+    q, k = torch.split(qk, (half, half), dim=-1)
+    q_heads = rearrange(q, "... (h d) -> ... h d", d=head_dim)
+    k_heads = rearrange(k, "... (h d) -> ... h d", d=head_dim)
+    normed_q = torch.nn.functional.rms_norm(
+        q_heads,
+        (head_dim,),
+        weight=gamma_q,
+        eps=eps,
+    )
+    normed_k = torch.nn.functional.rms_norm(
+        k_heads,
+        (head_dim,),
+        weight=gamma_k,
+        eps=eps,
+    )
+    normed = rearrange(normed_heads, "two ... h d -> ... (two h d)")
+    return torch_ops.rope(
+        x=normed,
+        cos=cos,
+        sin=sin,
+        layout=rope_layout,
+        head_dim=head_dim,
+    )
+
+
+def gemm_residual_rmsnorm_gemm(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    w0: torch.Tensor,
+    w1: torch.Tensor,
+    wn: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # the next projection with no epilogue
+    residual, normed = _gemm_residual_rmsnorm(
+        x=x,
+        y=y,
+        w0=w0,
+        wn=wn,
+        eps=eps,
+    )
+    out = torch.nn.functional.linear(
+        input=normed,
+        weight=w1,
+    )
+    return residual, out
+
+
+def gemm_residual_rmsnorm_gemm_swiglu(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    w0: torch.Tensor,
+    w1: torch.Tensor,
+    wn: torch.Tensor,
+    eps: float,
+    layout: torch_ops.PairLayout,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # the MLP's gate and up projection, w1's rows interleaved or split
+    residual, normed = _gemm_residual_rmsnorm(
+        x=x,
+        y=y,
+        w0=w0,
+        wn=wn,
+        eps=eps,
+    )
+    preact, postact = torch_ops.gemm_swiglu(
+        A=normed,
+        B=w1.mT,
+        layout=layout,
+    )
+    return residual, preact, postact
+
+
+def gemm_residual_rmsnorm_gemm_rope(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    w0: torch.Tensor,
+    w1: torch.Tensor,
+    wn: torch.Tensor,
+    cos: torch.Tensor | None,
+    sin: torch.Tensor | None,
+    positions: torch.Tensor | None,
+    frequencies: torch.Tensor | None,
+    size_q: int,
+    size_k: int,
+    size_v: int,
+    head_dim: int,
+    eps: float,
+    layout: torch_ops.PairLayout,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # the [q | k | v] projection, q and k rotated
+    residual, normed = _gemm_residual_rmsnorm(
+        x=x,
+        y=y,
+        w0=w0,
+        wn=wn,
+        eps=eps,
+    )
+    return residual, qk, v
+
+
+def gemm_residual_rmsnorm_gemm_qknorm_rope(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    w0: torch.Tensor,
+    w1: torch.Tensor,
+    wn: torch.Tensor,
+    gamma_q: torch.Tensor,
+    gamma_k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    head_dim: int,
+    eps: float,
+    layout: torch_ops.PairLayout,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # the [q | k | v] projection as transformer_block runs it: one
+    # GEMM, then q and k normed per head by gamma_q and gamma_k (nn.RMSNorm, fp32
+    # statistics at 16 bits) and rotated with the cos and sin cache, v as
+    # the GEMM left it
+    residual, normed = _gemm_residual_rmsnorm(
+        x=x,
+        y=y,
+        w0=w0,
+        wn=wn,
+        eps=eps,
+    )
+    qkv = torch.nn.functional.linear(
+        input=normed,
+        weight=w1,
+    )
+    # MHA: q, k and v equally wide; [q | k] and v are views of qkv, so
+    # no copy joins q and k
+    width = qkv.shape[1] // 3
+    qk, v = torch.split(qkv, (2 * width, width), dim=1)
+    rotated_qk = _qknorm_rope(
+        qk=qk,
+        gamma_q=gamma_q,
+        gamma_k=gamma_k,
+        cos=cos,
+        sin=sin,
+        head_dim=head_dim,
+        rope_layout=layout,
+        eps=eps,
+    )
+    return residual, rotated_qk, v
+
+
+def gemm_residual_rmsnorm_gemm_cross_entropy_fwd_bwd(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    w0: torch.Tensor,
+    w1: torch.Tensor,
+    wn: torch.Tensor,
+    target: torch.Tensor,
+    ignore_index: int,
+    eps: float,
+    logits_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # the final norm, then torch's LM head and its loss; no row dot, which
+    # torch's own path never forms
+    residual, normed = _gemm_residual_rmsnorm(
+        x=x,
+        y=y,
+        w0=w0,
+        wn=wn,
+        eps=eps,
+    )
+    losses, dlogits, _ = torch_ops.gemm_cross_entropy_fwd_bwd_bench(
+        A=normed,
+        B=w1.mT,
+        target=target,
+        ignore_index=ignore_index,
+        logits_dtype=logits_dtype,
+        return_zdz=False,
+    )
+    return residual, losses, dlogits
 
 
 def block_pre(
@@ -155,8 +366,8 @@ def block_post(
         weight=w3,
     )
     # one row of logits per token, the batch flattened as TorchTitan's loss flattens it
-    logits_flat = rearrange(logits, "... v -> (...) v")
-    targets_flat = rearrange(targets, "... -> (...)")
+    logits_flat = rearrange(logits, "b t v -> (b t) v")
+    targets_flat = rearrange(targets, "b t -> (b t)")
     return torch_ops.cross_entropy_loss(
         logits=logits_flat,
         target=targets_flat,
@@ -166,48 +377,12 @@ def block_post(
     )
 
 
-def _qknorm_rope(
-    qk: torch.Tensor,
-    gamma: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    head_dim: int,
-    rope_layout: torch_ops.PairLayout,
-    eps: float,
-) -> torch.Tensor:
-    # an nn.RMSNorm over each q and k head, then rope with the cos and sin cache
-    half = qk.shape[-1] // 2
-    q, k = torch.split(qk, (half, half), dim=-1)
-    q_heads = rearrange(q, "... (h d) -> ... h d", d=head_dim)
-    k_heads = rearrange(k, "... (h d) -> ... h d", d=head_dim)
-    normed_q = torch.nn.functional.rms_norm(
-        q_heads,
-        (head_dim,),
-        weight=gamma_q,
-        eps=eps,
-    )
-    normed_k = torch.nn.functional.rms_norm(
-        k_heads,
-        (head_dim,),
-        weight=gamma_k,
-        eps=eps,
-    )
-    normed_heads = torch.stack((normed_q, normed_k))
-    normed = rearrange(normed_heads, "two ... h d -> ... (two h d)")
-    return torch_ops.rope(
-        x=normed,
-        cos=cos,
-        sin=sin,
-        layout=rope_layout,
-        head_dim=head_dim,
-    )
-
-
 def transformer_block_pre(
     x: torch.Tensor,
     w: torch.Tensor,
     wn: torch.Tensor,
-    wn2: torch.Tensor,
+    wn2_q: torch.Tensor,
+    wn2_k: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
     head_dim: int,
@@ -230,7 +405,8 @@ def transformer_block_pre(
     qk, v = torch.split(qkv, (2 * width, width), dim=-1)
     rotated_qk = _qknorm_rope(
         qk=qk,
-        gamma=wn2,
+        gamma_q=wn2_q,
+        gamma_k=wn2_k,
         cos=cos,
         sin=sin,
         rope_layout=rope_layout,
@@ -250,7 +426,8 @@ def transformer_block(
     w3: torch.Tensor,
     wn0: torch.Tensor,
     wn1: torch.Tensor,
-    wn2: torch.Tensor,
+    wn2_q: torch.Tensor,
+    wn2_k: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
     head_dim: int,
@@ -303,7 +480,8 @@ def transformer_block(
     qk, v = torch.split(qkv, (2 * width, width), dim=-1)
     rotated_qk = _qknorm_rope(
         qk=qk,
-        gamma=wn2,
+        gamma_q=wn2_q,
+        gamma_k=wn2_k,
         cos=cos,
         sin=sin,
         rope_layout=rope_layout,
@@ -372,8 +550,8 @@ def transformer_block_post(
         weight=w3,
     )
     # one row of logits per token, the batch flattened as TorchTitan's loss flattens it
-    logits_flat = rearrange(logits, "... v -> (...) v")
-    targets_flat = rearrange(targets, "... -> (...)")
+    logits_flat = rearrange(logits, "b t v -> (b t) v")
+    targets_flat = rearrange(targets, "b t -> (b t)")
     return torch_ops.cross_entropy_loss(
         logits=logits_flat,
         target=targets_flat,
