@@ -82,23 +82,23 @@ def gemm_rmsnorm(
     dtype: torch.dtype,
 ) -> Case:
     sampler = Sampler(seed=seed)
-    samples = operands.linear_operands(
+    samples_linear = operands.linear_operands(
         shape=shape,
         out_features=shape.dim,
         sampler=sampler,
         dtype=dtype,
     )
     # rescale A to the size a real norm input has, and compute its rstd
-    norm = operands.rmsnorm_operands(
+    samples_rmsnorm = operands.rmsnorm_operands(
         shape=shape,
-        x=samples["A"],
+        x=samples_linear["A"],
         rstd_nominal=shape.statistics.rstd,
         sampler=sampler,
         dtype=dtype,
     )
-    A = norm["A"]
-    B = samples["B"]
-    rstd = norm["rstd"]
+    A = samples_rmsnorm["A"]
+    B = samples_linear["B"]
+    rstd = samples_rmsnorm["rstd"]
     inputs = {
         "A": A,
         "B": B,
@@ -154,7 +154,7 @@ def gemm_residual_partial_rmsnorm(
         shape=(shape.tokens, shape.dim),
         dtype=torch.float32,
     )
-    gamma = sampler.norm_weight(
+    gamma = sampler.gamma(
         size=shape.dim,
         dtype=dtype,
     )
@@ -220,7 +220,7 @@ def gemm_residual_partial_rmsnorm_bwd(
         shape=(shape.tokens, shape.dim),
         dtype=dtype,
     )
-    gamma = sampler.norm_weight(
+    gamma = sampler.gamma(
         size=shape.dim,
         dtype=dtype,
     )
@@ -385,22 +385,22 @@ def gemm_rmsnorm_swiglu(
     dtype: torch.dtype,
 ) -> Case:
     sampler = Sampler(seed=seed)
-    samples = operands.linear_operands(
+    samples_linear = operands.linear_operands(
         shape=shape,
         out_features=2 * shape.ffn,
         sampler=sampler,
         dtype=dtype,
     )
-    norm = operands.rmsnorm_operands(
+    samples_rmsnorm = operands.rmsnorm_operands(
         shape=shape,
-        x=samples["A"],
+        x=samples_linear["A"],
         rstd_nominal=shape.statistics.rstd,
         sampler=sampler,
         dtype=dtype,
     )
-    A = norm["A"]
-    B = samples["B"]
-    rstd = norm["rstd"]
+    A = samples_rmsnorm["A"]
+    B = samples_linear["B"]
+    rstd = samples_rmsnorm["rstd"]
     # reorder the weight for torch's split layout, as in gemm_swiglu
     weight = B.mT
     split_weight = rearrange(
