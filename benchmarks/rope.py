@@ -1,4 +1,3 @@
-import math
 import torch
 from coda.core.elementwise import functional as elementwise_functional
 from coda.core.gemm import functional as gemm_functional
@@ -379,8 +378,7 @@ def rope_bwd_zdz(
     )
     positions = samples_rope["positions"]
     frequencies = samples_rope["frequencies_qkv"]
-    # zdz, the row dot product of z and its gradient, is scaled by 1 / dim
-    # as the input norm's backward uses it
+    # zdz = sum(z * dz) / dim per row, as the RMSNorm backward uses it
     scale = 1.0 / shape.dim
     interleaved = {
         "y": y,
@@ -928,6 +926,172 @@ def qknorm_rope_bwd(
     )
 
 
+def qknorm_rope_bwd_zdz(
+    shape: Shape,
+    seed: int,
+    dtype: torch.dtype,
+) -> Case:
+    sampler = Sampler(seed=seed)
+    samples_rope = operands.rope_operands(shape=shape)
+    samples_qknorm = operands.qknorm_bwd_operands(
+        shape=shape,
+        rmsnorm=True,
+        sampler=sampler,
+        dtype=dtype,
+    )
+    preact = samples_qknorm["preact"]
+    gamma = samples_qknorm["gamma"]
+    rstd = samples_qknorm["rstd"]
+    head_mean_sq = samples_qknorm["head_mean_sq"]
+    size_qk = preact.shape[1]
+    size_v = samples_rope["size_v"]
+    samples_bwd = operands.qknorm_rope_bwd_zdz_operands(
+        shape=shape,
+        preact=preact,
+        gamma=gamma,
+        size_v=size_v,
+        sampler=sampler,
+        dtype=dtype,
+    )
+    dy = samples_bwd["dy"]
+    v = samples_bwd["v"]
+    dv = samples_bwd["dv"]
+    positions = samples_rope["positions"]
+    frequencies = samples_rope["frequencies_qk"]
+    # zdz = sum(z * dz) / dim per row, as the RMSNorm backward uses it
+    scale = 1.0 / shape.dim
+    interleaved = {
+        "dy": dy,
+        "preact": preact,
+        "v": v,
+        "rstd": rstd,
+        "head_mean_sq": head_mean_sq,
+        "gamma": gamma,
+        "cos": None,
+        "sin": None,
+        "pos": positions,
+        "freq": frequencies,
+        "head_dim": shape.head_dim,
+        "num_heads_q": shape.heads,
+        "num_heads_k": shape.kv_heads,
+        "eps": data.NORM_EPS,
+        "scale": scale,
+        "layout": PairLayout.interleaved,
+        "dv": dv,
+    }
+    split = interleaved.copy()
+    split["dy"] = operands.split_layout(
+        x=dy,
+        size_qk=size_qk,
+        head_dim=shape.head_dim,
+    )
+    split["preact"] = operands.split_pairs(
+        x=preact,
+        head_dim=shape.head_dim,
+    )
+    split["gamma"] = operands.split_pairs(
+        x=gamma,
+        head_dim=shape.head_dim,
+    )
+    split["layout"] = PairLayout.split
+    interleaved_cached = operands.cache_rope_cos_sin(
+        uncached=interleaved,
+        position_name="pos",
+        frequency_name="freq",
+    )
+    split_cached = operands.cache_rope_cos_sin(
+        uncached=split,
+        position_name="pos",
+        frequency_name="freq",
+    )
+    coda_inputs = {
+        "dy": dy,
+        "preact": preact,
+        "v": v,
+        "rstd": rstd,
+        "gamma": gamma,
+        "pos": positions,
+        "freq": frequencies,
+        "head_dim": shape.head_dim,
+        "num_heads_q": shape.heads,
+        "num_heads_k": shape.kv_heads,
+        "eps": data.NORM_EPS,
+        "scale": scale,
+        "dv": dv,
+        "size_qk": size_qk,
+    }
+    interleaved_oracle_impl = Implementation(
+        fn=make_oracle_fn(
+            fn=torch_ops.qknorm_rope_bwd_zdz,
+            in_dims={
+                "dy": 0,
+                "preact": 0,
+                "v": 0,
+                "rstd": 0,
+                "head_mean_sq": 0,
+                "gamma": None,
+                "pos": 0,
+                "freq": None,
+                "dv": 0,
+            },
+            out_dims=(0, 0, 0, 0),
+            reduce_dims=(None, None, None, 0),
+        ),
+        inputs=interleaved,
+    )
+    split_oracle_impl = Implementation(
+        fn=make_oracle_fn(
+            fn=torch_ops.qknorm_rope_bwd_zdz,
+            in_dims={
+                "dy": 0,
+                "preact": 0,
+                "v": 0,
+                "rstd": 0,
+                "head_mean_sq": 0,
+                "gamma": None,
+                "pos": 0,
+                "freq": None,
+                "dv": 0,
+            },
+            out_dims=(0, 0, 0, 0),
+            reduce_dims=(None, None, None, 0),
+        ),
+        inputs=split,
+    )
+    return Case(
+        implementations={
+            "coda": Implementation(
+                fn=coda_qknorm_rope_bwd_zdz,
+                inputs=coda_inputs,
+            ),
+            "torch/interleaved": Implementation(
+                fn=torch_ops.qknorm_rope_bwd_zdz,
+                inputs=interleaved,
+            ),
+            "torch/interleaved/cached": Implementation(
+                fn=torch_ops.qknorm_rope_bwd_zdz,
+                inputs=interleaved_cached,
+            ),
+            "torch/split": Implementation(
+                fn=torch_ops.qknorm_rope_bwd_zdz,
+                inputs=split,
+            ),
+            "torch/split/cached": Implementation(
+                fn=torch_ops.qknorm_rope_bwd_zdz,
+                inputs=split_cached,
+            ),
+        },
+        oracles={
+            "coda": interleaved_oracle_impl,
+            "torch/interleaved": interleaved_oracle_impl,
+            "torch/interleaved/cached": interleaved_oracle_impl,
+            "torch/split": split_oracle_impl,
+            "torch/split/cached": split_oracle_impl,
+        },
+        outputs=("dz_qk", "dz_v", "zdz", "dgamma"),
+    )
+
+
 OPS = {
     "gemm_rope": gemm_rope,
     "gemm_rmsnorm_rope": gemm_rmsnorm_rope,
@@ -935,6 +1099,5 @@ OPS = {
     "gemm_qknorm_rope": gemm_qknorm_rope,
     "gemm_rmsnorm_qknorm_rope": gemm_rmsnorm_qknorm_rope,
     "qknorm_rope_bwd": qknorm_rope_bwd,
-    "gemm": gemm,
     "qknorm_rope_bwd_zdz": qknorm_rope_bwd_zdz,
 }
