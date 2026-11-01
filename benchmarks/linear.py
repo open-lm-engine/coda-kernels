@@ -1,5 +1,4 @@
 import torch
-from einops import rearrange
 from coda.kernels.functional import cross_entropy as cross_entropy_functional
 from coda.kernels.functional import qknorm_rope as qknorm_rope_functional
 from coda.kernels.functional import sigmoid as sigmoid_functional
@@ -111,11 +110,11 @@ def linear_swiglu(
         dtype=dtype,
     )
     # reorder the weight for torch's split layout: all gates, then all ups
-    split_weight = rearrange(
-        tensor=weight,
-        pattern="(pair two) k -> (two pair) k",
-        two=2,
-    ).contiguous()
+    # the split helpers work on (K, N) weights, the layout GEMMs use; this
+    # weight is (N, K), so transpose it before and after the call
+    split_weight = operands.split_swiglu_weight(
+        B=weight.mT,
+    ).mT
     leaves = ("x", "weight")
     cotangents = ("grad_out",)
     coda_inputs = {
@@ -231,9 +230,9 @@ def linear_qknorm_rope(
     frequencies = samples_rope["frequencies_qk"]
     # reorder q's and k's weight rows, gamma, dq and dk for torch's split
     # layout, which pairs element j with j + head_dim / 2
-    # split_weight works on (K, N) weights, the layout GEMMs use; this
+    # the split helpers work on (K, N) weights, the layout GEMMs use; this
     # weight is (N, K), so transpose it before and after the call
-    split_weight = operands.split_weight(
+    split_weight = operands.split_rope_weight(
         B=weight.mT,
         size_qk=size_qk,
         head_dim=shape.head_dim,
