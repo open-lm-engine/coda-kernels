@@ -382,14 +382,20 @@ def linear_cross_entropy(
         "target": target,
         "grad_loss": grad_loss,
     }
+    # loss logits: fp32 for torch, following TorchTitan, and fp64 for the oracle
+    torch_inputs = {
+        **inputs,
+        "logits_dtype": torch.float32,
+    }
     # the oracle sums its row chunks' losses, so each chunk divides by
     # the count of targets not ignored in the whole batch
-    oracle_inputs = {
-        **inputs,
-        "count": operands.count_non_ignored_targets(
-            target=target,
-        ),
-    }
+    oracle_inputs = torch_inputs.copy()
+    oracle_inputs["logits_dtype"] = torch.float64
+    oracle_inputs["count"] = operands.count_non_ignored_targets(
+        target=target,
+    )
+    # the truth's cross entropy is the fixed one of arXiv:2610.31642: at a
+    # confident row its loss and target gradient do not round to 0
     oracle_forward = make_batch_mean_loss_fn(
         fn=torch_linear.linear_cross_entropy,
     )
@@ -425,7 +431,7 @@ def linear_cross_entropy(
             ),
             "torch": TrainingImplementation(
                 forward=torch_linear.linear_cross_entropy,
-                inputs=inputs,
+                inputs=torch_inputs,
                 leaves=leaves,
                 cotangents=cotangents,
                 copies_cotangents=False,
@@ -460,14 +466,18 @@ def linear_cross_entropy_forward(
         "weight": weight,
         "target": target,
     }
+    # loss logits: fp32 for torch, following TorchTitan, and fp64 for the oracle
+    torch_inputs = {
+        **inputs,
+        "logits_dtype": torch.float32,
+    }
     # the oracle sums its row chunks' losses, so each chunk divides by
     # the count of targets not ignored in the whole batch
-    oracle_inputs = {
-        **inputs,
-        "count": operands.count_non_ignored_targets(
-            target=target,
-        ),
-    }
+    oracle_inputs = torch_inputs.copy()
+    oracle_inputs["logits_dtype"] = torch.float64
+    oracle_inputs["count"] = operands.count_non_ignored_targets(
+        target=target,
+    )
     oracle_forward = make_batch_mean_loss_fn(
         fn=torch_linear.linear_cross_entropy,
     )
@@ -493,7 +503,7 @@ def linear_cross_entropy_forward(
             ),
             "torch": Implementation(
                 fn=torch_linear.linear_cross_entropy,
-                inputs=inputs,
+                inputs=torch_inputs,
             ),
         },
         oracles={
