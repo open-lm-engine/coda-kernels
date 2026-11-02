@@ -129,14 +129,16 @@ def gemm_rope(
     A = samples_linear["A"]
     B = samples_linear["B"]
     positions = samples_rope["positions"]
-    frequencies = samples_rope["frequencies_qkv"]
+    # CODA gets frequencies for q, k and v (zero on v); torch for q and k only
+    frequencies_qk = samples_rope["frequencies_qk"]
+    frequencies_qkv = samples_rope["frequencies_qkv"]
     interleaved = {
         "A": A,
         "B": B,
         "cos": None,
         "sin": None,
         "positions": positions,
-        "frequencies": frequencies,
+        "frequencies": frequencies_qk,
         "size_q": samples_rope["size_q"],
         "size_k": samples_rope["size_k"],
         "size_v": samples_rope["size_v"],
@@ -164,7 +166,7 @@ def gemm_rope(
         "A": A,
         "B": B,
         "positions": positions,
-        "frequencies": frequencies,
+        "frequencies": frequencies_qkv,
         "size_qk": size_qk,
     }
     interleaved_oracle_impl = Implementation(
@@ -255,7 +257,9 @@ def gemm_rmsnorm_rope(
     B = samples_linear["B"]
     rstd = samples_rmsnorm["rstd"]
     positions = samples_rope["positions"]
-    frequencies = samples_rope["frequencies_qkv"]
+    # CODA gets frequencies for q, k and v (zero on v); torch for q and k only
+    frequencies_qk = samples_rope["frequencies_qk"]
+    frequencies_qkv = samples_rope["frequencies_qkv"]
     interleaved = {
         "A": A,
         "B": B,
@@ -263,7 +267,7 @@ def gemm_rmsnorm_rope(
         "cos": None,
         "sin": None,
         "positions": positions,
-        "frequencies": frequencies,
+        "frequencies": frequencies_qk,
         "size_q": samples_rope["size_q"],
         "size_k": samples_rope["size_k"],
         "size_v": samples_rope["size_v"],
@@ -292,7 +296,7 @@ def gemm_rmsnorm_rope(
         "B": B,
         "rstd": rstd,
         "positions": positions,
-        "frequencies": frequencies,
+        "frequencies": frequencies_qkv,
         "size_qk": size_qk,
     }
     interleaved_oracle_impl = Implementation(
@@ -377,7 +381,9 @@ def rope_bwd_zdz(
         dtype=dtype,
     )
     positions = samples_rope["positions"]
-    frequencies = samples_rope["frequencies_qkv"]
+    # CODA gets frequencies for q, k and v (zero on v); torch for q and k only
+    frequencies_qk = samples_rope["frequencies_qk"]
+    frequencies_qkv = samples_rope["frequencies_qkv"]
     # zdz = sum(z * dz) / dim per row, as the RMSNorm backward uses it
     scale = 1.0 / shape.dim
     interleaved = {
@@ -386,7 +392,7 @@ def rope_bwd_zdz(
         "cos": None,
         "sin": None,
         "pos": positions,
-        "freq": frequencies,
+        "freq": frequencies_qk,
         "scale": scale,
         "size_q": samples_rope["size_q"],
         "size_k": samples_rope["size_k"],
@@ -420,7 +426,7 @@ def rope_bwd_zdz(
         "y": y,
         "dy": dy,
         "pos": positions,
-        "freq": frequencies,
+        "freq": frequencies_qkv,
         "scale": scale,
         "size_qk": size_qk,
     }
