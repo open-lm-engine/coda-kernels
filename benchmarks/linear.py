@@ -394,8 +394,6 @@ def linear_cross_entropy(
     oracle_inputs["count"] = operands.count_non_ignored_targets(
         target=target,
     )
-    # the truth's cross entropy is the fixed one of arXiv:2610.31642: at a
-    # confident row its loss and target gradient do not round to 0
     oracle_forward = make_batch_mean_loss_fn(
         fn=torch_linear.linear_cross_entropy,
     )
