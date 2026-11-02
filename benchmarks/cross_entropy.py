@@ -30,6 +30,13 @@ def gemm_lse(
         "A": samples["A"],
         "B": samples["B"],
     }
+    # loss logits: fp32 for torch, following TorchTitan, and fp64 for the oracle
+    torch_inputs = {
+        **inputs,
+        "logits_dtype": torch.float32,
+    }
+    oracle_inputs = torch_inputs.copy()
+    oracle_inputs["logits_dtype"] = torch.float64
     oracle_impl = Implementation(
         fn=make_oracle_fn(
             fn=torch_ops.gemm_lse,
@@ -40,7 +47,7 @@ def gemm_lse(
             out_dims=(0, 0),
             reduce_dims=(None, None),
         ),
-        inputs=inputs,
+        inputs=oracle_inputs,
     )
     return Case(
         implementations={
@@ -50,7 +57,7 @@ def gemm_lse(
             ),
             "torch": Implementation(
                 fn=torch_ops.gemm_lse,
-                inputs=inputs,
+                inputs=torch_inputs,
             ),
         },
         oracles={
@@ -78,6 +85,13 @@ def gemm_rmsnorm_lse(
         "B": samples["B"],
         "rstd": samples["rstd"],
     }
+    # loss logits: fp32 for torch, following TorchTitan, and fp64 for the oracle
+    torch_inputs = {
+        **inputs,
+        "logits_dtype": torch.float32,
+    }
+    oracle_inputs = torch_inputs.copy()
+    oracle_inputs["logits_dtype"] = torch.float64
     oracle_impl = Implementation(
         fn=make_oracle_fn(
             fn=torch_ops.gemm_rmsnorm_lse,
@@ -89,7 +103,7 @@ def gemm_rmsnorm_lse(
             out_dims=(0, 0),
             reduce_dims=(None, None),
         ),
-        inputs=inputs,
+        inputs=oracle_inputs,
     )
     return Case(
         implementations={
@@ -99,7 +113,7 @@ def gemm_rmsnorm_lse(
             ),
             "torch": Implementation(
                 fn=torch_ops.gemm_rmsnorm_lse,
-                inputs=inputs,
+                inputs=torch_inputs,
             ),
         },
         oracles={
@@ -133,6 +147,13 @@ def gemm_lse_select_logits(
         **inputs,
         "return_lse": True,
     }
+    # loss logits: fp32 for torch, following TorchTitan, and fp64 for the oracle
+    torch_inputs = {
+        **inputs,
+        "logits_dtype": torch.float32,
+    }
+    oracle_inputs = torch_inputs.copy()
+    oracle_inputs["logits_dtype"] = torch.float64
     oracle_impl = Implementation(
         fn=make_oracle_fn(
             fn=torch_ops.gemm_lse_select_logits,
@@ -144,7 +165,7 @@ def gemm_lse_select_logits(
             out_dims=(0, 0, 0),
             reduce_dims=(None, None, None),
         ),
-        inputs=inputs,
+        inputs=oracle_inputs,
     )
     return Case(
         implementations={
@@ -154,7 +175,7 @@ def gemm_lse_select_logits(
             ),
             "torch": Implementation(
                 fn=torch_ops.gemm_lse_select_logits,
-                inputs=inputs,
+                inputs=torch_inputs,
             ),
         },
         oracles={
@@ -202,14 +223,21 @@ def cross_entropy_fwd_bwd(
         "dlogits_dtype": dtype,
         "return_zdz": True,
     }
+    # torch's loss logits in fp32, following TorchTitan
     torch_inputs = {
         "logits": logits,
         "target": target,
         "ignore_index": data.IGNORE_INDEX,
         "return_zdz": True,
+        "logits_dtype": torch.float32,
     }
-    oracle_inputs = torch_inputs.copy()
-    oracle_inputs["target"] = target_int32
+    # the oracle runs on the logits in fp64, so it takes no logits_dtype
+    oracle_inputs = {
+        "logits": logits,
+        "target": target_int32,
+        "ignore_index": data.IGNORE_INDEX,
+        "return_zdz": True,
+    }
     oracle_impl = Implementation(
         fn=make_oracle_fn(
             fn=torch_ops.cross_entropy_fwd_bwd,
@@ -260,6 +288,13 @@ def gemm_cross_entropy_fwd_bwd(
         "ignore_index": data.IGNORE_INDEX,
         "return_zdz": True,
     }
+    # loss logits: fp32 for torch, following TorchTitan, and fp64 for the oracle
+    torch_inputs = {
+        **inputs,
+        "logits_dtype": torch.float32,
+    }
+    oracle_inputs = torch_inputs.copy()
+    oracle_inputs["logits_dtype"] = torch.float64
     oracle_impl = Implementation(
         fn=make_oracle_fn(
             fn=torch_ops.gemm_cross_entropy_fwd_bwd,
@@ -271,7 +306,7 @@ def gemm_cross_entropy_fwd_bwd(
             out_dims=(0, 0, 0),
             reduce_dims=(None, None, None),
         ),
-        inputs=inputs,
+        inputs=oracle_inputs,
     )
     return Case(
         implementations={
@@ -281,7 +316,7 @@ def gemm_cross_entropy_fwd_bwd(
             ),
             "torch": Implementation(
                 fn=torch_ops.gemm_cross_entropy_fwd_bwd_bench,
-                inputs=inputs,
+                inputs=torch_inputs,
             ),
         },
         oracles={
@@ -312,6 +347,13 @@ def gemm_rmsnorm_cross_entropy_fwd_bwd(
         "ignore_index": data.IGNORE_INDEX,
         "return_zdz": True,
     }
+    # loss logits: fp32 for torch, following TorchTitan, and fp64 for the oracle
+    torch_inputs = {
+        **inputs,
+        "logits_dtype": torch.float32,
+    }
+    oracle_inputs = torch_inputs.copy()
+    oracle_inputs["logits_dtype"] = torch.float64
     oracle_impl = Implementation(
         fn=make_oracle_fn(
             fn=torch_ops.gemm_rmsnorm_cross_entropy_fwd_bwd,
@@ -324,7 +366,7 @@ def gemm_rmsnorm_cross_entropy_fwd_bwd(
             out_dims=(0, 0, 0),
             reduce_dims=(None, None, None),
         ),
-        inputs=inputs,
+        inputs=oracle_inputs,
     )
     return Case(
         implementations={
@@ -334,7 +376,7 @@ def gemm_rmsnorm_cross_entropy_fwd_bwd(
             ),
             "torch": Implementation(
                 fn=torch_ops.gemm_rmsnorm_cross_entropy_fwd_bwd_bench,
-                inputs=inputs,
+                inputs=torch_inputs,
             ),
         },
         oracles={
