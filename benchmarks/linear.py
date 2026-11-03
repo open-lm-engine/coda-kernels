@@ -5,6 +5,7 @@ from coda.kernels.functional import sigmoid as sigmoid_functional
 from coda.kernels.functional import swiglu as swiglu_functional
 
 from benchmarks.backends import torch_linear
+from benchmarks.backends.torch_ops import CrossEntropyNumerics
 from benchmarks.backends.torch_ops import PairLayout
 from benchmarks.utils import data
 from benchmarks.utils import operands
@@ -386,7 +387,12 @@ def linear_cross_entropy(
     torch_inputs = {
         **inputs,
         "logits_dtype": torch.float32,
+        # the collapse-free loss and gradient CODA's kernel forms
+        "cross_entropy_numerics": CrossEntropyNumerics.precise,
     }
+    # torch's own cross entropy, reported apart
+    torch_standard_ce_inputs = torch_inputs.copy()
+    torch_standard_ce_inputs["cross_entropy_numerics"] = CrossEntropyNumerics.standard
     # the oracle sums its row chunks' losses, so each chunk divides by
     # the count of targets not ignored in the whole batch
     oracle_inputs = torch_inputs.copy()
@@ -434,10 +440,18 @@ def linear_cross_entropy(
                 cotangents=cotangents,
                 copies_cotangents=False,
             ),
+            "torch/standard-ce": TrainingImplementation(
+                forward=torch_linear.linear_cross_entropy,
+                inputs=torch_standard_ce_inputs,
+                leaves=leaves,
+                cotangents=cotangents,
+                copies_cotangents=False,
+            ),
         },
         oracles={
             "coda": oracle_impl,
             "torch": oracle_impl,
+            "torch/standard-ce": oracle_impl,
         },
         outputs=outputs,
     )
@@ -468,7 +482,12 @@ def linear_cross_entropy_forward(
     torch_inputs = {
         **inputs,
         "logits_dtype": torch.float32,
+        # the collapse-free loss and gradient CODA's kernel forms
+        "cross_entropy_numerics": CrossEntropyNumerics.precise,
     }
+    # torch's own cross entropy, reported apart
+    torch_standard_ce_inputs = torch_inputs.copy()
+    torch_standard_ce_inputs["cross_entropy_numerics"] = CrossEntropyNumerics.standard
     # the oracle sums its row chunks' losses, so each chunk divides by
     # the count of targets not ignored in the whole batch
     oracle_inputs = torch_inputs.copy()
@@ -503,10 +522,15 @@ def linear_cross_entropy_forward(
                 fn=torch_linear.linear_cross_entropy,
                 inputs=torch_inputs,
             ),
+            "torch/standard-ce": Implementation(
+                fn=torch_linear.linear_cross_entropy,
+                inputs=torch_standard_ce_inputs,
+            ),
         },
         oracles={
             "coda": oracle_impl,
             "torch": oracle_impl,
+            "torch/standard-ce": oracle_impl,
         },
         outputs=("loss",),
     )

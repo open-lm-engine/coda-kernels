@@ -235,8 +235,8 @@ def cross_entropy_fwd_bwd(
         "cross_entropy_numerics": CrossEntropyNumerics.precise,
     }
     # torch's own cross entropy, reported apart
-    standard_inputs = torch_inputs.copy()
-    standard_inputs["cross_entropy_numerics"] = CrossEntropyNumerics.standard
+    torch_standard_ce_inputs = torch_inputs.copy()
+    torch_standard_ce_inputs["cross_entropy_numerics"] = CrossEntropyNumerics.standard
     # the oracle runs on the logits in fp64, so it takes no logits_dtype
     oracle_inputs = {
         "logits": logits,
@@ -269,7 +269,7 @@ def cross_entropy_fwd_bwd(
             ),
             "torch/standard-ce": Implementation(
                 fn=torch_ops.cross_entropy_fwd_bwd_bench,
-                inputs=standard_inputs,
+                inputs=torch_standard_ce_inputs,
             ),
         },
         oracles={
@@ -310,8 +310,8 @@ def gemm_cross_entropy_fwd_bwd(
     oracle_inputs = torch_inputs.copy()
     oracle_inputs["logits_dtype"] = torch.float64
     # torch's own cross entropy, reported apart
-    standard_inputs = torch_inputs.copy()
-    standard_inputs["cross_entropy_numerics"] = CrossEntropyNumerics.standard
+    torch_standard_ce_inputs = torch_inputs.copy()
+    torch_standard_ce_inputs["cross_entropy_numerics"] = CrossEntropyNumerics.standard
     oracle_impl = Implementation(
         fn=make_oracle_fn(
             fn=torch_ops.gemm_cross_entropy_fwd_bwd,
@@ -337,7 +337,7 @@ def gemm_cross_entropy_fwd_bwd(
             ),
             "torch/standard-ce": Implementation(
                 fn=torch_ops.gemm_cross_entropy_fwd_bwd_bench,
-                inputs=standard_inputs,
+                inputs=torch_standard_ce_inputs,
             ),
         },
         oracles={
@@ -379,8 +379,8 @@ def gemm_rmsnorm_cross_entropy_fwd_bwd(
     oracle_inputs = torch_inputs.copy()
     oracle_inputs["logits_dtype"] = torch.float64
     # torch's own cross entropy, reported apart
-    standard_inputs = torch_inputs.copy()
-    standard_inputs["cross_entropy_numerics"] = CrossEntropyNumerics.standard
+    torch_standard_ce_inputs = torch_inputs.copy()
+    torch_standard_ce_inputs["cross_entropy_numerics"] = CrossEntropyNumerics.standard
     oracle_impl = Implementation(
         fn=make_oracle_fn(
             fn=torch_ops.gemm_rmsnorm_cross_entropy_fwd_bwd,
@@ -407,7 +407,7 @@ def gemm_rmsnorm_cross_entropy_fwd_bwd(
             ),
             "torch/standard-ce": Implementation(
                 fn=torch_ops.gemm_rmsnorm_cross_entropy_fwd_bwd_bench,
-                inputs=standard_inputs,
+                inputs=torch_standard_ce_inputs,
             ),
         },
         oracles={
