@@ -2,30 +2,75 @@ import torch
 import functools
 from collections import defaultdict
 from typing import Callable, NamedTuple
+from torch._inductor import list_mode_options
 
-# torch.compile's options by mode, always fullgraph and static
+# per mode; always fullgraph and static
 COMPILE_OPTIONS = {
     "default": {},
     "maa": {"mode": "max-autotune-no-cudagraphs"},
 }
-# every mode torch runs in: eager, then each compile mode
 MODES = ("eager", "default", "maa")
 
 
 class Implementation(NamedTuple):
-    # a function and the exact inputs it is called with
     fn: Callable
     inputs: dict
 
 
+class TrainingImplementation(NamedTuple):
+    forward: Callable
+    inputs: dict
+    # inputs to differentiate
+    leaves: tuple[str, ...]
+    # one per output
+    cotangents: tuple[str, ...]
+    # aligns outputs with torch's before comparing
+    postprocessing_fn: Callable | None = None
+
+
 class Case(NamedTuple):
-    # CODA's implementation and torch's, by name
-    implementations: dict[str, Implementation]
-    # the oracle that answers each of them, by the same name: the same
-    # computation in the same layout, run on fp64 copies of its inputs
+    implementations: dict[str, Implementation | TrainingImplementation]
+    # fp64 reference per implementation
     oracles: dict[str, Implementation]
-    # the names of the outputs every function returns, in order
+    # in return order
     outputs: tuple[str, ...]
+
+
+def sampled_m(count: int) -> torch.Tensor | None:
+    if count <= SAMPLED_M:
+        return None
+    else:
+        generator = torch.Generator(device="cuda")
+        generator.manual_seed(SAMPLE_SEED)
+        permutation = torch.randperm(
+            n=count,
+            generator=generator,
+            device="cuda",
+        )
+        return permutation[:SAMPLED_M].sort().values
+
+
+def select_output_by_m(
+    output: torch.Tensor,
+    m: int,
+) -> torch.Tensor:
+    # rows the oracle answered
+    if output.shape[0] == m:
+        return output
+    else:
+        indices = sampled_m(count=output.shape[0])
+        return output.index_select(
+            dim=0,
+            index=indices,
+        )
+
+
+def make_batch_mean_loss_fn(fn: Callable) -> Callable:
+    def loss_fn(count: int, **inputs: object) -> torch.Tensor:
+        loss = fn(reduction="sum", **inputs)
+        return loss / count
+
+    return loss_fn
 
 
 def compiled(
