@@ -4,6 +4,7 @@ from coda.core.gemm import functional as gemm_functional
 from coda.kernels.functional import cross_entropy as cross_entropy_functional
 
 from benchmarks.backends import torch_ops
+from benchmarks.backends.torch_ops import CrossEntropyNumerics
 from benchmarks.utils import data
 from benchmarks.utils import operands
 from benchmarks.utils.cases import Case, Implementation, make_oracle_fn
@@ -230,13 +231,19 @@ def cross_entropy_fwd_bwd(
         "ignore_index": data.IGNORE_INDEX,
         "return_zdz": True,
         "logits_dtype": torch.float32,
+        # the collapse-free loss and gradient CODA's kernel forms
+        "cross_entropy_numerics": CrossEntropyNumerics.precise,
     }
+    # torch's own cross entropy, reported apart
+    standard_inputs = torch_inputs.copy()
+    standard_inputs["cross_entropy_numerics"] = CrossEntropyNumerics.standard
     # the oracle runs on the logits in fp64, so it takes no logits_dtype
     oracle_inputs = {
         "logits": logits,
         "target": target_int32,
         "ignore_index": data.IGNORE_INDEX,
         "return_zdz": True,
+        "cross_entropy_numerics": CrossEntropyNumerics.precise,
     }
     oracle_impl = Implementation(
         fn=make_oracle_fn(
@@ -260,10 +267,15 @@ def cross_entropy_fwd_bwd(
                 fn=torch_ops.cross_entropy_fwd_bwd_bench,
                 inputs=torch_inputs,
             ),
+            "torch/standard-ce": Implementation(
+                fn=torch_ops.cross_entropy_fwd_bwd_bench,
+                inputs=standard_inputs,
+            ),
         },
         oracles={
             "coda": oracle_impl,
             "torch": oracle_impl,
+            "torch/standard-ce": oracle_impl,
         },
         outputs=("losses", "dlogits", "zdz"),
     )
@@ -292,9 +304,14 @@ def gemm_cross_entropy_fwd_bwd(
     torch_inputs = {
         **inputs,
         "logits_dtype": torch.float32,
+        # the collapse-free loss and gradient CODA's kernel forms
+        "cross_entropy_numerics": CrossEntropyNumerics.precise,
     }
     oracle_inputs = torch_inputs.copy()
     oracle_inputs["logits_dtype"] = torch.float64
+    # torch's own cross entropy, reported apart
+    standard_inputs = torch_inputs.copy()
+    standard_inputs["cross_entropy_numerics"] = CrossEntropyNumerics.standard
     oracle_impl = Implementation(
         fn=make_oracle_fn(
             fn=torch_ops.gemm_cross_entropy_fwd_bwd,
@@ -318,10 +335,15 @@ def gemm_cross_entropy_fwd_bwd(
                 fn=torch_ops.gemm_cross_entropy_fwd_bwd_bench,
                 inputs=torch_inputs,
             ),
+            "torch/standard-ce": Implementation(
+                fn=torch_ops.gemm_cross_entropy_fwd_bwd_bench,
+                inputs=standard_inputs,
+            ),
         },
         oracles={
             "coda": oracle_impl,
             "torch": oracle_impl,
+            "torch/standard-ce": oracle_impl,
         },
         outputs=("losses", "dlogits", "zdz"),
     )
@@ -351,9 +373,14 @@ def gemm_rmsnorm_cross_entropy_fwd_bwd(
     torch_inputs = {
         **inputs,
         "logits_dtype": torch.float32,
+        # the collapse-free loss and gradient CODA's kernel forms
+        "cross_entropy_numerics": CrossEntropyNumerics.precise,
     }
     oracle_inputs = torch_inputs.copy()
     oracle_inputs["logits_dtype"] = torch.float64
+    # torch's own cross entropy, reported apart
+    standard_inputs = torch_inputs.copy()
+    standard_inputs["cross_entropy_numerics"] = CrossEntropyNumerics.standard
     oracle_impl = Implementation(
         fn=make_oracle_fn(
             fn=torch_ops.gemm_rmsnorm_cross_entropy_fwd_bwd,
@@ -378,10 +405,15 @@ def gemm_rmsnorm_cross_entropy_fwd_bwd(
                 fn=torch_ops.gemm_rmsnorm_cross_entropy_fwd_bwd_bench,
                 inputs=torch_inputs,
             ),
+            "torch/standard-ce": Implementation(
+                fn=torch_ops.gemm_rmsnorm_cross_entropy_fwd_bwd_bench,
+                inputs=standard_inputs,
+            ),
         },
         oracles={
             "coda": oracle_impl,
             "torch": oracle_impl,
+            "torch/standard-ce": oracle_impl,
         },
         outputs=("losses", "dlogits", "zdz"),
     )
