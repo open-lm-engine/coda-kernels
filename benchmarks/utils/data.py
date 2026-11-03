@@ -84,13 +84,13 @@ class Sampler(object):
             high=ratio**0.5,
         )
 
-    def norm_weight(
+    def gamma(
         self,
         size: int,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        # a norm weight in the range trained
-        # models use
+        # a norm weight in the range of trained
+        # Llama-3 and Qwen3 norm weights
         values = self.log_uniform(
             size=size,
             low=NORM_WEIGHT_LOW,
@@ -142,8 +142,7 @@ class Statistics(NamedTuple):
     # qk-norm, 0.02 to 350
     head_mean_sq: float
     # the scale of the residual C in A @ B + C,
-    # relative to A @ B: 0.15 to 10 in real
-    # models
+    # relative to A @ B: 0.15 to 10
     residual_scale: float
 
 
@@ -157,7 +156,7 @@ TYPICAL = Statistics(
 
 
 class Shape(NamedTuple):
-    # tokens through a model of these sizes
+    # tokens through layers of these sizes
     tokens: int
     dim: int
     ffn: int
