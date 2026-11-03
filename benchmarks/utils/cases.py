@@ -10,6 +10,11 @@ COMPILE_OPTIONS = {
     "maa": {"mode": "max-autotune-no-cudagraphs"},
 }
 MODES = ("eager", "default", "maa")
+# rows per oracle chunk: all of M in fp64 does not fit
+ORACLE_CHUNK_SIZE = 1024
+# rows an oracle checks when M has more, and their seed
+ORACLE_NUM_ROWS = 1024
+ORACLE_ROWS_SEED = 0
 
 
 class Implementation(NamedTuple):
@@ -36,33 +41,96 @@ class Case(NamedTuple):
     outputs: tuple[str, ...]
 
 
-def sampled_m(count: int) -> torch.Tensor | None:
-    if count <= SAMPLED_M:
+def oracle_rows(count: int) -> torch.Tensor | None:
+    # rows the oracle checks: all (None) if count <= ORACLE_NUM_ROWS,
+    # else a fixed random sample of that many, sorted
+    if count <= ORACLE_NUM_ROWS:
         return None
     else:
         generator = torch.Generator(device="cuda")
-        generator.manual_seed(SAMPLE_SEED)
+        generator.manual_seed(ORACLE_ROWS_SEED)
         permutation = torch.randperm(
             n=count,
             generator=generator,
             device="cuda",
         )
-        return permutation[:SAMPLED_M].sort().values
+        rows = permutation[:ORACLE_NUM_ROWS]
+        return rows.sort().values
 
 
-def select_output_by_m(
+def select_oracle_rows(
     output: torch.Tensor,
     m: int,
 ) -> torch.Tensor:
-    # rows the oracle answered
+    # the output's rows its oracle checked, when it checked fewer than all
     if output.shape[0] == m:
         return output
     else:
-        indices = sampled_m(count=output.shape[0])
+        indices = oracle_rows(count=output.shape[0])
         return output.index_select(
             dim=0,
             index=indices,
         )
+
+
+def _step_forward(
+    fn: Callable,
+    arguments: dict,
+) -> tuple:
+    # the forward; returns its outputs
+    outputs = fn(**arguments)
+    if isinstance(outputs, torch.Tensor):
+        return (outputs,)
+    else:
+        return tuple(outputs)
+
+
+def _step_backward(
+    outputs: tuple,
+    leaf_values: list[torch.Tensor],
+    grad_outputs: list[torch.Tensor],
+) -> tuple:
+    # the leaves' grads; returns the outputs, then the grads
+    grads = torch.autograd.grad(
+        outputs=outputs,
+        inputs=leaf_values,
+        grad_outputs=grad_outputs,
+    )
+    detached = []
+    for output in outputs:
+        detached.append(output.detach())
+
+    return tuple(detached) + grads
+
+
+def make_step_fn(
+    forward: Callable,
+    leaves: tuple[str, ...],
+    cotangents: tuple[str, ...],
+) -> Callable:
+    # forward and backward on leaves made beforehand; returns outputs,
+    # then grads
+    def step_fn(**inputs: object) -> tuple:
+        arguments = inputs.copy()
+        grad_outputs = []
+        for name in cotangents:
+            grad_outputs.append(arguments.pop(name))
+
+        leaf_values = []
+        for name in leaves:
+            leaf_values.append(arguments[name])
+
+        outputs = _step_forward(
+            fn=forward,
+            arguments=arguments,
+        )
+        return _step_backward(
+            outputs=outputs,
+            leaf_values=leaf_values,
+            grad_outputs=grad_outputs,
+        )
+
+    return step_fn
 
 
 def make_batch_mean_loss_fn(fn: Callable) -> Callable:
