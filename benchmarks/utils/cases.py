@@ -43,6 +43,15 @@ class Case(NamedTuple):
     outputs: tuple[str, ...]
 
 
+class BenchCallable(NamedTuple):
+    fn: Callable
+    setup: Callable
+    inputs: dict
+
+    def run(self) -> object:
+        return self.fn(**self.inputs)
+
+
 def oracle_rows(count: int) -> torch.Tensor | None:
     # rows the oracle checks: all (None) if count <= ORACLE_NUM_ROWS,
     # else a fixed random sample of that many, sorted
