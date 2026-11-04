@@ -24,7 +24,7 @@ class Implementation(NamedTuple):
     inputs: dict
 
 
-class TrainingImplementation(NamedTuple):
+class ImplementationFwdBwd(NamedTuple):
     forward: Callable
     inputs: dict
     # inputs to differentiate
@@ -36,7 +36,7 @@ class TrainingImplementation(NamedTuple):
 
 
 class Case(NamedTuple):
-    implementations: dict[str, Implementation | TrainingImplementation]
+    implementations: dict[str, Implementation | ImplementationFwdBwd]
     # fp64 reference per implementation
     oracles: dict[str, Implementation]
     # in return order
@@ -320,3 +320,51 @@ def compiled(
             dynamic=False,
             **COMPILE_OPTIONS[mode],
         )
+
+
+def _make_bench_callable(
+    name: str,
+    implementation: Implementation,
+    builds: dict[str, tuple[str, dict[str, object]]],
+    setup: Callable,
+) -> dict[str, BenchCallable]:
+    # one call per build
+    calls = {}
+    for build_label, (mode, options) in builds.items():
+        label = f"{name}/{build_label}"
+        calls[label] = BenchCallable(
+            fn=compiled(
+                fn=implementation.fn,
+                mode=mode,
+                name=label,
+                options=options,
+            ),
+            setup=setup,
+            inputs=implementation.inputs,
+        )
+
+    return calls
+
+
+def make_callables(
+    case: Case,
+    compile_options: dict[str, dict[str, object]],
+) -> dict[str, dict[str, BenchCallable]]:
+    # every implementation's calls, by label
+    calls = {}
+    for name, implementation in case.implementations.items():
+        if isinstance(implementation, ImplementationFwdBwd):
+            calls[name] = _make_fwdbwd_bench_callable(
+                name=name,
+                implementation=implementation,
+                builds=builds,
+            )
+        else:
+            calls[name] = _make_bench_callable(
+                name=name,
+                implementation=implementation,
+                builds=builds,
+                setup=_no_setup,
+            )
+
+    return calls
