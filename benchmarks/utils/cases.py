@@ -81,7 +81,7 @@ def _make_leaves(
     leaves: tuple[str, ...],
 ) -> dict:
     # a copy of inputs whose leaves are fresh tensors that require grad,
-    # on the same storage
+    # sharing the original's memory
     made = inputs.copy()
     for name in leaves:
         made[name] = (
@@ -125,7 +125,12 @@ def make_oracle_fn(
     leaves: tuple[str, ...] = (),
     chunk_size: int = ORACLE_CHUNK_SIZE,
 ) -> Callable:
+    # runs fn in fp64 on chunk_size rows of M at a time; each output is
+    # summed over the chunks (reduce_dims 0), kept per row (out_dims 0),
+    # or taken from the first chunk (out_dims None)
     for dim in (*in_dims.values(), *out_dims, *reduce_dims):
+        # each dim is 0 (split along M) or None (whole); only a
+        # split output can be summed
         assert dim in (0, None)
 
     assert len(out_dims) == len(reduce_dims)
@@ -155,6 +160,70 @@ def make_oracle_fn(
             return sizes.pop()
         else:
             return 1
+
+    @functools.wraps(fn)
+    def oracle_fn(**kwargs: object) -> tuple:
+        count = get_mapped_size(inputs=kwargs)
+        rows = oracle_rows(count=count)
+        # by output position: each chunk's checked rows (out_dims 0), the
+        # sum over chunks (reduce_dims 0), or the first chunk's value
+        outputs_chunked = defaultdict(list)
+        outputs_reduced = {}
+        outputs_unmapped = {}
+        for start in range(0, count, chunk_size):
+            # the last chunk stops at M
+            stop = min(start + chunk_size, count)
+            arguments = _chunk_inputs(
+                inputs=kwargs,
+                mapped=mapped,
+                leaves=leaves,
+                start=start,
+                stop=stop,
+            )
+            outputs = fn(**arguments)
+            if isinstance(outputs, torch.Tensor):
+                outputs = (outputs,)
+
+            assert len(outputs) == len(out_dims)
+            # the checked rows in this chunk, counted from its start
+            if rows is None:
+                chunk_rows = None
+            else:
+                inside = (rows >= start) & (rows < stop)
+                chunk_rows = rows[inside] - start
+
+            for position, output in enumerate(outputs):
+                if reduce_dims[position] == 0:
+                    if position in outputs_reduced:
+                        outputs_reduced[position] = outputs_reduced[position] + output
+                    else:
+                        outputs_reduced[position] = output
+                elif out_dims[position] == 0:
+                    if chunk_rows is None:
+                        outputs_chunked[position].append(output)
+                    else:
+                        outputs_chunked[position].append(
+                            output.index_select(
+                                dim=0,
+                                index=chunk_rows,
+                            ),
+                        )
+                elif position not in outputs_unmapped:
+                    outputs_unmapped[position] = output
+
+            # free this chunk before the next
+            del arguments, outputs, output
+
+        oracle_outputs = []
+        for position in range(len(out_dims)):
+            if position in outputs_reduced:
+                oracle_outputs.append(outputs_reduced[position])
+            elif position in outputs_chunked:
+                oracle_outputs.append(torch.cat(tensors=outputs_chunked[position]))
+            else:
+                oracle_outputs.append(outputs_unmapped[position])
+
+        return tuple(oracle_outputs)
 
     return oracle_fn
 
