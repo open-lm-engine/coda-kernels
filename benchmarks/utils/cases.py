@@ -369,6 +369,67 @@ def _make_bench_callable(
     return bench_callables
 
 
+def _make_fwdbwd_bench_callable(
+    name: str,
+    implementation: ImplementationFwdBwd,
+) -> dict[str, BenchCallable]:
+    # per compile setting, the whole step and, when compiled, the forward alone
+    inputs = _make_leaves(
+        inputs=implementation.inputs,
+        leaves=implementation.leaves,
+    )
+    # a backward can overwrite its cotangents, so the calls get copies and
+    # setup resets them before each call
+    for cotangent in implementation.cotangents:
+        inputs[cotangent] = (
+            implementation.inputs[cotangent]
+            .detach()
+            .clone()
+        )
+
+    def setup() -> None:
+        for cotangent in implementation.cotangents:
+            inputs[cotangent].copy_(implementation.inputs[cotangent])
+
+    step_fn = make_step_fn(
+        forward=implementation.forward,
+        leaves=implementation.leaves,
+        cotangents=implementation.cotangents,
+    )
+    # forward and backward compiled together, as one graph; training usually
+    # compiles only the forward, but this is often faster for torch
+    bench_callables = _make_bench_callable(
+        name=name,
+        implementation=Implementation(
+            fn=step_fn,
+            inputs=inputs,
+        ),
+        setup=setup,
+    )
+
+    # the standard way: torch.compile on the forward, AOTAutograd for the backward
+    for setting_label, (mode, options) in COMPILE_SETTINGS.items():
+        if mode != "eager":
+            forward_label = f"{name}/{setting_label}/forward"
+            forward = compiled(
+                fn=implementation.forward,
+                mode=mode,
+                name=forward_label,
+                options=options,
+            )
+            bench_callables[forward_label] = BenchCallable(
+                fn=make_step_fn(
+                    forward=forward,
+                    leaves=implementation.leaves,
+                    cotangents=implementation.cotangents,
+                ),
+                setup=setup,
+                inputs=inputs,
+            )
+
+    return bench_callables
+
+
 def make_callables(
     case: Case,
 ) -> dict[str, dict[str, BenchCallable]]:
