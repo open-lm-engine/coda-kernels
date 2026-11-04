@@ -10,6 +10,8 @@ COMPILE_OPTIONS = {
     "maa": {"mode": "max-autotune-no-cudagraphs"},
 }
 MODES = ("eager", "default", "maa")
+# the dtype an oracle computes in
+ORACLE_DTYPE = torch.float64
 # rows per oracle chunk: all of M in fp64 does not fit
 ORACLE_CHUNK_SIZE = 1024
 # rows an oracle checks when M has more, and their seed
@@ -74,24 +76,45 @@ def select_oracle_rows(
         )
 
 
+def _make_leaves(
+    inputs: dict,
+    leaves: tuple[str, ...],
+) -> dict:
+    # a copy of inputs whose leaves are fresh tensors that require grad,
+    # on the same storage
+    made = inputs.copy()
+    for name in leaves:
+        made[name] = (
+            inputs[name]
+            .detach()
+            .requires_grad_(True)
+        )
+
+    return made
+
+
 def _chunk_inputs(
     inputs: dict,
     mapped: list[str],
     leaves: tuple[str, ...],
     start: int,
     stop: int,
-    dtype: torch.dtype,
 ) -> dict:
-    # mapped inputs sliced along M, floats widened to dtype, leaves made
     arguments = {}
     for name, value in inputs.items():
         if name in mapped:
-            value = value[start:stop]
+            assert 0 <= start < stop <= value.shape[0]
+            value = value[start:stop, ...]
 
         if isinstance(value, torch.Tensor) and value.is_floating_point():
-            arguments[name] = value.to(dtype=dtype)
+            arguments[name] = value.to(dtype=ORACLE_DTYPE)
         else:
             arguments[name] = value
+
+    return _make_leaves(
+        inputs=arguments,
+        leaves=leaves,
+    )
 
 
 def make_oracle_fn(
@@ -115,10 +138,23 @@ def make_oracle_fn(
         if dim == 0:
             mapped.append(name)
 
-    @functools.wraps(fn)
-    def oracle_fn(**kwargs: object) -> tuple:
+    def get_mapped_size(inputs: dict) -> int:
+        # M; every tensor input is listed, and the mapped ones agree on it
+        tensor_names = []
+        for name, value in inputs.items():
+            if isinstance(value, torch.Tensor):
+                tensor_names.append(name)
 
-        return tuple(oracle_outputs)
+        assert set(tensor_names) == set(in_dims)
+        sizes = set()
+        for name in mapped:
+            sizes.add(inputs[name].shape[0])
+
+        assert len(sizes) <= 1
+        if len(sizes) == 1:
+            return sizes.pop()
+        else:
+            return 1
 
     return oracle_fn
 
