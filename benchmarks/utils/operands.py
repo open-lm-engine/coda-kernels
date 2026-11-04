@@ -2,12 +2,12 @@ import math
 import torch
 from typing import NamedTuple
 from einops import rearrange, reduce, repeat
-from coda.core.ops.rope_utils import make_rope_frequencies
 
 from benchmarks.backends import torch_ops
 from benchmarks.utils import data
 from benchmarks.utils import models
 from benchmarks.utils.data import Sampler, Shape
+from coda.core.ops.rope_utils import make_rope_frequencies
 
 
 class Normal(NamedTuple):
@@ -17,8 +17,8 @@ class Normal(NamedTuple):
 
 
 class Block(NamedTuple):
-    # a shifted block's forward outputs, each of which gets a cotangent,
-    # and its leaves
+    # a shifted block's forward outputs, each given a cotangent, and its
+    # leaves
     outputs: tuple[str, ...]
     leaves: tuple[str, ...]
 
@@ -70,11 +70,13 @@ def positions(shape: Shape) -> torch.Tensor:
     # every token's rope position, (B * T,); each sequence starts again
     # at the shape's offset
     sequence = sequence_positions(shape=shape)
-    return repeat(
+    token_positions = repeat(
         tensor=sequence,
         pattern="t -> (b t)",
         b=models.batch_size(shape=shape),
     )
+    assert token_positions.is_contiguous()
+    return token_positions
 
 
 def inv_freq(shape: Shape) -> torch.Tensor:
@@ -89,7 +91,9 @@ def inv_freq(shape: Shape) -> torch.Tensor:
     )
     exponents = even_indices / shape.head_dim
     powers = ROPE_BASE**exponents
-    return 1.0 / powers
+    pair_frequencies = 1.0 / powers
+    assert pair_frequencies.is_contiguous()
+    return pair_frequencies
 
 
 def rope_operands(shape: Shape) -> dict:
@@ -104,6 +108,7 @@ def rope_operands(shape: Shape) -> dict:
         inv_freq=pair_frequencies,
         num_heads=qk_heads,
     )
+
     # v's columns get frequency 0, which leaves them unrotated
     frequencies_v = torch.zeros(
         size=(size_v,),
