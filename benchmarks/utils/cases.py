@@ -173,14 +173,14 @@ def make_oracle_fn(
         for start in range(0, count, chunk_size):
             # the last chunk stops at M
             stop = min(start + chunk_size, count)
-            arguments = _chunk_inputs(
+            kwargs_chunked = _chunk_inputs(
                 inputs=kwargs,
                 mapped=mapped,
                 leaves=leaves,
                 start=start,
                 stop=stop,
             )
-            outputs = fn(**arguments)
+            outputs = fn(**kwargs_chunked)
             if isinstance(outputs, torch.Tensor):
                 outputs = (outputs,)
 
@@ -209,17 +209,18 @@ def make_oracle_fn(
                             ),
                         )
                 elif position not in outputs_unmapped:
+                    # no M, so every chunk gives the same value
                     outputs_unmapped[position] = output
 
             # free this chunk before the next
-            del arguments, outputs, output
+            del kwargs_chunked, outputs, output
 
         oracle_outputs = []
         for position in range(len(out_dims)):
             if position in outputs_reduced:
                 oracle_outputs.append(outputs_reduced[position])
             elif position in outputs_chunked:
-                oracle_outputs.append(torch.cat(tensors=outputs_chunked[position]))
+                oracle_outputs.append(torch.cat(outputs_chunked[position], dim=0))
             else:
                 oracle_outputs.append(outputs_unmapped[position])
 
