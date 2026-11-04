@@ -51,7 +51,7 @@ class Case(NamedTuple):
 
 class BenchCallable(NamedTuple):
     fn: Callable
-    setup: Callable
+    setup: Callable | None
     inputs: dict
 
     def run(self) -> object:
@@ -330,19 +330,26 @@ def compiled(
             mode=mode,
         )
     else:
+        # torch.compile takes a mode or options, not both: the mode as its
+        # options, then these
+        compile_options = list_mode_options(
+            mode=mode,
+            dynamic=False,
+        ).copy()
+        compile_options.update(options)
         return torch.compile(
             fn,
             fullgraph=True,
             dynamic=False,
             name=name,
-            options=options,
+            options=compile_options,
         )
 
 
 def _make_bench_callable(
     name: str,
     implementation: Implementation,
-    setup: Callable,
+    setup: Callable | None,
 ) -> dict[str, BenchCallable]:
     # one call per compile setting
     bench_callables = {}
@@ -377,7 +384,7 @@ def make_callables(
             bench_callables[name] = _make_bench_callable(
                 name=name,
                 implementation=implementation,
-                setup=_no_setup,
+                setup=None,
             )
 
     return bench_callables
