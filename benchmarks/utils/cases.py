@@ -407,16 +407,16 @@ def _make_fwdbwd_callables(
     # the standard way: torch.compile on the forward, AOTAutograd for the backward
     for setting_label, (mode, options) in COMPILE_SETTINGS.items():
         if mode != "eager":
-            forward_label = f"{name}/{setting_label}/forward"
-            forward = compiled(
+            label = f"{name}/{setting_label}/forward"
+            fn_compiled = compiled(
                 fn=implementation.fn,
                 mode=mode,
-                name=forward_label,
+                name=label,
                 options=options,
             )
-            callables[forward_label] = Implementation(
+            callables[label] = Implementation(
                 fn=make_step_fn(
-                    fn=forward,
+                    fn=fn_compiled,
                     leaves=implementation.leaves,
                     cotangents=implementation.cotangents,
                 ),
