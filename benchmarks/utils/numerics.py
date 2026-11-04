@@ -2,11 +2,16 @@ import torch
 from typing import NamedTuple
 from collections import defaultdict
 
-from benchmarks.utils.cases import Case, make_callables, select_output_by_m
+from benchmarks.utils.cases import (
+    Case,
+    ImplementationFwdBwd,
+    make_callables,
+    select_oracle_rows,
+)
 
 
 class Precision(NamedTuple):
-    # e.g., {"coda": {"out": float}, "torch/eager": {"out": float}}
+    # e.g., {"coda/eager": {"out": float}, "torch/eager": {"out": float}}
     errors: dict[str, dict[str, float]]
     # least possible error per output, e.g., {"out": float}
     errors_minimum: dict[str, float]
@@ -71,7 +76,7 @@ def precision(case: Case) -> Precision:
 
                 # along M, keep what the oracle answered (a scalar has no M)
                 if oracle_output.ndim > 0:
-                    output = select_output_by_m(
+                    output = select_oracle_rows(
                         output=output,
                         m=oracle_output.shape[0],
                     )
