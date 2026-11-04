@@ -37,18 +37,13 @@ def precision(case: Case) -> Precision:
     assert next(iter(bench_callables)) == "coda"
     assert next(iter(bench_callables["coda"])) == coda_eager
 
-    oracle_outputs_dict = {}
     dtypes = {}
     errors = defaultdict(dict)
     errors_minimum = {}
     for impl_name, impl_variants in bench_callables.items():
-        oracle_impl = case.oracles[impl_name]
-
-        # run each oracle once; implementations may share one
-        if id(oracle_impl) not in oracle_outputs_dict:
-            oracle_outputs_dict[id(oracle_impl)] = oracle_impl.fn(**oracle_impl.inputs)
-
-        oracle_outputs = oracle_outputs_dict[id(oracle_impl)]
+        # each implementation runs its own oracle; outputs are not shared, as
+        # they are freed after each implementation to save memory
+        oracle_outputs = case.oracles[impl_name].run()
         for variant, call in impl_variants.items():
             # read the second call, to catch one that overwrites its inputs
             if call.setup is not None:
@@ -114,6 +109,9 @@ def precision(case: Case) -> Precision:
 
             # free each call's outputs; all at once do not fit at scale
             del outputs, output
+
+        # free its fp64 outputs before the next oracle runs, to save memory
+        del oracle_outputs, oracle_output
 
     return Precision(
         errors=errors,
