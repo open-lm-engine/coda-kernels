@@ -1,6 +1,7 @@
 import itertools
 from typing import NamedTuple
 
+from benchmarks.utils import data
 
 
 class Model(NamedTuple):
@@ -56,7 +57,8 @@ LLAMA3 = {
         head_dim=128,
     ),
 }
-TOKENS = (2048, 8192, 32768)
+TOKENS = (8192, 16384, 32768)
+SEQUENCE_LENGTH = 2048
 # Llama-3's own vocab size (128000 tokens and 256 special
 # ones), the only one an op that does not read the
 # vocab runs at
@@ -79,7 +81,7 @@ VOCAB_SIZES = (
 def op_vocab_sizes(op_name: str) -> tuple[int, ...]:
     # every vocab size for an op that reads the vocab,
     # and Llama-3's own for the rest
-    if op_name in VOCAB_READERS:
+    if op_name in OPS_WITH_VOCAB:
         return VOCAB_SIZES
     else:
         return (LLAMA3_VOCAB_SIZE,)
@@ -95,6 +97,12 @@ def op_kv_heads(
         return model.heads
     else:
         return model.kv_heads
+
+
+def batch_size(shape: data.Shape) -> int:
+    # the sequences a shape's tokens make up, SEQUENCE_LENGTH each
+    assert shape.tokens % SEQUENCE_LENGTH == 0
+    return shape.tokens // SEQUENCE_LENGTH
 
 
 def row_label(
