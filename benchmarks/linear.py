@@ -12,7 +12,7 @@ from benchmarks.utils import operands
 from benchmarks.utils.cases import (
     Case,
     Implementation,
-    TrainingImplementation,
+    ImplementationFwdBwd,
     make_batch_mean_loss_fn,
     make_oracle_fn,
     make_step_fn,
@@ -47,10 +47,9 @@ def linear_sigmoid(
     }
     # the oracle runs torch's forward and backward in fp64
     torch_step = make_step_fn(
-        forward=torch_linear.linear_sigmoid,
+        fn=torch_linear.linear_sigmoid,
         leaves=leaves,
         cotangents=cotangents,
-        copies_cotangents=False,
     )
     outputs = ("out", "dx", "dweight")
     # the oracle runs in chunks of rows and sums dweight over them
@@ -64,24 +63,23 @@ def linear_sigmoid(
             },
             out_dims=(0, 0, 0),
             reduce_dims=(None, None, 0),
+            leaves=leaves,
         ),
         inputs=inputs,
     )
     return Case(
         implementations={
-            "coda": TrainingImplementation(
-                forward=sigmoid_functional.linear_sigmoid,
+            "coda": ImplementationFwdBwd(
+                fn=sigmoid_functional.linear_sigmoid,
                 inputs=inputs,
                 leaves=leaves,
                 cotangents=cotangents,
-                copies_cotangents=False,
             ),
-            "torch": TrainingImplementation(
-                forward=torch_linear.linear_sigmoid,
+            "torch": ImplementationFwdBwd(
+                fn=torch_linear.linear_sigmoid,
                 inputs=inputs,
                 leaves=leaves,
                 cotangents=cotangents,
-                copies_cotangents=False,
             ),
         },
         oracles={
@@ -137,10 +135,9 @@ def linear_swiglu(
     }
     # the oracles run torch's forward and backward in fp64
     torch_step = make_step_fn(
-        forward=torch_linear.linear_swiglu,
+        fn=torch_linear.linear_swiglu,
         leaves=leaves,
         cotangents=cotangents,
-        copies_cotangents=False,
     )
     outputs = ("out", "dx", "dweight")
     interleaved_oracle_impl = Implementation(
@@ -153,6 +150,7 @@ def linear_swiglu(
             },
             out_dims=(0, 0, 0),
             reduce_dims=(None, None, 0),
+            leaves=leaves,
         ),
         inputs=interleaved,
     )
@@ -166,31 +164,29 @@ def linear_swiglu(
             },
             out_dims=(0, 0, 0),
             reduce_dims=(None, None, 0),
+            leaves=leaves,
         ),
         inputs=split,
     )
     return Case(
         implementations={
-            "coda": TrainingImplementation(
-                forward=swiglu_functional.linear_swiglu,
+            "coda": ImplementationFwdBwd(
+                fn=swiglu_functional.linear_swiglu,
                 inputs=coda_inputs,
                 leaves=leaves,
                 cotangents=cotangents,
-                copies_cotangents=False,
             ),
-            "torch/interleaved": TrainingImplementation(
-                forward=torch_linear.linear_swiglu,
+            "torch/interleaved": ImplementationFwdBwd(
+                fn=torch_linear.linear_swiglu,
                 inputs=interleaved,
                 leaves=leaves,
                 cotangents=cotangents,
-                copies_cotangents=False,
             ),
-            "torch/split": TrainingImplementation(
-                forward=torch_linear.linear_swiglu,
+            "torch/split": ImplementationFwdBwd(
+                fn=torch_linear.linear_swiglu,
                 inputs=split,
                 leaves=leaves,
                 cotangents=cotangents,
-                copies_cotangents=False,
             ),
         },
         oracles={
@@ -289,12 +285,22 @@ def linear_qknorm_rope(
         "sin": None,
         "layout": PairLayout.split,
     }
+    # torch with its rope tables built once, outside the timed step
+    interleaved_cached = operands.cache_rope_cos_sin(
+        uncached=interleaved,
+        position_name="positions",
+        frequency_name="frequencies",
+    )
+    split_cached = operands.cache_rope_cos_sin(
+        uncached=split,
+        position_name="positions",
+        frequency_name="frequencies",
+    )
     # the oracles run torch's forward and backward in fp64
     torch_step = make_step_fn(
-        forward=torch_linear.linear_qknorm_rope,
+        fn=torch_linear.linear_qknorm_rope,
         leaves=leaves,
         cotangents=cotangents,
-        copies_cotangents=False,
     )
     outputs = ("q", "k", "v", "dx", "dweight", "dgamma")
     oracle_fn = make_oracle_fn(
@@ -311,6 +317,7 @@ def linear_qknorm_rope(
         },
         out_dims=(0, 0, 0, 0, 0, 0),
         reduce_dims=(None, None, None, None, 0, 0),
+        leaves=leaves,
     )
     interleaved_oracle_impl = Implementation(
         fn=oracle_fn,
@@ -322,32 +329,43 @@ def linear_qknorm_rope(
     )
     return Case(
         implementations={
-            "coda": TrainingImplementation(
-                forward=qknorm_rope_functional.linear_qknorm_rope,
+            "coda": ImplementationFwdBwd(
+                fn=qknorm_rope_functional.linear_qknorm_rope,
                 inputs=coda_inputs,
                 leaves=leaves,
                 cotangents=cotangents,
-                copies_cotangents=False,
             ),
-            "torch/interleaved": TrainingImplementation(
-                forward=torch_linear.linear_qknorm_rope,
+            "torch/interleaved": ImplementationFwdBwd(
+                fn=torch_linear.linear_qknorm_rope,
                 inputs=interleaved,
                 leaves=leaves,
                 cotangents=cotangents,
-                copies_cotangents=False,
             ),
-            "torch/split": TrainingImplementation(
-                forward=torch_linear.linear_qknorm_rope,
+            "torch/interleaved/cached": ImplementationFwdBwd(
+                fn=torch_linear.linear_qknorm_rope,
+                inputs=interleaved_cached,
+                leaves=leaves,
+                cotangents=cotangents,
+            ),
+            "torch/split": ImplementationFwdBwd(
+                fn=torch_linear.linear_qknorm_rope,
                 inputs=split,
                 leaves=leaves,
                 cotangents=cotangents,
-                copies_cotangents=False,
+            ),
+            "torch/split/cached": ImplementationFwdBwd(
+                fn=torch_linear.linear_qknorm_rope,
+                inputs=split_cached,
+                leaves=leaves,
+                cotangents=cotangents,
             ),
         },
         oracles={
             "coda": interleaved_oracle_impl,
             "torch/interleaved": interleaved_oracle_impl,
+            "torch/interleaved/cached": interleaved_oracle_impl,
             "torch/split": split_oracle_impl,
+            "torch/split/cached": split_oracle_impl,
         },
         outputs=outputs,
     )
@@ -404,10 +422,9 @@ def linear_cross_entropy(
         fn=torch_linear.linear_cross_entropy,
     )
     oracle_step = make_step_fn(
-        forward=oracle_forward,
+        fn=oracle_forward,
         leaves=leaves,
         cotangents=cotangents,
-        copies_cotangents=False,
     )
     outputs = ("loss", "dx", "dweight")
     oracle_impl = Implementation(
@@ -421,31 +438,29 @@ def linear_cross_entropy(
             },
             out_dims=(0, 0, 0),
             reduce_dims=(0, None, 0),
+            leaves=leaves,
         ),
         inputs=oracle_inputs,
     )
     return Case(
         implementations={
-            "coda": TrainingImplementation(
-                forward=cross_entropy_functional.linear_cross_entropy,
+            "coda": ImplementationFwdBwd(
+                fn=cross_entropy_functional.linear_cross_entropy,
                 inputs=inputs,
                 leaves=leaves,
                 cotangents=cotangents,
-                copies_cotangents=False,
             ),
-            "torch": TrainingImplementation(
-                forward=torch_linear.linear_cross_entropy,
+            "torch": ImplementationFwdBwd(
+                fn=torch_linear.linear_cross_entropy,
                 inputs=torch_inputs,
                 leaves=leaves,
                 cotangents=cotangents,
-                copies_cotangents=False,
             ),
-            "torch/standard-ce": TrainingImplementation(
-                forward=torch_linear.linear_cross_entropy,
+            "torch/standard-ce": ImplementationFwdBwd(
+                fn=torch_linear.linear_cross_entropy,
                 inputs=torch_standard_ce_inputs,
                 leaves=leaves,
                 cotangents=cotangents,
-                copies_cotangents=False,
             ),
         },
         oracles={
