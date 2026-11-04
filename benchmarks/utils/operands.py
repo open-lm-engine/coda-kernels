@@ -128,3 +128,118 @@ def rope_operands(shape: Shape) -> dict:
         "size_k": size_k,
         "size_v": size_v,
     }
+
+
+def split_swiglu_weight(B: torch.Tensor) -> torch.Tensor:
+    # B is the transposed weight: its gate and up rows are regrouped into
+    # torch's split layout, all gates then all ups, and transposed back to
+    # keep B's strides
+    split = rearrange(
+        tensor=B.mT,
+        pattern="(pair two) k -> (two pair) k",
+        two=2,
+    ).contiguous()
+    return split.mT
+
+
+def linear_operands(
+    shape: Shape,
+    out_features: int,
+    sampler: Sampler,
+    dtype: torch.dtype,
+) -> dict:
+    # a linear layer's inputs: A (tokens, dim), and B, the transposed
+    # weight, k-major as nn.Linear stores it
+    weight = sampler.weight(
+        shape=(out_features, shape.dim),
+        dtype=dtype,
+    )
+    A = sampler.randn(
+        shape=(shape.tokens, shape.dim),
+        dtype=dtype,
+    )
+    return {
+        "A": A,
+        "B": weight.mT,
+    }
+
+
+def lm_head(
+    shape: Shape,
+    rmsnorm: bool,
+    sampler: Sampler,
+    dtype: torch.dtype,
+) -> dict:
+    # the LM head's inputs: the final norm's output A, the weight
+    # transposed as B, and targets with some ignored
+    samples_linear = linear_operands(
+        shape=shape,
+        out_features=shape.vocab_size,
+        sampler=sampler,
+        dtype=dtype,
+    )
+    weight = samples_linear["B"].mT
+    target = sampler.targets(
+        size=shape.tokens,
+        vocab_size=shape.vocab_size,
+    )
+
+    A = logit_rows(
+        shape=shape,
+        weight=weight,
+        target=target,
+        bulk=samples_linear["A"],
+        sampler=sampler,
+    )
+
+
+def activation_shape(
+    shape: Shape,
+    width: int,
+) -> tuple[int, int, int]:
+    # a block activation's (B, T, width): the step's tokens as a batch
+    # of sequences, as a block takes them
+    return (
+        models.batch_size(shape=shape),
+        models.SEQUENCE_LENGTH,
+        width,
+    )
+
+
+def gemm_residual_rmsnorm_gemm_operands(
+    shape: Shape,
+    in_features: int,
+    out_features: int,
+    sampler: Sampler,
+    dtype: torch.dtype,
+) -> dict:
+    # gemm_residual_rmsnorm_gemm's leaves, drawn as block_leaf draws them:
+    # the residual stream x; y and w0, the GEMM that adds onto it; w1, the
+    # next GEMM's weight; and wn, the norm's weight between them
+    x = sampler.randn(
+        shape=(shape.tokens, shape.dim),
+        dtype=dtype,
+    )
+    y = sampler.randn(
+        shape=(shape.tokens, in_features),
+        dtype=dtype,
+    )
+    w0 = sampler.weight(
+        shape=(shape.dim, in_features),
+        dtype=dtype,
+    )
+    w1 = sampler.weight(
+        shape=(out_features, shape.dim),
+        dtype=dtype,
+    )
+    wn = sampler.gamma(
+        size=shape.dim,
+        dtype=dtype,
+    )
+    return {
+        "x": ACTIVATION_STD * x,
+        "y": ACTIVATION_STD * y,
+        "w0": w0,
+        "w1": w1,
+        "wn": wn,
+    }
