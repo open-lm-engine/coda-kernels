@@ -3,13 +3,19 @@ import functools
 from collections import defaultdict
 from typing import Callable, NamedTuple
 from torch._inductor import list_mode_options
+from benchmarks.backends import torchtitan_llama3
 
-# per mode; always fullgraph and static
-COMPILE_OPTIONS = {
-    "default": {},
-    "maa": {"mode": "max-autotune-no-cudagraphs"},
+# the options the extra compile settings add, TorchTitan's
+EXTRA_COMPILE_OPTIONS = torchtitan_llama3.EXTRA_COMPILE_OPTIONS
+# torch.compile's (mode, options) by label, always fullgraph and static:
+# eager, then each mode plain and with EXTRA_COMPILE_OPTIONS
+COMPILE_SETTINGS = {
+    "eager": ("eager", {}),
+    "default": ("default", {}),
+    "default-extra": ("default", EXTRA_COMPILE_OPTIONS),
+    "maa": ("max-autotune-no-cudagraphs", {}),
+    "maa-extra": ("max-autotune-no-cudagraphs", EXTRA_COMPILE_OPTIONS),
 }
-MODES = ("eager", "default", "maa")
 # the dtype an oracle computes in
 ORACLE_DTYPE = torch.float64
 # rows per oracle chunk: all of M in fp64 does not fit
@@ -309,28 +315,38 @@ def make_batch_mean_loss_fn(fn: Callable) -> Callable:
 def compiled(
     fn: Callable,
     mode: str,
+    name: str,
+    options: dict[str, object],
 ) -> Callable:
-    # fn as written for eager, else one torch.compile of it
+    # one name per call, so no call reuses another's graph
     if mode == "eager":
         return fn
+    elif len(options) == 0:
+        return torch.compile(
+            fn,
+            fullgraph=True,
+            dynamic=False,
+            name=name,
+            mode=mode,
+        )
     else:
         return torch.compile(
             fn,
             fullgraph=True,
             dynamic=False,
-            **COMPILE_OPTIONS[mode],
+            name=name,
+            options=options,
         )
 
 
 def _make_bench_callable(
     name: str,
     implementation: Implementation,
-    compile_settings: dict[str, tuple[str, dict[str, object]]],
     setup: Callable,
 ) -> dict[str, BenchCallable]:
     # one call per compile setting
     bench_callables = {}
-    for setting_label, (mode, options) in compile_settings.items():
+    for setting_label, (mode, options) in COMPILE_SETTINGS.items():
         label = f"{name}/{setting_label}"
         bench_callables[label] = BenchCallable(
             fn=compiled(
@@ -348,7 +364,6 @@ def _make_bench_callable(
 
 def make_callables(
     case: Case,
-    compile_options: dict[str, dict[str, object]],
 ) -> dict[str, dict[str, BenchCallable]]:
     # every implementation's calls, by label
     bench_callables = {}
@@ -357,13 +372,11 @@ def make_callables(
             bench_callables[name] = _make_fwdbwd_bench_callable(
                 name=name,
                 implementation=implementation,
-                compile_settings=compile_settings,
             )
         else:
             bench_callables[name] = _make_bench_callable(
                 name=name,
                 implementation=implementation,
-                compile_settings=compile_settings,
                 setup=_no_setup,
             )
 
