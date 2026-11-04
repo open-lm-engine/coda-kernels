@@ -67,10 +67,60 @@ def select_oracle_rows(
         return output
     else:
         indices = oracle_rows(count=output.shape[0])
+        assert indices.shape[0] == m
         return output.index_select(
             dim=0,
             index=indices,
         )
+
+
+def _chunk_inputs(
+    inputs: dict,
+    mapped: list[str],
+    leaves: tuple[str, ...],
+    start: int,
+    stop: int,
+    dtype: torch.dtype,
+) -> dict:
+    # mapped inputs sliced along M, floats widened to dtype, leaves made
+    arguments = {}
+    for name, value in inputs.items():
+        if name in mapped:
+            value = value[start:stop]
+
+        if isinstance(value, torch.Tensor) and value.is_floating_point():
+            arguments[name] = value.to(dtype=dtype)
+        else:
+            arguments[name] = value
+
+
+def make_oracle_fn(
+    fn: Callable,
+    in_dims: dict[str, int | None],
+    out_dims: tuple[int | None, ...],
+    reduce_dims: tuple[int | None, ...],
+    leaves: tuple[str, ...] = (),
+    chunk_size: int = ORACLE_CHUNK_SIZE,
+) -> Callable:
+    for dim in (*in_dims.values(), *out_dims, *reduce_dims):
+        assert dim in (0, None)
+
+    assert len(out_dims) == len(reduce_dims)
+    for out_dim, reduce_dim in zip(out_dims, reduce_dims, strict=True):
+        if reduce_dim == 0:
+            assert out_dim == 0
+
+    mapped = []
+    for name, dim in in_dims.items():
+        if dim == 0:
+            mapped.append(name)
+
+    @functools.wraps(fn)
+    def oracle_fn(**kwargs: object) -> tuple:
+
+        return tuple(oracle_outputs)
+
+    return oracle_fn
 
 
 def _step_forward(
@@ -155,65 +205,3 @@ def compiled(
             dynamic=False,
             **COMPILE_OPTIONS[mode],
         )
-
-
-def make_callables(case: Case) -> dict[str, dict[str, Callable]]:
-    # each implementation's callables, by its name and then by label:
-    # CODA's as written, torch's eager or compiled once per mode
-    result = defaultdict(dict)
-    for name, implementation in case.implementations.items():
-        if name == "coda":
-            result[name][name] = functools.partial(
-                implementation.fn,
-                **implementation.inputs,
-            )
-        else:
-            for mode in MODES:
-                result[name][f"{name}/{mode}"] = functools.partial(
-                    compiled(
-                        fn=implementation.fn,
-                        mode=mode,
-                    ),
-                    **implementation.inputs,
-                )
-    return result
-
-
-def oracle_outputs(oracle: Implementation) -> tuple:
-    # the oracle over fp64 copies of its floating-point inputs, the rest
-    # (integer tensors, scalars, layouts) as they are
-    arguments = {}
-    for name, value in oracle.inputs.items():
-        if isinstance(value, torch.Tensor) and value.is_floating_point():
-            arguments[name] = value.to(dtype=torch.float64)
-        else:
-            arguments[name] = value
-    outputs = oracle.fn(**arguments)
-
-    if isinstance(outputs, torch.Tensor):
-        return (outputs,)
-    else:
-        return tuple(outputs)
-
-
-def precision(case: Case) -> dict[str, dict[str, float]]:
-    # every call's rel-L2 by output, against its implementation's oracle
-    errors = defaultdict(dict)
-    for name, variants in make_callables(case=case).items():
-        oracle_values = oracle_outputs(oracle=case.oracles[name])
-        for label, call in variants.items():
-            outputs = call()
-
-            if isinstance(outputs, torch.Tensor):
-                values = (outputs,)
-            else:
-                values = tuple(outputs)
-
-            for output, value, oracle_value in zip(case.outputs, values, oracle_values, strict=True):
-                # rel-L2: the output's error over the size of the oracle's
-                assert oracle_value.dtype == torch.float64
-                difference = value.to(dtype=torch.float64) - oracle_value
-                error = torch.linalg.vector_norm(difference)
-                size = torch.linalg.vector_norm(oracle_value)
-                errors[label][output] = (error / size).item()
-    return errors
