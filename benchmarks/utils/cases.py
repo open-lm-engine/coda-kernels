@@ -325,14 +325,14 @@ def compiled(
 def _make_bench_callable(
     name: str,
     implementation: Implementation,
-    builds: dict[str, tuple[str, dict[str, object]]],
+    compile_settings: dict[str, tuple[str, dict[str, object]]],
     setup: Callable,
 ) -> dict[str, BenchCallable]:
-    # one call per build
-    calls = {}
-    for build_label, (mode, options) in builds.items():
-        label = f"{name}/{build_label}"
-        calls[label] = BenchCallable(
+    # one call per compile setting
+    bench_callables = {}
+    for setting_label, (mode, options) in compile_settings.items():
+        label = f"{name}/{setting_label}"
+        bench_callables[label] = BenchCallable(
             fn=compiled(
                 fn=implementation.fn,
                 mode=mode,
@@ -343,7 +343,7 @@ def _make_bench_callable(
             inputs=implementation.inputs,
         )
 
-    return calls
+    return bench_callables
 
 
 def make_callables(
@@ -351,20 +351,20 @@ def make_callables(
     compile_options: dict[str, dict[str, object]],
 ) -> dict[str, dict[str, BenchCallable]]:
     # every implementation's calls, by label
-    calls = {}
+    bench_callables = {}
     for name, implementation in case.implementations.items():
         if isinstance(implementation, ImplementationFwdBwd):
-            calls[name] = _make_fwdbwd_bench_callable(
+            bench_callables[name] = _make_fwdbwd_bench_callable(
                 name=name,
                 implementation=implementation,
-                builds=builds,
+                compile_settings=compile_settings,
             )
         else:
-            calls[name] = _make_bench_callable(
+            bench_callables[name] = _make_bench_callable(
                 name=name,
                 implementation=implementation,
-                builds=builds,
+                compile_settings=compile_settings,
                 setup=_no_setup,
             )
 
-    return calls
+    return bench_callables
