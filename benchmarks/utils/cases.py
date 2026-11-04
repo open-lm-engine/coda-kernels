@@ -28,6 +28,7 @@ ORACLE_ROWS_SEED = 0
 class Implementation(NamedTuple):
     fn: Callable
     inputs: dict
+    # runs before each call, untimed; None if there is nothing to reset
     setup_fn: Callable | None = None
 
     def run(self) -> object:
@@ -35,6 +36,7 @@ class Implementation(NamedTuple):
 
 
 class ImplementationFwdBwd(NamedTuple):
+    # the forward; make_callables builds the training step from it
     fn: Callable
     inputs: dict
     # inputs to differentiate
@@ -270,7 +272,7 @@ def _step_backward(
 
 
 def make_step_fn(
-    forward: Callable,
+    fn: Callable,
     leaves: tuple[str, ...],
     cotangents: tuple[str, ...],
 ) -> Callable:
@@ -287,7 +289,7 @@ def make_step_fn(
             leaf_values.append(arguments[name])
 
         outputs = _step_forward(
-            fn=forward,
+            fn=fn,
             arguments=arguments,
         )
         return _step_backward(
@@ -341,16 +343,16 @@ def compiled(
         )
 
 
-def _make_bench_callable(
+def _make_op_callables(
     name: str,
     implementation: Implementation,
     setup_fn: Callable | None,
 ) -> dict[str, Implementation]:
     # one call per compile setting
-    bench_callables = {}
+    callables = {}
     for setting_label, (mode, options) in COMPILE_SETTINGS.items():
         label = f"{name}/{setting_label}"
-        bench_callables[label] = Implementation(
+        callables[label] = Implementation(
             fn=compiled(
                 fn=implementation.fn,
                 mode=mode,
@@ -361,10 +363,10 @@ def _make_bench_callable(
             setup_fn=setup_fn,
         )
 
-    return bench_callables
+    return callables
 
 
-def _make_fwdbwd_bench_callable(
+def _make_fwdbwd_callables(
     name: str,
     implementation: ImplementationFwdBwd,
 ) -> dict[str, Implementation]:
@@ -374,7 +376,7 @@ def _make_fwdbwd_bench_callable(
         leaves=implementation.leaves,
     )
     # a backward can overwrite its cotangents, so the calls get copies and
-    # setup resets them before each call
+    # setup_fn resets them before each call
     for cotangent in implementation.cotangents:
         inputs[cotangent] = (
             implementation.inputs[cotangent]
@@ -382,7 +384,7 @@ def _make_fwdbwd_bench_callable(
             .clone()
         )
 
-    def setup() -> None:
+    def setup_fn() -> None:
         for cotangent in implementation.cotangents:
             inputs[cotangent].copy_(implementation.inputs[cotangent])
 
@@ -393,13 +395,13 @@ def _make_fwdbwd_bench_callable(
     )
     # forward and backward compiled together, as one graph; training usually
     # compiles only the forward, but this is often faster for torch
-    bench_callables = _make_bench_callable(
+    callables = _make_op_callables(
         name=name,
         implementation=Implementation(
             fn=step_fn,
             inputs=inputs,
         ),
-        setup=setup,
+        setup_fn=setup_fn,
     )
 
     # the standard way: torch.compile on the forward, AOTAutograd for the backward
@@ -412,9 +414,9 @@ def _make_fwdbwd_bench_callable(
                 name=forward_label,
                 options=options,
             )
-            bench_callables[forward_label] = Implementation(
+            callables[forward_label] = Implementation(
                 fn=make_step_fn(
-                    forward=forward,
+                    fn=forward,
                     leaves=implementation.leaves,
                     cotangents=implementation.cotangents,
                 ),
@@ -422,23 +424,23 @@ def _make_fwdbwd_bench_callable(
                 setup_fn=setup_fn,
             )
 
-    return bench_callables
+    return callables
 
 
 def make_callables(case: Case) -> dict[str, dict[str, Implementation]]:
     # every implementation's calls, by label
-    bench_callables = {}
+    callables = {}
     for name, implementation in case.implementations.items():
         if isinstance(implementation, ImplementationFwdBwd):
-            bench_callables[name] = _make_fwdbwd_bench_callable(
+            callables[name] = _make_fwdbwd_callables(
                 name=name,
                 implementation=implementation,
             )
         else:
-            bench_callables[name] = _make_bench_callable(
+            callables[name] = _make_op_callables(
                 name=name,
                 implementation=implementation,
-                setup=None,
+                setup_fn=None,
             )
 
-    return bench_callables
+    return callables
