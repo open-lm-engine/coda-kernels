@@ -32,27 +32,27 @@ def relative_l2_error(
 def precision(case: Case) -> Precision:
     # CODA's eager call runs first: it sets each output's dtype, which every
     # call is compared in, and its least possible error
-    bench_callables = make_callables(case=case)
+    callables = make_callables(case=case)
     coda_eager = "coda/eager"
-    assert next(iter(bench_callables)) == "coda"
-    assert next(iter(bench_callables["coda"])) == coda_eager
+    assert next(iter(callables)) == "coda"
+    assert next(iter(callables["coda"])) == coda_eager
 
     dtypes = {}
     errors = defaultdict(dict)
     errors_minimum = {}
-    for impl_name, impl_variants in bench_callables.items():
+    for impl_name, impl_variants in callables.items():
         # each implementation runs its own oracle; outputs are not shared, as
         # they are freed after each implementation to save memory
         oracle_outputs = case.oracles[impl_name].run()
         for variant, call in impl_variants.items():
             # read the second call, to catch one that overwrites its inputs
-            if call.setup is not None:
-                call.setup()
+            if call.setup_fn is not None:
+                call.setup_fn()
 
             call.run()
 
-            if call.setup is not None:
-                call.setup()
+            if call.setup_fn is not None:
+                call.setup_fn()
 
             outputs = call.run()
             # the outputs as the case names them: a lone tensor as a tuple,
