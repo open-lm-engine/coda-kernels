@@ -57,7 +57,9 @@ LLAMA3 = {
         head_dim=128,
     ),
 }
+# tokens per step
 TOKENS = (8192, 16384, 32768)
+# tokens per sequence: a step's tokens are split into sequences this long
 SEQUENCE_LENGTH = 2048
 # Llama-3's own vocab size (128000 tokens and 256 special
 # ones), the only one an op that does not read the
@@ -76,24 +78,53 @@ VOCAB_SIZES = (
     GPT_OSS_VOCAB_SIZE,
     QWEN3_5_VOCAB_SIZE,
 )
+# ops run at every vocab size
+OPS_WITH_VOCAB = (
+    "gemm_lse",
+    "gemm_rmsnorm_lse",
+    "gemm_lse_select_logits",
+    "cross_entropy_fwd_bwd",
+    "gemm_cross_entropy_fwd_bwd",
+    "gemm_rmsnorm_cross_entropy_fwd_bwd",
+    "linear_cross_entropy",
+    "linear_cross_entropy_forward",
+    "gemm_scalar_scale_lm_head",
+    "transformer.block_post",
+    "llama3.block_post",
+    "chain.gemm_residual_rmsnorm_gemm_cross_entropy_fwd_bwd",
+)
+# ops run with as many k and v heads as q heads
+OPS_WITH_MHA = (
+    "gemm_qknorm_rope",
+    "gemm_rmsnorm_qknorm_rope",
+    "qknorm_rope_bwd",
+    "qknorm_rope_bwd_zdz",
+    "linear_qknorm_rope",
+    "gemm_xsa_bwd",
+    "transformer.block_pre",
+    "transformer.block",
+    "transformer.block_post",
+    "llama3.block_pre",
+    "llama3.block",
+    "llama3.block_post",
+    "chain.gemm_residual_rmsnorm_gemm_qknorm_rope",
+)
 
 
-def op_vocab_sizes(op_name: str) -> tuple[int, ...]:
-    # every vocab size for an op that reads the vocab,
-    # and Llama-3's own for the rest
+def get_vocab_sizes(op_name: str) -> tuple[int, ...]:
+    # all vocab sizes for an op with a vocab dimension, else Llama-3's
     if op_name in OPS_WITH_VOCAB:
         return VOCAB_SIZES
     else:
         return (LLAMA3_VOCAB_SIZE,)
 
 
-def op_kv_heads(
+def get_kv_heads(
     op_name: str,
     model: Model,
 ) -> int:
-    # the model's own k and v heads, or as many as q heads
-    # for the ops whose kernels take no fewer (qk-norm's)
-    if op_name in MHA:
+    # the q head count for an op that runs MHA, else the model's k and v heads
+    if op_name in OPS_WITH_MHA:
         return model.heads
     else:
         return model.kv_heads
@@ -129,13 +160,13 @@ def bench_shapes(
         model = LLAMA3[model_name]
         sizes = itertools.product(
             TOKENS,
-            op_vocab_sizes(op_name=op_name),
+            get_vocab_sizes(op_name=op_name),
         )
         for tokens, vocab_size in sizes:
             shape = model.shape(
                 tokens=tokens,
                 vocab_size=vocab_size,
-                kv_heads=op_kv_heads(
+                kv_heads=get_kv_heads(
                     op_name=op_name,
                     model=model,
                 ),
