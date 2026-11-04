@@ -130,6 +130,48 @@ def rope_operands(shape: Shape) -> dict:
     }
 
 
+def split_layout_heads(
+    x: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    # each head along the last axis, from the interleaved layout, pairs
+    # (2j, 2j + 1), to the split layout, pairs (j, j + head_dim / 2)
+    assert x.shape[-1] == num_heads * head_dim
+    assert head_dim % 2 == 0
+    half = head_dim // 2
+    return rearrange(
+        tensor=x,
+        pattern="... (h p two) -> ... (h two p)",
+        h=num_heads,
+        two=2,
+        p=half,
+    ).contiguous()
+
+
+def split_layout(
+    x: torch.Tensor,
+    size_qk: int,
+    head_dim: int,
+) -> torch.Tensor:
+    # a [q | k | v] activation in the split layout; v has no rope pairs
+    assert x.ndim == 2
+    assert 0 < size_qk < x.shape[1]
+    assert size_qk % head_dim == 0
+    num_heads = size_qk // head_dim
+    qk = x[:, :size_qk]
+    v = x[:, size_qk:]
+    split_qk = split_layout_heads(
+        x=qk,
+        num_heads=num_heads,
+        head_dim=head_dim,
+    )
+    return torch.cat(
+        tensors=(split_qk, v),
+        dim=1,
+    )
+
+
 def split_swiglu_weight(B: torch.Tensor) -> torch.Tensor:
     # B is the transposed weight: its gate and up rows are regrouped into
     # torch's split layout, all gates then all ups, and transposed back to
@@ -192,13 +234,28 @@ def lm_head(
         sampler=sampler,
     )
 
+    if rmsnorm:
+        # the norm's weight folds into B and divides out of A, so the
+        # logits stay near the plain op's
+        gamma = sampler.gamma(
+            size=shape.dim,
+            dtype=torch.float32,
+        )
+    else:
+        A = A.to(dtype=dtype)
+        return {
+            "A": A,
+            "B": samples_linear["B"],
+            "target": target,
+        }
 
-def activation_shape(
+
+def batched_shape(
     shape: Shape,
     width: int,
 ) -> tuple[int, int, int]:
-    # a block activation's (B, T, width): the step's tokens as a batch
-    # of sequences, as a block takes them
+    # (B, T, width): the step's tokens as a batch of sequences, as a block
+    # takes them
     return (
         models.batch_size(shape=shape),
         models.SEQUENCE_LENGTH,
