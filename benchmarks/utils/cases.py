@@ -28,10 +28,14 @@ ORACLE_ROWS_SEED = 0
 class Implementation(NamedTuple):
     fn: Callable
     inputs: dict
+    setup_fn: Callable | None = None
+
+    def run(self) -> object:
+        return self.fn(**self.inputs)
 
 
 class ImplementationFwdBwd(NamedTuple):
-    forward: Callable
+    fn: Callable
     inputs: dict
     # inputs to differentiate
     leaves: tuple[str, ...]
@@ -47,15 +51,6 @@ class Case(NamedTuple):
     oracles: dict[str, Implementation]
     # in return order
     outputs: tuple[str, ...]
-
-
-class BenchCallable(NamedTuple):
-    fn: Callable
-    setup: Callable | None
-    inputs: dict
-
-    def run(self) -> object:
-        return self.fn(**self.inputs)
 
 
 def oracle_rows(count: int) -> torch.Tensor | None:
@@ -349,21 +344,21 @@ def compiled(
 def _make_bench_callable(
     name: str,
     implementation: Implementation,
-    setup: Callable | None,
-) -> dict[str, BenchCallable]:
+    setup_fn: Callable | None,
+) -> dict[str, Implementation]:
     # one call per compile setting
     bench_callables = {}
     for setting_label, (mode, options) in COMPILE_SETTINGS.items():
         label = f"{name}/{setting_label}"
-        bench_callables[label] = BenchCallable(
+        bench_callables[label] = Implementation(
             fn=compiled(
                 fn=implementation.fn,
                 mode=mode,
                 name=label,
                 options=options,
             ),
-            setup=setup,
             inputs=implementation.inputs,
+            setup_fn=setup_fn,
         )
 
     return bench_callables
@@ -372,7 +367,7 @@ def _make_bench_callable(
 def _make_fwdbwd_bench_callable(
     name: str,
     implementation: ImplementationFwdBwd,
-) -> dict[str, BenchCallable]:
+) -> dict[str, Implementation]:
     # per compile setting, the whole step and, when compiled, the forward alone
     inputs = _make_leaves(
         inputs=implementation.inputs,
@@ -392,7 +387,7 @@ def _make_fwdbwd_bench_callable(
             inputs[cotangent].copy_(implementation.inputs[cotangent])
 
     step_fn = make_step_fn(
-        forward=implementation.forward,
+        fn=implementation.fn,
         leaves=implementation.leaves,
         cotangents=implementation.cotangents,
     )
@@ -412,27 +407,25 @@ def _make_fwdbwd_bench_callable(
         if mode != "eager":
             forward_label = f"{name}/{setting_label}/forward"
             forward = compiled(
-                fn=implementation.forward,
+                fn=implementation.fn,
                 mode=mode,
                 name=forward_label,
                 options=options,
             )
-            bench_callables[forward_label] = BenchCallable(
+            bench_callables[forward_label] = Implementation(
                 fn=make_step_fn(
                     forward=forward,
                     leaves=implementation.leaves,
                     cotangents=implementation.cotangents,
                 ),
-                setup=setup,
                 inputs=inputs,
+                setup_fn=setup_fn,
             )
 
     return bench_callables
 
 
-def make_callables(
-    case: Case,
-) -> dict[str, dict[str, BenchCallable]]:
+def make_callables(case: Case) -> dict[str, dict[str, Implementation]]:
     # every implementation's calls, by label
     bench_callables = {}
     for name, implementation in case.implementations.items():
