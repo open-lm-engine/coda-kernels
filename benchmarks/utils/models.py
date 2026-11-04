@@ -56,6 +56,7 @@ LLAMA3 = {
         head_dim=128,
     ),
 }
+TOKENS = (2048, 8192, 32768)
 # Llama-3's own vocab size (128000 tokens and 256 special
 # ones), the only one an op that does not read the
 # vocab runs at
