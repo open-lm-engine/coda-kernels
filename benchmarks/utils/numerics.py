@@ -30,14 +30,15 @@ def relative_l2_error(
 
 
 def precision(case: Case) -> Precision:
-    # CODA first: its output dtypes apply to every call
-    callables = make_callables(case=case)
-    assert next(iter(callables)) == "coda"
+    # CODA first: its eager call's output dtypes apply to every call, in
+    # every compile setting
+    bench_callables = make_callables(case=case)
+    assert next(iter(bench_callables)) == "coda"
     oracle_outputs_dict = {}
     dtypes = {}
     errors = defaultdict(dict)
     errors_minimum = {}
-    for impl_name, variants in callables.items():
+    for impl_name, impl_variants in bench_callables.items():
         oracle_impl = case.oracles[impl_name]
 
         # run each oracle once; implementations may share one
@@ -45,19 +46,39 @@ def precision(case: Case) -> Precision:
             oracle_outputs_dict[id(oracle_impl)] = oracle_impl.fn(**oracle_impl.inputs)
 
         oracle_outputs = oracle_outputs_dict[id(oracle_impl)]
-        for variant, call in variants.items():
+        for variant, call in impl_variants.items():
             # read the second call, to catch one that overwrites its inputs
-            call()
-            outputs = call()
+            if call.setup is not None:
+                call.setup()
+
+            call.run()
+
+            if call.setup is not None:
+                call.setup()
+
+            outputs = call.run()
 
             if isinstance(outputs, torch.Tensor):
                 outputs = (outputs,)
+            else:
+                outputs = tuple(outputs)
+
+            implementation = case.implementations[impl_name]
+            if (
+                isinstance(implementation, ImplementationFwdBwd)
+                and implementation.postprocessing_fn is not None
+            ):
+                outputs = implementation.postprocessing_fn(outputs)
 
             for output_name, output, oracle_output in zip(
-                case.outputs, outputs, oracle_outputs, strict=True,
+                case.outputs,
+                outputs,
+                oracle_outputs,
+                strict=True,
             ):
-                # CODA sets each output's dtype and least possible error
-                if variant == "coda":
+                # CODA's eager call sets each output's dtype and least
+                # possible error
+                if variant == coda_eager:
                     dtypes[output_name] = output.dtype
                     errors_minimum[output_name] = relative_l2_error(
                         output=oracle_output.to(dtype=output.dtype),
@@ -65,7 +86,8 @@ def precision(case: Case) -> Precision:
                     )
 
                 # an output wider than CODA's (fp32 or fp64 where CODA stores 16
-                # bits) is rounded to CODA's dtype
+                # bits) is rounded to CODA's dtype; a narrower one (16 bits where
+                # CODA keeps fp32) is read as it is, its coarser value its own
                 if (
                     output.dtype in {torch.float32, torch.float64}
                     and dtypes[output_name] in {torch.bfloat16, torch.float16}
