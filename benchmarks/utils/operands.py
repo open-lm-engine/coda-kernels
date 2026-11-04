@@ -166,10 +166,12 @@ def split_layout(
         num_heads=num_heads,
         head_dim=head_dim,
     )
-    return torch.cat(
+    split = torch.cat(
         tensors=(split_qk, v),
         dim=1,
     )
+    assert split.is_contiguous()
+    return split
 
 
 def split_swiglu_weight(B: torch.Tensor) -> torch.Tensor:
