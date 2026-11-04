@@ -30,10 +30,13 @@ def relative_l2_error(
 
 
 def precision(case: Case) -> Precision:
-    # CODA first: its eager call's output dtypes apply to every call, in
-    # every compile setting
+    # CODA's eager call runs first: it sets each output's dtype, which every
+    # call is compared in, and its least possible error
     bench_callables = make_callables(case=case)
+    coda_eager = "coda/eager"
     assert next(iter(bench_callables)) == "coda"
+    assert next(iter(bench_callables["coda"])) == coda_eager
+
     oracle_outputs_dict = {}
     dtypes = {}
     errors = defaultdict(dict)
@@ -57,7 +60,8 @@ def precision(case: Case) -> Precision:
                 call.setup()
 
             outputs = call.run()
-
+            # the outputs as the case names them: a lone tensor as a tuple,
+            # and a training step's through its postprocessing_fn
             if isinstance(outputs, torch.Tensor):
                 outputs = (outputs,)
             else:
