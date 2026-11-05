@@ -290,7 +290,7 @@ def lm_head(
         vocab_size=shape.vocab_size,
     )
 
-    A = logit_rows(
+    A_fp32 = logit_rows(
         shape=shape,
         weight=weight,
         target=target,
@@ -299,19 +299,213 @@ def lm_head(
     )
 
     if rmsnorm:
-        # the norm's weight folds into B and divides out of A, so the
-        # logits stay near the plain op's
+        # B is the weight times the norm's weight gamma, and A is divided
+        # by gamma, so the logits stay near the plain op's
         gamma = sampler.gamma(
             size=shape.dim,
             dtype=torch.float32,
         )
-    else:
-        A = A.to(dtype=dtype)
+        A_over_gamma = A_fp32 / gamma
+        samples_rmsnorm = rmsnorm_operands(
+            shape=shape,
+            x=A_over_gamma,
+            rstd_nominal=shape.statistics.final_rstd,
+            sampler=sampler,
+            dtype=dtype,
+        )
+        weight_times_gamma = weight * gamma
         return {
-            "A": A,
+            "A": samples_rmsnorm["A"],
+            "B": weight_times_gamma.to(dtype=dtype).mT,
+            "rstd": samples_rmsnorm["rstd"],
+            "target": target,
+        }
+    else:
+        return {
+            "A": A_fp32.to(dtype=dtype),
             "B": samples_linear["B"],
             "target": target,
         }
+
+
+def muon_iterate(
+    weight: torch.Tensor,
+    steps: int,
+    coefficients: tuple[float, float, float],
+) -> torch.Tensor:
+    # Muon's Newton-Schulz iterate after this many steps, computed in fp64:
+    # the weight divided by its norm, then X = a X + (b G + c G G) X with
+    # G = X X^T at each step
+    a, b, c = coefficients
+    weight_fp64 = weight.to(dtype=torch.float64)
+    norm = torch.linalg.vector_norm(weight_fp64)
+    X = weight_fp64 / (norm + MUON_EPS)
+
+    for _ in range(steps):
+        gram = torch.mm(
+            input=X,
+            mat2=X.mT,
+        )
+        gram_squared = torch.mm(
+            input=gram,
+            mat2=gram,
+        )
+        polynomial = b * gram + c * gram_squared
+        update = torch.mm(
+            input=polynomial,
+            mat2=X,
+        )
+        X = a * X + update
+
+    return X
+
+
+def lm_head_dlogits(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    target: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    # the cross-entropy gradient on the LM head's logits: each row sums to
+    # zero, with most of its weight on the target
+    M, _ = A.shape
+    dlogits_chunks = []
+
+    for start in range(0, M, DLOGITS_CHUNK_SIZE):
+        stop = start + DLOGITS_CHUNK_SIZE
+        logits = torch.mm(
+            input=A_chunk,
+            mat2=B,
+            out_dtype=torch.float32,
+        )
+        _, dlogits = torch_ops.cross_entropy(
+            logits=logits,
+            target=target_chunk,
+            ignore_index=data.IGNORE_INDEX,
+            cross_entropy_numerics=torch_ops.CrossEntropyNumerics.precise,
+        )
+        dlogits_chunks.append(dlogits.to(dtype=dtype))
+
+    return torch.cat(tensors=dlogits_chunks)
+
+
+
+def linear_qknorm_rope_operands(
+    shape: Shape,
+    size_q: int,
+    size_k: int,
+    size_v: int,
+    sampler: Sampler,
+    dtype: torch.dtype,
+) -> dict:
+    # a linear_qknorm_rope step's tensors: the [q | k | v] weight, x,
+    # gamma, and the cotangents dq, dk and dv; dq and dk come from
+    # qk_cotangent
+    size_qk = size_q + size_k
+    weight = sampler.weight(
+        shape=(size_qk + size_v, shape.dim),
+        dtype=dtype,
+    )
+    x = sampler.randn(
+        shape=(shape.tokens, shape.dim),
+        dtype=dtype,
+    )
+    gamma = sampler.gamma(
+        size=2 * shape.head_dim,
+        dtype=dtype,
+    )
+    random_dq = sampler.randn(
+        shape=(shape.tokens, size_q),
+        dtype=dtype,
+    )
+    random_dk = sampler.randn(
+        shape=(shape.tokens, size_k),
+        dtype=dtype,
+    )
+    dv = sampler.randn(
+        shape=(shape.tokens, size_v),
+        dtype=dtype,
+    )
+
+    # q and k before the norm, as the GEMM's fp32 accumulator holds them
+    weight_qk = weight[:size_qk]
+    accumulator = torch.mm(
+        input=x,
+        mat2=weight_qk.mT,
+        out_dtype=torch.float32,
+    )
+    random_qk = torch.cat(
+        tensors=(random_dq, random_dk),
+        dim=1,
+    )
+    cotangent = qk_cotangent(
+        shape=shape,
+        random=random_qk,
+        z=accumulator,
+        gamma=gamma,
+        sampler=sampler,
+        dtype=dtype,
+    )
+    cotangent_q, cotangent_k = torch.split(
+        tensor=cotangent,
+        split_size_or_sections=(size_q, size_k),
+        dim=1,
+    )
+    return {
+        "weight": weight,
+        "x": x,
+        "gamma": gamma,
+        "dq": cotangent_q.contiguous(),
+        "dk": cotangent_k.contiguous(),
+        "dv": dv,
+    }
+
+
+def qknorm_rope_bwd_zdz_operands(
+    shape: Shape,
+    preact: torch.Tensor,
+    gamma: torch.Tensor,
+    size_v: int,
+    sampler: Sampler,
+    dtype: torch.dtype,
+) -> dict:
+    # what the zdz backward reads besides the forward's saved tensors: dy,
+    # the cotangent of [q | k | v] (from qk_cotangent on q and k, so zdz is
+    # a well-conditioned sum, and random on v); v; and dv, v's gradient
+    # from attention, which the backward adds to dy on v's columns
+    random = sampler.randn(
+        shape=preact.shape,
+        dtype=dtype,
+    )
+    cotangent_qk = qk_cotangent(
+        shape=shape,
+        random=random,
+        z=preact,
+        gamma=gamma,
+        sampler=sampler,
+        dtype=dtype,
+    )
+    cotangent_v = sampler.randn(
+        shape=(shape.tokens, size_v),
+        dtype=dtype,
+    )
+    dy = torch.cat(
+        tensors=(cotangent_qk, cotangent_v),
+        dim=1,
+    )
+    v = sampler.randn(
+        shape=(shape.tokens, size_v),
+        dtype=dtype,
+    )
+    dv = sampler.randn(
+        shape=(shape.tokens, size_v),
+        dtype=dtype,
+    )
+    return {
+        "dy": dy,
+        "v": v,
+        "dv": dv,
+    }
 
 
 def batched_shape(
