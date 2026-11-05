@@ -130,6 +130,26 @@ def rope_operands(shape: Shape) -> dict:
     }
 
 
+def cache_rope_cos_sin(
+    positions: torch.Tensor,
+    frequencies: torch.Tensor,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # fp32 cos and sin tables for the arms that take them in place of
+    # positions and frequencies; computed in fp64, so they rotate by the
+    # oracle's angles
+    assert frequencies.ndim == 1
+    assert frequencies.shape[0] % head_dim == 0
+    head_frequencies = frequencies[:head_dim]
+    head_frequencies_fp64 = head_frequencies.to(dtype=torch.float64)
+    positions_fp64 = positions.to(dtype=torch.float64)
+    cos, sin = torch_ops.rope_tables(
+        positions=positions_fp64,
+        frequencies=head_frequencies_fp64,
+    )
+    return cos.to(dtype=torch.float32), sin.to(dtype=torch.float32)
+
+
 def split_layout_heads(
     x: torch.Tensor,
     num_heads: int,
@@ -184,6 +204,48 @@ def split_swiglu_weight(B: torch.Tensor) -> torch.Tensor:
         two=2,
     ).contiguous()
     return split.mT
+
+
+def split_rope_weight(
+    B: torch.Tensor,
+    size_qk: int,
+    head_dim: int,
+) -> torch.Tensor:
+    # B is the transposed weight: its q and k rows move to the split
+    # layout, any v rows stay, and it is transposed back to keep B's strides
+    weight = B.mT
+    assert weight.ndim == 2
+    assert weight.is_contiguous()
+    weight_qk = weight[:size_qk]
+    weight_v = weight[size_qk:]
+    assert head_dim % 2 == 0
+    half = head_dim // 2
+    weight_split_qk = rearrange(
+        tensor=weight_qk,
+        pattern="(h p two) k -> (h two p) k",
+        two=2,
+        p=half,
+    )
+    weight_split = torch.cat(
+        tensors=(weight_split_qk, weight_v),
+        dim=0,
+    )
+    assert weight_split.is_contiguous()
+    return weight_split.mT
+
+
+def head_norms(
+    x: torch.Tensor,
+    head_dim: int,
+) -> torch.Tensor:
+    # each row's norm per head, (M, heads), in fp64
+    x_fp64 = x.to(dtype=torch.float64)
+    heads = rearrange(
+        tensor=x_fp64,
+        pattern="m (h d) -> m h d",
+        d=head_dim,
+    )
+    return heads.norm(dim=-1)
 
 
 def linear_operands(
