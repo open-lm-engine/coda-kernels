@@ -227,6 +227,12 @@ def measure_head_norms(
     return heads.norm(dim=-1)
 
 
+def count_non_ignored_targets(target: torch.Tensor) -> int:
+    # the number of targets not set to IGNORE_INDEX
+    non_ignored = (target != data.IGNORE_INDEX)
+    return non_ignored.sum().item()
+
+
 def gemm_operands(
     shape: Shape,
     out_features: int,
@@ -246,6 +252,48 @@ def gemm_operands(
     return {
         "A": A,
         "B": weight.mT,
+    }
+
+
+def rmsnorm_operands(
+    shape: Shape,
+    x: torch.Tensor,
+    rstd_scale: float,
+    sampler: Sampler,
+    dtype: torch.dtype,
+) -> dict:
+    # an rmsnorm input A whose scale the next GEMM applies, x rescaled per
+    # row so its rstd lies near rstd_nominal, and that rstd
+    row_multipliers = sampler.multipliers(
+        size=shape.tokens,
+        ratio=ROW_RSTD_RATIO,
+    )
+    x_fp32 = x.to(dtype=torch.float32)
+    x_square = x_fp32.square()
+    mean_square = reduce(
+        tensor=x_square,
+        pattern="m n -> m",
+        reduction="mean",
+    )
+    rms = torch.sqrt(mean_square)
+    scaled_rms = rstd_scale * rms
+    row_scale = row_multipliers / scaled_rms
+    row_scale = rearrange(
+        tensor=row_scale,
+        pattern="m -> m 1",
+    )
+    A_fp32 = x_fp32 * row_scale
+    A = A_fp32.to(dtype=dtype)
+
+    # rstd of A as stored, which is what the GEMM reads
+    stored = A.to(dtype=torch.float32)
+    rstd = torch_ops.rmsnorm_rstd(
+        x=stored,
+        eps=data.NORM_EPS,
+    )
+    return {
+        "A": A,
+        "rstd": rstd,
     }
 
 
@@ -429,20 +477,24 @@ def lm_head_operands(
     )
 
     if rmsnorm:
-        # the op normalizes A / gamma to unit rms per row, then multiplies
-        # by B, the weight times gamma; B also carries the rows' median rms,
-        # so each row's logits are the fit's scaled by 0.78 to 1.28, and the
-        # loss distribution stays the plain op's
+        # rmsnorm rescales each row of A / gamma to unit rms, so B carries
+        # gamma and the rows' median rms to keep the logits near the plain op's
         gamma = sampler.gamma(
             size=shape.dim,
             dtype=torch.float32,
         )
         A_over_gamma = A_fp32 / gamma
-        weight_times_gamma = weight * gamma
+        mean_square = reduce(
+            tensor=A_over_gamma.square(),
+            pattern="m n -> m",
+            reduction="mean",
+        )
+        median_rms = torch.sqrt(mean_square).median()
+        weight_times_gamma = weight * gamma * median_rms
         samples_rmsnorm = rmsnorm_operands(
             shape=shape,
             x=A_over_gamma,
-            rstd_nominal=shape.statistics.final_rstd,
+            rstd_scale=shape.statistics.final_rstd,
             sampler=sampler,
             dtype=dtype,
         )
