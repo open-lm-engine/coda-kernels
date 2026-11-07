@@ -246,13 +246,13 @@ def calibrate_cosines(
     direction_heads = rearrange(
         tensor=direction_fp32,
         pattern="m (h d) -> m h d",
-        e=head_dim,
+        d=head_dim,
     )
     x_fp32 = x.to(dtype=torch.float32)
     x_heads = rearrange(
         tensor=x_fp32,
         pattern="m (h d) -> m h d",
-        e=head_dim,
+        d=head_dim,
     )
 
     # x's part along direction, and its part perpendicular to it
@@ -546,7 +546,7 @@ def block_input(
         "w3": (3 * shape.dim, shape.dim),
     }
 
-    # block_post's w3 is the LM head instead
+    # the final block takes the LM head as w3
     if is_final:
         weight_shapes["w3"] = (shape.vocab_size, shape.dim)
 
@@ -583,6 +583,70 @@ def block_input(
             dtype=dtype,
         )
         return ACTIVATION_STD * values
+
+
+def gemm_xsa_bwd_operands(
+    shape: Shape,
+    sampler: Sampler,
+    dtype: torch.dtype,
+) -> dict:
+    # attention's output x and its value v, and the output projection's
+    # cotangent A and k-major weight B
+    v = sampler.randn(
+        shape=(shape.tokens, shape.dim),
+        dtype=dtype,
+    )
+    x = sampler.randn(
+        shape=(shape.tokens, shape.dim),
+        dtype=dtype,
+    )
+    A = sampler.randn(
+        shape=(shape.tokens, shape.dim),
+        dtype=dtype,
+    )
+    weight = sampler.weight(
+        shape=(shape.dim, shape.dim),
+        dtype=dtype,
+    )
+
+    # per head, x is X_OVER_V of v's length, at a drawn cosine to v
+    assert shape.dim % shape.head_dim == 0
+    num_heads = shape.dim // shape.head_dim
+    flat_cosines = sampler.uniform(
+        size=shape.tokens * num_heads,
+        low=COSINE_LOW,
+        high=COSINE_LOW + 1.0,
+    )
+    target_cosines = rearrange(
+        tensor=flat_cosines,
+        pattern="(m h) -> m h",
+        h=num_heads,
+    )
+    v_norms = measure_head_norms(
+        x=v,
+        head_dim=shape.head_dim,
+    )
+    x_norms = X_OVER_V * v_norms
+
+    # XSA reads v in place from a [Q | K | V] buffer; the rest is NaN, so
+    # any read outside v shows up
+    buffer = torch.full(
+        size=(shape.tokens, 3 * shape.dim),
+        fill_value=math.nan,
+        dtype=v.dtype,
+        device=v.device,
+    )
+    v_start = 2 * shape.dim
+    v_packed = buffer[:, v_start:]
+    v_packed.copy_(v)
+    B = weight.mT
+    return {
+        "x": x,
+        "v": v_packed,
+        "head_dim": shape.head_dim,
+        "A": A,
+        "B": B,
+    }
 
 
 def qknorm_rope_bwd_zdz_operands(
@@ -805,3 +869,39 @@ def gemm_residual_rmsnorm_gemm_operands(
         "w1": w1,
         "wn": wn,
     }
+
+
+def block_operands(
+    shape: Shape,
+    name: str,
+    sampler: Sampler,
+    dtype: torch.dtype,
+) -> dict:
+    # a block's leaves, a cotangent per output and rope's operands; name
+    # is family and place, e.g. llama3.block_post. Activations and their
+    # cotangents are (B, T, width), weights 2D, positions (B * T,)
+    block = BLOCKS[name]
+    inputs = {}
+
+    for leaf_name in block.leaves:
+        inputs[leaf_name] = block_input(
+            shape=shape,
+            name=leaf_name,
+            is_final=block.is_final,
+            sampler=sampler,
+            dtype=dtype,
+        )
+
+    inputs["positions"] = token_positions(shape=shape)
+    pair_frequencies = inv_freq(shape=shape)
+
+    # q's and k's heads alone; a transformer block has as many k heads
+    # as q heads
+    qk_heads = 2 * shape.heads
+    frequencies = make_rope_frequencies(
+        inv_freq=pair_frequencies,
+        num_heads=qk_heads,
+    )
+
+    inputs["frequencies"] = frequencies
+    return inputs
