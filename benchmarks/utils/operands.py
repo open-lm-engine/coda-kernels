@@ -233,6 +233,132 @@ def count_non_ignored_targets(target: torch.Tensor) -> int:
     return non_ignored.sum().item()
 
 
+def calibrate_cosines(
+    x: torch.Tensor,
+    direction: torch.Tensor,
+    cosine: torch.Tensor,
+    norm: torch.Tensor,
+    head_dim: int,
+) -> torch.Tensor:
+    # x aligned with direction, per head, to the given cosine and norm, in
+    # fp32; the rest of it points along x's part perpendicular to direction
+    direction_fp32 = direction.to(dtype=torch.float32)
+    direction_heads = rearrange(
+        tensor=direction_fp32,
+        pattern="m (h d) -> m h d",
+        e=head_dim,
+    )
+    x_fp32 = x.to(dtype=torch.float32)
+    x_heads = rearrange(
+        tensor=x_fp32,
+        pattern="m (h d) -> m h d",
+        e=head_dim,
+    )
+
+    # x's part along direction, and its part perpendicular to it
+    direction_norms = direction_heads.norm(
+        dim=-1,
+        keepdim=True,
+    )
+    direction_unit = direction_heads / direction_norms
+    dot_terms = x_heads * direction_unit
+    x_dot_direction = reduce(
+        tensor=dot_terms,
+        pattern="m h d -> m h 1",
+        reduction="sum",
+    )
+    x_parallel = x_dot_direction * direction_unit
+    x_perpendicular = x_heads - x_parallel
+    x_perpendicular_norms = x_perpendicular.norm(
+        dim=-1,
+        keepdim=True,
+    )
+    perpendicular_unit = x_perpendicular / x_perpendicular_norms
+
+    # the unit vector at the given cosine to direction, on x's side
+    cosine_fp32 = cosine.to(dtype=torch.float32)
+    cosine_heads = rearrange(
+        tensor=cosine_fp32,
+        pattern="m h -> m h 1",
+    )
+    cosine_squared = cosine_heads.square()
+    sine_squared = 1.0 - cosine_squared
+    sine_heads = torch.sqrt(sine_squared)
+    parallel_part = cosine_heads * direction_unit
+    perpendicular_part = sine_heads * perpendicular_unit
+    aligned_unit = parallel_part + perpendicular_part
+
+    # scaled to the given norm
+    norm_fp32 = norm.to(dtype=torch.float32)
+    norm_heads = rearrange(
+        tensor=norm_fp32,
+        pattern="m h -> m h 1",
+    )
+    aligned_heads = aligned_unit * norm_heads
+    return rearrange(
+        tensor=aligned_heads,
+        pattern="m h d -> m (h d)",
+    )
+
+
+def calibrate_logits(
+    x: torch.Tensor,
+    weight_rows: torch.Tensor,
+    logits: torch.Tensor,
+) -> torch.Tensor:
+    # x (M, dim) moved by the smallest step that makes its logits on each
+    # row's gathered weight rows (M, n, dim) equal logits (M, n); the step
+    # lies within those weight rows, so x's other logits barely change
+
+    # x's current logits on the chosen tokens, and their gap to the targets
+    x_column = rearrange(
+        tensor=x,
+        pattern="m d -> m d 1",
+    )
+    current_logits = torch.bmm(
+        input=weight_rows,
+        mat2=x_column,
+    )
+    current_logits = rearrange(
+        tensor=current_logits,
+        pattern="m n 1 -> m n",
+    )
+    logit_gap = logits - current_logits
+
+    # how much of each weight row the step adds: solved from the rows' dot
+    # products, plus a small ridge that keeps the system solvable when a row
+    # drew the same token twice
+    weight_dots = torch.bmm(
+        input=weight_rows,
+        mat2=weight_rows.mT,
+    )
+    identity = torch.eye(
+        n=weight_rows.shape[1],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    ridged_dots = weight_dots + RIDGE * identity
+    step_weights = torch.linalg.solve(
+        A=ridged_dots,
+        B=logit_gap,
+    )
+
+    # the step, step_weights times the weight rows
+    step_weights = rearrange(
+        tensor=step_weights,
+        pattern="m n -> m 1 n",
+    )
+    step = torch.bmm(
+        input=step_weights,
+        mat2=weight_rows,
+    )
+    step = rearrange(
+        tensor=step,
+        pattern="m 1 d -> m d",
+    )
+    return x + step
+
+
 def gemm_operands(
     shape: Shape,
     out_features: int,
