@@ -405,7 +405,7 @@ def lm_head_dlogits(
 def block_input(
     shape: Shape,
     name: str,
-    is_vocab: bool,
+    is_final: bool,
     sampler: Sampler,
     dtype: torch.dtype,
 ) -> torch.Tensor:
@@ -421,7 +421,7 @@ def block_input(
     }
 
     # block_post's w3 is the LM head instead
-    if is_vocab:
+    if is_final:
         weight_shapes["w3"] = (shape.vocab_size, shape.dim)
 
     if name in weight_shapes:
