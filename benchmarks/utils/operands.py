@@ -759,28 +759,35 @@ def block_input(
     if is_final:
         weight_shapes["w3"] = (shape.vocab_size, shape.dim)
 
+    # the norm weights' sizes; wn2 is q's and k's per-head norm weights, one
+    # head each
+    norm_sizes = {
+        "wn": shape.dim,
+        "wn0": shape.dim,
+        "wn1": shape.dim,
+        "wn2": 2 * shape.head_dim,
+    }
+    # the activations' stds: ACTIVATION_STD, and 1 for v0, the previous
+    # block's v
+    activation_stds = {
+        "x": ACTIVATION_STD,
+        "x0": ACTIVATION_STD,
+        "o0": ACTIVATION_STD,
+        "y0": ACTIVATION_STD,
+        "v0": 1.0,
+    }
+    # each name is in exactly one table
+    tables = (weight_shapes, norm_sizes, activation_stds)
+    assert sum(name in table for table in tables) == 1
+
     if name in weight_shapes:
         return sampler.weight(
             shape=weight_shapes[name],
             dtype=dtype,
         )
-    elif name == "wn2":
-        # q's and k's per-head norm weights, one head each
+    elif name in norm_sizes:
         return sampler.gamma(
-            size=2 * shape.head_dim,
-            dtype=dtype,
-        )
-    elif name.startswith("wn"):
-        return sampler.gamma(
-            size=shape.dim,
-            dtype=dtype,
-        )
-    elif name == "v0":
-        return sampler.randn(
-            shape=batched_shape(
-                shape=shape,
-                width=shape.dim,
-            ),
+            size=norm_sizes[name],
             dtype=dtype,
         )
     else:
@@ -791,7 +798,7 @@ def block_input(
             ),
             dtype=dtype,
         )
-        return ACTIVATION_STD * values
+        return activation_stds[name] * values
 
 
 def gemm_xsa_bwd_operands(
@@ -805,7 +812,7 @@ def gemm_xsa_bwd_operands(
         shape=(shape.tokens, shape.dim),
         dtype=dtype,
     )
-    x = sampler.randn(
+    random_x = sampler.randn(
         shape=(shape.tokens, shape.dim),
         dtype=dtype,
     )
@@ -821,21 +828,24 @@ def gemm_xsa_bwd_operands(
     # per head, x is X_OVER_V of v's length, at a drawn cosine to v
     assert shape.dim % shape.head_dim == 0
     num_heads = shape.dim // shape.head_dim
-    flat_cosines = sampler.uniform(
-        size=shape.tokens * num_heads,
+    cosines_to_v = sampler.uniform(
+        shape=(shape.tokens, num_heads),
         low=COSINE_LOW,
         high=COSINE_LOW + 1.0,
-    )
-    target_cosines = rearrange(
-        tensor=flat_cosines,
-        pattern="(m h) -> m h",
-        h=num_heads,
     )
     v_norms = measure_head_norms(
         x=v,
         head_dim=shape.head_dim,
     )
     x_norms = X_OVER_V * v_norms
+    x_fp32 = calibrate_cosines(
+        x=random_x,
+        direction=v,
+        cosine=cosines_to_v,
+        norm=x_norms,
+        head_dim=shape.head_dim,
+    )
+    x = x_fp32.to(dtype=dtype)
 
     # XSA reads v in place from a [Q | K | V] buffer; the rest is NaN, so
     # any read outside v shows up
@@ -858,6 +868,80 @@ def gemm_xsa_bwd_operands(
     }
 
 
+def qknorm_rope_bwd_operands(
+    shape: Shape,
+    rmsnorm: bool,
+    sampler: Sampler,
+    dtype: torch.dtype,
+) -> dict:
+    # what qk-norm rope's forward saves for its backward: gamma (one q
+    # head's, then one k head's), preact, head_mean_sq, and rstd with rmsnorm
+    heads = shape.heads + shape.kv_heads
+
+    # z is what qk-norm normalizes, at the shape's head mean square: the
+    # GEMM's fp32 accumulator, or with rmsnorm rstd times it
+    noise = sampler.randn(
+        shape=(shape.tokens, heads * shape.head_dim),
+        dtype=torch.float32,
+    )
+    row_scales = sampler.multipliers(
+        size=shape.tokens,
+        ratio=QKNORM_ROW_RATIO,
+    )
+    head_scales = sampler.multipliers(
+        size=heads,
+        ratio=QKNORM_HEAD_RATIO,
+    )
+    row_scales = rearrange(
+        tensor=row_scales,
+        pattern="m -> m 1",
+    )
+    row_mean_square = shape.statistics.head_mean_sq * row_scales
+    mean_square = row_mean_square * head_scales
+    rms = torch.sqrt(mean_square)
+    column_rms = repeat(
+        tensor=rms,
+        pattern="m h -> m (h d)",
+        d=shape.head_dim,
+    )
+    z = noise * column_rms
+    gamma = sampler.gamma(
+        size=2 * shape.head_dim,
+        dtype=dtype,
+    )
+    saved = {"gamma": gamma}
+
+    if rmsnorm:
+        # rstd at the input norm's level, varied across tokens; preact is
+        # the accumulator before rstd scales it
+        multipliers = sampler.multipliers(
+            size=shape.tokens,
+            ratio=QKNORM_ROW_RATIO,
+        )
+        rstd = shape.statistics.rstd * multipliers
+        rstd_column = rearrange(
+            tensor=rstd,
+            pattern="m -> m 1",
+        )
+        accumulator = z / rstd_column
+        preact = accumulator.to(dtype=dtype)
+        preact_fp32 = preact.to(dtype=torch.float32)
+        stored = preact_fp32 * rstd_column
+        saved["rstd"] = rstd
+    else:
+        preact = z.to(dtype=dtype)
+        stored = preact.to(dtype=torch.float32)
+
+    saved["preact"] = preact
+
+    # head_mean_sq as the backward forms it, from the stored preact
+    saved["head_mean_sq"] = torch_ops.head_mean_square(
+        x=stored,
+        head_dim=shape.head_dim,
+    )
+    return saved
+
+
 def qknorm_rope_bwd_zdz_operands(
     shape: Shape,
     preact: torch.Tensor,
@@ -867,17 +951,17 @@ def qknorm_rope_bwd_zdz_operands(
     dtype: torch.dtype,
 ) -> dict:
     # what the zdz backward reads besides the forward's saved tensors: dy,
-    # the cotangent of [q | k | v] (from qk_cotangent on q and k, so zdz is
-    # a well-conditioned sum, and random on v); v; and dv, v's gradient
-    # from attention, which the backward adds to dy on v's columns
+    # the cotangent of [q | k | v] (from calibrate_qk_cotangent on q and k,
+    # so zdz is a well-conditioned sum, and random on v); v; and dv, v's
+    # gradient from attention, which the backward adds to dy on v's columns
     random = sampler.randn(
         shape=preact.shape,
         dtype=dtype,
     )
-    cotangent_qk = qk_cotangent(
+    cotangent_qk = calibrate_qk_cotangent(
         shape=shape,
-        random=random,
-        z=preact,
+        random_cotangent=random,
+        qk_preact=preact,
         gamma=gamma,
         sampler=sampler,
         dtype=dtype,
