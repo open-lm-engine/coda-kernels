@@ -217,7 +217,7 @@ def measure_head_norms(
     x: torch.Tensor,
     head_dim: int,
 ) -> torch.Tensor:
-    # each row's norm per head, (M, heads), in fp32
+    # each token's norm per head, (tokens, heads), in fp32
     x_fp32 = x.to(dtype=torch.float32)
     heads = rearrange(
         tensor=x_fp32,
@@ -303,20 +303,27 @@ def calibrate_cosines(
 
 def calibrate_logits(
     x: torch.Tensor,
-    weight_rows: torch.Tensor,
+    candidate_weights: torch.Tensor,
     logits: torch.Tensor,
 ) -> torch.Tensor:
-    # x (M, dim) moved by the smallest step that makes its logits on each
-    # row's gathered weight rows (M, n, dim) equal logits (M, n); the step
-    # lies within those weight rows, so x's other logits barely change
+    # x (num_tokens, dim) moved by the smallest step that makes its logits on
+    # each token's candidate weights (num_tokens, num_logits, dim) equal
+    # logits (num_tokens, num_logits); the step lies within those weights, so
+    # x's other logits barely change
+    assert x.ndim == 2
+    num_tokens, dim = x.shape
+    assert candidate_weights.ndim == 3
+    num_logits = candidate_weights.shape[1]
+    assert candidate_weights.shape == (num_tokens, num_logits, dim)
+    assert logits.shape == (num_tokens, num_logits)
 
-    # x's current logits on the chosen tokens, and their gap to the targets
+    # x's current logits on its candidates, and their gap to the targets
     x_column = rearrange(
         tensor=x,
         pattern="m d -> m d 1",
     )
     current_logits = torch.bmm(
-        input=weight_rows,
+        input=candidate_weights,
         mat2=x_column,
     )
     current_logits = rearrange(
@@ -325,32 +332,32 @@ def calibrate_logits(
     )
     logit_gap = logits - current_logits
 
-    # how much of each weight row the step adds: solved from the rows' dot
-    # products, plus a small ridge that keeps the system solvable when a row
-    # drew the same token twice
-    weight_dots = torch.bmm(
-        input=weight_rows,
-        mat2=weight_rows.mT,
+    # how much of each candidate weight the step adds: solved from the
+    # weights' dot products, plus a small ridge that keeps the system
+    # solvable when a token drew the same candidate twice
+    candidate_dots = torch.bmm(
+        input=candidate_weights,
+        mat2=candidate_weights.mT,
     )
     identity = torch.eye(
-        n=weight_rows.shape[1],
+        n=num_logits,
         dtype=torch.float32,
         device="cuda",
     )
-    ridged_dots = weight_dots + RIDGE * identity
-    step_weights = torch.linalg.solve(
+    ridged_dots = candidate_dots + RIDGE * identity
+    step_coefficients = torch.linalg.solve(
         A=ridged_dots,
         B=logit_gap,
     )
 
-    # the step, step_weights times the weight rows
-    step_weights = rearrange(
-        tensor=step_weights,
+    # the step: step_coefficients times the candidate weights
+    step_coefficients = rearrange(
+        tensor=step_coefficients,
         pattern="m n -> m 1 n",
     )
     step = torch.bmm(
-        input=step_weights,
-        mat2=weight_rows,
+        input=step_coefficients,
+        mat2=candidate_weights,
     )
     step = rearrange(
         tensor=step,
@@ -490,27 +497,229 @@ def muon_iterate(
     return X
 
 
+def calibrate_qk_cotangent(
+    shape: Shape,
+    random_cotangent: torch.Tensor,
+    qk_preact: torch.Tensor,
+    gamma: torch.Tensor,
+    sampler: Sampler,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    # a realistic cotangent on the rotated q and k heads, made from a random
+    # one; qk_preact holds q and k before qk-norm, and gamma the norm's
+    # weight, one q head's then one k head's
+
+    # every head's norm weight: q's for the q heads, k's for the k heads
+    num_heads = shape.heads + shape.kv_heads
+    gamma_fp32 = gamma.to(dtype=torch.float32)
+    gamma_q, gamma_k = torch.split(
+        tensor=gamma_fp32,
+        split_size_or_sections=(shape.head_dim, shape.head_dim),
+    )
+    gamma_per_q_head = repeat(
+        tensor=gamma_q,
+        pattern="d -> h d",
+        h=shape.heads,
+    )
+    gamma_per_k_head = repeat(
+        tensor=gamma_k,
+        pattern="d -> h d",
+        h=shape.kv_heads,
+    )
+    gamma_per_head = torch.cat(tensors=(gamma_per_q_head, gamma_per_k_head))
+
+    # q and k after qk-norm, up to each head's scale: the norm divides a
+    # head by one scalar, its rstd, before multiplying by gamma
+    qk_fp32 = qk_preact.to(dtype=torch.float32)
+    qk_per_head = rearrange(
+        tensor=qk_fp32,
+        pattern="m (h d) -> m h d",
+        d=shape.head_dim,
+    )
+    normed_qk_per_head = qk_per_head * gamma_per_head
+    normed_qk = rearrange(
+        tensor=normed_qk_per_head,
+        pattern="m h d -> m (h d)",
+    )
+
+    # each head of the random cotangent turned to a cosine with its normed
+    # head drawn within COSINE_LIMIT, keeping its length; left random, the
+    # cosine sits near 0.1 and shrinks qk-norm's projection term to a tenth
+    cosine_per_head = sampler.uniform(
+        shape=(shape.tokens, num_heads),
+        low=-COSINE_LIMIT,
+        high=COSINE_LIMIT,
+    )
+    norm_per_head = measure_head_norms(
+        x=random_cotangent,
+        head_dim=shape.head_dim,
+    )
+    cotangent_before_rope = calibrate_cosines(
+        x=random_cotangent,
+        direction=normed_qk,
+        cosine=cosine_per_head,
+        norm=norm_per_head,
+        head_dim=shape.head_dim,
+    )
+
+    # then rotated by the forward's rope angles, since the cotangent arrives
+    # on the rotated heads; rope takes (tokens, heads, head_dim)
+    samples_rope = rope_operands(shape=shape)
+    frequencies = samples_rope["frequencies_qk"]
+    assert frequencies.shape[0] == num_heads * shape.head_dim
+    cos, sin = cache_rope_cos_sin(
+        positions=samples_rope["positions"],
+        frequencies=frequencies,
+        head_dim=shape.head_dim,
+    )
+    cotangent_before_rope_per_head = rearrange(
+        tensor=cotangent_before_rope,
+        pattern="m (h d) -> m h d",
+        d=shape.head_dim,
+    )
+    cotangent_per_head = torch_ops.rope(
+        x=cotangent_before_rope_per_head,
+        cos=cos,
+        sin=sin,
+        layout=torch_ops.PairLayout.interleaved,
+    )
+    cotangent = rearrange(
+        tensor=cotangent_per_head,
+        pattern="m h d -> m (h d)",
+    )
+    return cotangent.to(dtype=dtype)
+
+
+def calibrate_lm_head_input(
+    shape: Shape,
+    random_input: torch.Tensor,
+    weight: torch.Tensor,
+    target: torch.Tensor,
+    sampler: Sampler,
+) -> torch.Tensor:
+    # the LM head's input A (tokens, dim), the final norm's output, in fp32:
+    # random_input calibrated so the logits A @ weight^T follow the fit at
+    # the top, each position's candidates at drawn logits over a random
+    # background
+    assert random_input.shape == (shape.tokens, shape.dim)
+    assert weight.shape == (shape.vocab_size, shape.dim)
+    assert target.shape == (shape.tokens,)
+
+    # each position's candidates: its target first, or a random token where
+    # the target is ignored, then a rival and the others
+    candidate_tokens = sampler.tokens(
+        shape=(shape.tokens, CANDIDATES),
+        vocab_size=shape.vocab_size,
+    )
+    non_ignored = (target != data.IGNORE_INDEX)
+    candidate_tokens[:, 0] = torch.where(
+        condition=non_ignored,
+        input=target,
+        other=candidate_tokens[:, 0],
+    )
+
+    # their logits: each position's baseline, plus each candidate's offset
+    # over it
+    baseline_noise = sampler.randn(
+        shape=(shape.tokens, 1),
+        dtype=torch.float32,
+    )
+    baseline = BASELINE.mean + BASELINE.std * baseline_noise
+    offset_noise = sampler.randn(
+        shape=(shape.tokens, CANDIDATES),
+        dtype=torch.float32,
+    )
+    background_std = sampler.log_uniform(
+        size=shape.tokens,
+        low=BACKGROUND_STD_LOW,
+        high=BACKGROUND_STD_HIGH,
+    )
+    other_means = [OTHER_CANDIDATE.mean] * OTHER_CANDIDATES
+    other_stds = [OTHER_CANDIDATE.std] * OTHER_CANDIDATES
+    offset_means = torch.tensor(
+        data=[TARGET.mean, RIVAL.mean] + other_means,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    offset_stds = torch.tensor(
+        data=[TARGET.std, RIVAL.std] + other_stds,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    candidate_logits = baseline + offset_means + offset_stds * offset_noise
+
+    # the background: the random input, scaled so each position's other
+    # logits have std background_std; each candidate's weight also adds its
+    # logit times a unit-variance draw to every other logit, so the
+    # background keeps only the variance left, at least
+    # BACKGROUND_VARIANCE_MIN
+    candidate_logits_squared = candidate_logits.square()
+    candidate_sum_squares = reduce(
+        tensor=candidate_logits_squared,
+        pattern="m n -> m",
+        reduction="sum",
+    )
+    candidate_variance = candidate_sum_squares / shape.dim
+    variance_left = background_std.square() - candidate_variance
+    background_variance = torch.clamp(
+        input=variance_left,
+        min=BACKGROUND_VARIANCE_MIN,
+    )
+    background_scale = torch.sqrt(background_variance)
+    background_scale = rearrange(
+        tensor=background_scale,
+        pattern="m -> m 1",
+    )
+    random_input_fp32 = random_input.to(dtype=torch.float32)
+    background = random_input_fp32 * background_scale
+
+    # the background moved so the candidates' logits are the drawn ones,
+    # LM_HEAD_CHUNK_SIZE positions at a time to bound the candidate weights'
+    # memory
+    A = torch.empty_like(background)
+    assert shape.tokens % LM_HEAD_CHUNK_SIZE == 0
+    for start in range(0, shape.tokens, LM_HEAD_CHUNK_SIZE):
+        stop = start + LM_HEAD_CHUNK_SIZE
+        background_chunk = background[start:stop, ...]
+        candidate_tokens_chunk = candidate_tokens[start:stop, ...]
+        candidate_logits_chunk = candidate_logits[start:stop, ...]
+        assert background_chunk.shape == (LM_HEAD_CHUNK_SIZE, shape.dim)
+        assert candidate_tokens_chunk.shape == (LM_HEAD_CHUNK_SIZE, CANDIDATES)
+        assert candidate_logits_chunk.shape == (LM_HEAD_CHUNK_SIZE, CANDIDATES)
+        candidate_weights = weight[candidate_tokens_chunk]
+        candidate_weights_fp32 = candidate_weights.to(dtype=torch.float32)
+        A_chunk = calibrate_logits(
+            x=background_chunk,
+            candidate_weights=candidate_weights_fp32,
+            logits=candidate_logits_chunk,
+        )
+        assert A_chunk.shape == (LM_HEAD_CHUNK_SIZE, shape.dim)
+        A[start:stop, ...] = A_chunk
+
+    return A
+
+
 def lm_head_dlogits(
     A: torch.Tensor,
     B: torch.Tensor,
     target: torch.Tensor,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    # the cross-entropy gradient on the LM head's logits: each row sums to
-    # zero, with most of its weight on the target
+    # the cross-entropy gradient on the LM head's logits: each token's sums
+    # to zero, with most of its weight on the target
     assert A.ndim == 2
-    M, K = A.shape
+    num_tokens, dim = A.shape
     assert B.ndim == 2
-    assert B.shape[0] == K
-    assert target.shape == (M,)
-    assert M % DLOGITS_CHUNK_SIZE == 0
+    assert B.shape[0] == dim
+    assert target.shape == (num_tokens,)
+    assert num_tokens % DLOGITS_CHUNK_SIZE == 0
     dlogits_chunks = []
 
-    for start in range(0, M, DLOGITS_CHUNK_SIZE):
+    for start in range(0, num_tokens, DLOGITS_CHUNK_SIZE):
         stop = start + DLOGITS_CHUNK_SIZE
         A_chunk = A[start:stop]
         target_chunk = target[start:stop]
-        assert A_chunk.shape == (DLOGITS_CHUNK_SIZE, K)
+        assert A_chunk.shape == (DLOGITS_CHUNK_SIZE, dim)
         assert target_chunk.shape == (DLOGITS_CHUNK_SIZE,)
         logits = torch.mm(
             input=A_chunk,
