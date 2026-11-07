@@ -262,8 +262,9 @@ def rmsnorm_operands(
     sampler: Sampler,
     dtype: torch.dtype,
 ) -> dict:
-    # an rmsnorm input A whose scale the next GEMM applies, x rescaled per
-    # row so its rstd lies near rstd_nominal, and that rstd
+    # an rmsnorm input A and its rstd: x rescaled per row so its rstd lies
+    # near rstd_scale, a value measured on real models, which keeps A's
+    # scale realistic
     row_multipliers = sampler.multipliers(
         size=shape.tokens,
         ratio=ROW_RSTD_RATIO,
@@ -399,6 +400,63 @@ def lm_head_dlogits(
         dlogits_chunks.append(dlogits.to(dtype=dtype))
 
     return torch.cat(tensors=dlogits_chunks)
+
+
+def block_input(
+    shape: Shape,
+    name: str,
+    is_vocab: bool,
+    sampler: Sampler,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    # one of a block's inputs, by name, at the usual init scale; w and w3
+    # project to [q | k | v] and w1 to the MLP's gate and up; an activation
+    # is (B, T, dim)
+    weight_shapes = {
+        "w": (3 * shape.dim, shape.dim),
+        "w0": (shape.dim, shape.dim),
+        "w1": (2 * shape.ffn, shape.dim),
+        "w2": (shape.dim, shape.ffn),
+        "w3": (3 * shape.dim, shape.dim),
+    }
+
+    # block_post's w3 is the LM head instead
+    if is_vocab:
+        weight_shapes["w3"] = (shape.vocab_size, shape.dim)
+
+    if name in weight_shapes:
+        return sampler.weight(
+            shape=weight_shapes[name],
+            dtype=dtype,
+        )
+    elif name == "wn2":
+        # q's and k's per-head norm weights, one head each
+        return sampler.gamma(
+            size=2 * shape.head_dim,
+            dtype=dtype,
+        )
+    elif name.startswith("wn"):
+        return sampler.gamma(
+            size=shape.dim,
+            dtype=dtype,
+        )
+    elif name == "v0":
+        return sampler.randn(
+            shape=batched_shape(
+                shape=shape,
+                width=shape.dim,
+            ),
+            dtype=dtype,
+        )
+    else:
+        values = sampler.randn(
+            shape=batched_shape(
+                shape=shape,
+                width=shape.dim,
+            ),
+            dtype=dtype,
+        )
+        return ACTIVATION_STD * values
 
 
 def qknorm_rope_bwd_zdz_operands(
