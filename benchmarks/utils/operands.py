@@ -1102,10 +1102,10 @@ def linear_qknorm_rope_operands(
         tensors=(random_dq, random_dk),
         dim=1,
     )
-    cotangent = qk_cotangent(
+    cotangent = calibrate_qk_cotangent(
         shape=shape,
-        random=random_qk,
-        z=accumulator,
+        random_cotangent=random_qk,
+        qk_preact=accumulator,
         gamma=gamma,
         sampler=sampler,
         dtype=dtype,
