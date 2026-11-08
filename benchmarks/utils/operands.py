@@ -750,7 +750,7 @@ def calibrate_lm_head_input(
         dtype=torch.float32,
     )
     background_std = sampler.log_uniform(
-        size=shape.tokens,
+        shape=(shape.tokens,),
         low=BACKGROUND_STD_LOW,
         high=BACKGROUND_STD_HIGH,
         dtype=torch.float32,
