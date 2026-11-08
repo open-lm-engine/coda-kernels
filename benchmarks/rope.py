@@ -120,14 +120,14 @@ def gemm_rope(
     samples_rope = operands.rope_operands(shape=shape)
     size_qk = samples_rope["size_q"] + samples_rope["size_k"]
     width = size_qk + samples_rope["size_v"]
-    samples_linear = operands.linear_operands(
+    samples_gemm = operands.gemm_operands(
         shape=shape,
         out_features=width,
         sampler=sampler,
         dtype=dtype,
     )
-    A = samples_linear["A"]
-    B = samples_linear["B"]
+    A = samples_gemm["A"]
+    B = samples_gemm["B"]
     positions = samples_rope["positions"]
     # CODA gets frequencies for q, k and v (zero on v); torch for q and k only
     frequencies_qk = samples_rope["frequencies_qk"]
@@ -146,22 +146,32 @@ def gemm_rope(
         "layout": PairLayout.interleaved,
     }
     split = interleaved.copy()
-    split["B"] = operands.split_rope_weight(
+    split["B"] = operands.split_layout_rope_weight(
         B=B,
         size_qk=size_qk,
         head_dim=shape.head_dim,
     )
     split["layout"] = PairLayout.split
-    interleaved_cached = operands.cache_rope_cos_sin(
-        uncached=interleaved,
-        position_name="positions",
-        frequency_name="frequencies",
+    # torch with its rope tables built once, outside the timed step
+    cos, sin = operands.cache_rope_cos_sin(
+        positions=positions,
+        frequencies=frequencies_qk,
+        head_dim=shape.head_dim,
     )
-    split_cached = operands.cache_rope_cos_sin(
-        uncached=split,
-        position_name="positions",
-        frequency_name="frequencies",
-    )
+    interleaved_cached = {
+        **interleaved,
+        "positions": None,
+        "frequencies": None,
+        "cos": cos,
+        "sin": sin,
+    }
+    split_cached = {
+        **split,
+        "positions": None,
+        "frequencies": None,
+        "cos": cos,
+        "sin": sin,
+    }
     coda_inputs = {
         "A": A,
         "B": B,
@@ -240,7 +250,7 @@ def gemm_rmsnorm_rope(
     samples_rope = operands.rope_operands(shape=shape)
     size_qk = samples_rope["size_q"] + samples_rope["size_k"]
     width = size_qk + samples_rope["size_v"]
-    samples_linear = operands.linear_operands(
+    samples_gemm = operands.gemm_operands(
         shape=shape,
         out_features=width,
         sampler=sampler,
@@ -248,13 +258,13 @@ def gemm_rmsnorm_rope(
     )
     samples_rmsnorm = operands.rmsnorm_operands(
         shape=shape,
-        x=samples_linear["A"],
-        rstd_nominal=shape.statistics.rstd,
+        x=samples_gemm["A"],
+        rstd_scale=shape.statistics.rstd,
         sampler=sampler,
         dtype=dtype,
     )
     A = samples_rmsnorm["A"]
-    B = samples_linear["B"]
+    B = samples_gemm["B"]
     rstd = samples_rmsnorm["rstd"]
     positions = samples_rope["positions"]
     # CODA gets frequencies for q, k and v (zero on v); torch for q and k only
@@ -275,22 +285,32 @@ def gemm_rmsnorm_rope(
         "layout": PairLayout.interleaved,
     }
     split = interleaved.copy()
-    split["B"] = operands.split_rope_weight(
+    split["B"] = operands.split_layout_rope_weight(
         B=B,
         size_qk=size_qk,
         head_dim=shape.head_dim,
     )
     split["layout"] = PairLayout.split
-    interleaved_cached = operands.cache_rope_cos_sin(
-        uncached=interleaved,
-        position_name="positions",
-        frequency_name="frequencies",
+    # torch with its rope tables built once, outside the timed step
+    cos, sin = operands.cache_rope_cos_sin(
+        positions=positions,
+        frequencies=frequencies_qk,
+        head_dim=shape.head_dim,
     )
-    split_cached = operands.cache_rope_cos_sin(
-        uncached=split,
-        position_name="positions",
-        frequency_name="frequencies",
-    )
+    interleaved_cached = {
+        **interleaved,
+        "positions": None,
+        "frequencies": None,
+        "cos": cos,
+        "sin": sin,
+    }
+    split_cached = {
+        **split,
+        "positions": None,
+        "frequencies": None,
+        "cos": cos,
+        "sin": sin,
+    }
     coda_inputs = {
         "A": A,
         "B": B,
@@ -401,27 +421,37 @@ def rope_bwd_zdz(
         "layout": PairLayout.interleaved,
     }
     split = interleaved.copy()
-    split["y"] = operands.split_layout(
+    split["y"] = operands.split_layout_qkv(
         x=y,
         size_qk=size_qk,
         head_dim=shape.head_dim,
     )
-    split["dy"] = operands.split_layout(
+    split["dy"] = operands.split_layout_qkv(
         x=dy,
         size_qk=size_qk,
         head_dim=shape.head_dim,
     )
     split["layout"] = PairLayout.split
-    interleaved_cached = operands.cache_rope_cos_sin(
-        uncached=interleaved,
-        position_name="pos",
-        frequency_name="freq",
+    # torch with its rope tables built once, outside the timed step
+    cos, sin = operands.cache_rope_cos_sin(
+        positions=positions,
+        frequencies=frequencies_qk,
+        head_dim=shape.head_dim,
     )
-    split_cached = operands.cache_rope_cos_sin(
-        uncached=split,
-        position_name="pos",
-        frequency_name="freq",
-    )
+    interleaved_cached = {
+        **interleaved,
+        "pos": None,
+        "freq": None,
+        "cos": cos,
+        "sin": sin,
+    }
+    split_cached = {
+        **split,
+        "pos": None,
+        "freq": None,
+        "cos": cos,
+        "sin": sin,
+    }
     coda_inputs = {
         "y": y,
         "dy": dy,
@@ -500,14 +530,14 @@ def gemm_qknorm_rope(
     sampler = Sampler(seed=seed)
     samples_rope = operands.rope_operands(shape=shape)
     size_qk = samples_rope["size_q"] + samples_rope["size_k"]
-    samples_linear = operands.linear_operands(
+    samples_gemm = operands.gemm_operands(
         shape=shape,
         out_features=size_qk,
         sampler=sampler,
         dtype=dtype,
     )
-    A = samples_linear["A"]
-    B = samples_linear["B"]
+    A = samples_gemm["A"]
+    B = samples_gemm["B"]
     # qk-norm's weight: one head's worth for q, then one for k
     gamma = sampler.gamma(
         size=2 * shape.head_dim,
@@ -530,26 +560,37 @@ def gemm_qknorm_rope(
         "layout": PairLayout.interleaved,
     }
     split = interleaved.copy()
-    split["B"] = operands.split_rope_weight(
+    split["B"] = operands.split_layout_rope_weight(
         B=B,
         size_qk=size_qk,
         head_dim=shape.head_dim,
     )
-    split["weight"] = operands.split_pairs(
+    split["weight"] = operands.split_layout_heads(
         x=gamma,
+        num_heads=2,
         head_dim=shape.head_dim,
     )
     split["layout"] = PairLayout.split
-    interleaved_cached = operands.cache_rope_cos_sin(
-        uncached=interleaved,
-        position_name="positions",
-        frequency_name="frequencies",
+    # torch with its rope tables built once, outside the timed step
+    cos, sin = operands.cache_rope_cos_sin(
+        positions=positions,
+        frequencies=frequencies,
+        head_dim=shape.head_dim,
     )
-    split_cached = operands.cache_rope_cos_sin(
-        uncached=split,
-        position_name="positions",
-        frequency_name="frequencies",
-    )
+    interleaved_cached = {
+        **interleaved,
+        "positions": None,
+        "frequencies": None,
+        "cos": cos,
+        "sin": sin,
+    }
+    split_cached = {
+        **split,
+        "positions": None,
+        "frequencies": None,
+        "cos": cos,
+        "sin": sin,
+    }
     coda_inputs = {
         "A": A,
         "B": B,
@@ -633,7 +674,7 @@ def gemm_rmsnorm_qknorm_rope(
     sampler = Sampler(seed=seed)
     samples_rope = operands.rope_operands(shape=shape)
     size_qk = samples_rope["size_q"] + samples_rope["size_k"]
-    samples_linear = operands.linear_operands(
+    samples_gemm = operands.gemm_operands(
         shape=shape,
         out_features=size_qk,
         sampler=sampler,
@@ -641,13 +682,13 @@ def gemm_rmsnorm_qknorm_rope(
     )
     samples_rmsnorm = operands.rmsnorm_operands(
         shape=shape,
-        x=samples_linear["A"],
-        rstd_nominal=shape.statistics.rstd,
+        x=samples_gemm["A"],
+        rstd_scale=shape.statistics.rstd,
         sampler=sampler,
         dtype=dtype,
     )
     A = samples_rmsnorm["A"]
-    B = samples_linear["B"]
+    B = samples_gemm["B"]
     rstd = samples_rmsnorm["rstd"]
     # qk-norm's weight: one head's worth for q, then one for k
     gamma = sampler.gamma(
@@ -672,26 +713,37 @@ def gemm_rmsnorm_qknorm_rope(
         "layout": PairLayout.interleaved,
     }
     split = interleaved.copy()
-    split["B"] = operands.split_rope_weight(
+    split["B"] = operands.split_layout_rope_weight(
         B=B,
         size_qk=size_qk,
         head_dim=shape.head_dim,
     )
-    split["weight"] = operands.split_pairs(
+    split["weight"] = operands.split_layout_heads(
         x=gamma,
+        num_heads=2,
         head_dim=shape.head_dim,
     )
     split["layout"] = PairLayout.split
-    interleaved_cached = operands.cache_rope_cos_sin(
-        uncached=interleaved,
-        position_name="positions",
-        frequency_name="frequencies",
+    # torch with its rope tables built once, outside the timed step
+    cos, sin = operands.cache_rope_cos_sin(
+        positions=positions,
+        frequencies=frequencies,
+        head_dim=shape.head_dim,
     )
-    split_cached = operands.cache_rope_cos_sin(
-        uncached=split,
-        position_name="positions",
-        frequency_name="frequencies",
-    )
+    interleaved_cached = {
+        **interleaved,
+        "positions": None,
+        "frequencies": None,
+        "cos": cos,
+        "sin": sin,
+    }
+    split_cached = {
+        **split,
+        "positions": None,
+        "frequencies": None,
+        "cos": cos,
+        "sin": sin,
+    }
     coda_inputs = {
         "A": A,
         "B": B,
@@ -779,7 +831,7 @@ def qknorm_rope_bwd(
     samples_rope = operands.rope_operands(shape=shape)
     size_q = samples_rope["size_q"]
     size_k = samples_rope["size_k"]
-    samples_qknorm = operands.qknorm_bwd_operands(
+    samples_qknorm = operands.qknorm_rope_bwd_operands(
         shape=shape,
         rmsnorm=False,
         sampler=sampler,
@@ -796,10 +848,10 @@ def qknorm_rope_bwd(
         shape=(shape.tokens, size_qk),
         dtype=dtype,
     )
-    cotangent = operands.qk_cotangent(
+    cotangent = operands.calibrate_qk_cotangent(
         shape=shape,
-        random=random,
-        z=x,
+        random_cotangent=random,
+        qk_preact=x,
         gamma=gamma,
         sampler=sampler,
         dtype=dtype,
@@ -825,33 +877,47 @@ def qknorm_rope_bwd(
         "layout": PairLayout.interleaved,
     }
     split = interleaved.copy()
-    split["dq"] = operands.split_pairs(
+    split["dq"] = operands.split_layout_heads(
         x=dq,
+        num_heads=shape.heads,
         head_dim=shape.head_dim,
     )
-    split["dk"] = operands.split_pairs(
+    split["dk"] = operands.split_layout_heads(
         x=dk,
+        num_heads=shape.kv_heads,
         head_dim=shape.head_dim,
     )
-    split["x"] = operands.split_pairs(
+    split["x"] = operands.split_layout_heads(
         x=x,
+        num_heads=shape.heads + shape.kv_heads,
         head_dim=shape.head_dim,
     )
-    split["gamma"] = operands.split_pairs(
+    split["gamma"] = operands.split_layout_heads(
         x=gamma,
+        num_heads=2,
         head_dim=shape.head_dim,
     )
     split["layout"] = PairLayout.split
-    interleaved_cached = operands.cache_rope_cos_sin(
-        uncached=interleaved,
-        position_name="pos",
-        frequency_name="freq",
+    # torch with its rope tables built once, outside the timed step
+    cos, sin = operands.cache_rope_cos_sin(
+        positions=positions,
+        frequencies=frequencies,
+        head_dim=shape.head_dim,
     )
-    split_cached = operands.cache_rope_cos_sin(
-        uncached=split,
-        position_name="pos",
-        frequency_name="freq",
-    )
+    interleaved_cached = {
+        **interleaved,
+        "pos": None,
+        "freq": None,
+        "cos": cos,
+        "sin": sin,
+    }
+    split_cached = {
+        **split,
+        "pos": None,
+        "freq": None,
+        "cos": cos,
+        "sin": sin,
+    }
     coda_inputs = {
         "dq": dq,
         "dk": dk,
@@ -939,7 +1005,7 @@ def qknorm_rope_bwd_zdz(
 ) -> Case:
     sampler = Sampler(seed=seed)
     samples_rope = operands.rope_operands(shape=shape)
-    samples_qknorm = operands.qknorm_bwd_operands(
+    samples_qknorm = operands.qknorm_rope_bwd_operands(
         shape=shape,
         rmsnorm=True,
         sampler=sampler,
@@ -986,30 +1052,42 @@ def qknorm_rope_bwd_zdz(
         "dv": dv,
     }
     split = interleaved.copy()
-    split["dy"] = operands.split_layout(
+    split["dy"] = operands.split_layout_qkv(
         x=dy,
         size_qk=size_qk,
         head_dim=shape.head_dim,
     )
-    split["preact"] = operands.split_pairs(
+    split["preact"] = operands.split_layout_heads(
         x=preact,
+        num_heads=shape.heads + shape.kv_heads,
         head_dim=shape.head_dim,
     )
-    split["gamma"] = operands.split_pairs(
+    split["gamma"] = operands.split_layout_heads(
         x=gamma,
+        num_heads=2,
         head_dim=shape.head_dim,
     )
     split["layout"] = PairLayout.split
-    interleaved_cached = operands.cache_rope_cos_sin(
-        uncached=interleaved,
-        position_name="pos",
-        frequency_name="freq",
+    # torch with its rope tables built once, outside the timed step
+    cos, sin = operands.cache_rope_cos_sin(
+        positions=positions,
+        frequencies=frequencies,
+        head_dim=shape.head_dim,
     )
-    split_cached = operands.cache_rope_cos_sin(
-        uncached=split,
-        position_name="pos",
-        frequency_name="freq",
-    )
+    interleaved_cached = {
+        **interleaved,
+        "pos": None,
+        "freq": None,
+        "cos": cos,
+        "sin": sin,
+    }
+    split_cached = {
+        **split,
+        "pos": None,
+        "freq": None,
+        "cos": cos,
+        "sin": sin,
+    }
     coda_inputs = {
         "dy": dy,
         "preact": preact,
