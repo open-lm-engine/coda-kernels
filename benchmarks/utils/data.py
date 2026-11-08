@@ -64,7 +64,7 @@ class Sampler(object):
 
     def log_uniform(
         self,
-        size: int,
+        shape: tuple[int, ...],
         low: float,
         high: float,
         dtype: torch.dtype,
@@ -72,7 +72,7 @@ class Sampler(object):
         # log-uniform in [low, high), in fp32
         assert dtype == torch.float32
         uniform = self.rand(
-            shape=(size,),
+            shape=shape,
             dtype=dtype,
         )
         exponent = math.log(low) + uniform * math.log(high / low)
@@ -114,7 +114,7 @@ class Sampler(object):
         # a norm weight in the range of trained
         # Llama-3 and Qwen3 norm weights
         values = self.log_uniform(
-            size=size,
+            shape=(size,),
             low=NORM_WEIGHT_LOW,
             high=NORM_WEIGHT_HIGH,
             dtype=torch.float32,
@@ -130,7 +130,7 @@ class Sampler(object):
         # random factors near 1; the largest is at
         # most ratio times the smallest
         return self.log_uniform(
-            size=size,
+            shape=(size,),
             low=ratio**-0.5,
             high=ratio**0.5,
             dtype=dtype,
