@@ -53,6 +53,9 @@ RSTD_SPREAD = 2.0
 # square across tokens and across heads
 HEAD_MEAN_SQ_TOKEN_SPREAD = 2.0
 HEAD_MEAN_SQ_HEAD_SPREAD = 4.0
+# qk-norm's weights: one for q, one for
+# k, each head_dim wide
+NUM_QK_NORM_WEIGHTS = 2
 # largest cosine, either sign, between
 # qk-norm's cotangent and a normed head
 QK_COTANGENT_MAX_COSINE = 0.6
@@ -889,7 +892,7 @@ def block_input(
         "wn": shape.dim,
         "wn0": shape.dim,
         "wn1": shape.dim,
-        "wn2": 2 * shape.head_dim,
+        "wn2": NUM_QK_NORM_WEIGHTS * shape.head_dim,
     }
     # the activations' stds: ACTIVATION_STD, and 1 for v0, the previous
     # block's v
@@ -1038,7 +1041,7 @@ def qknorm_rope_bwd_operands(
     )
     z = noise * column_rms
     gamma = sampler.gamma(
-        size=2 * shape.head_dim,
+        size=NUM_QK_NORM_WEIGHTS * shape.head_dim,
         dtype=dtype,
     )
     inputs = {"gamma": gamma}
@@ -1209,7 +1212,7 @@ def linear_qknorm_rope_operands(
         dtype=dtype,
     )
     gamma = sampler.gamma(
-        size=2 * shape.head_dim,
+        size=NUM_QK_NORM_WEIGHTS * shape.head_dim,
         dtype=dtype,
     )
     random_dq = sampler.randn(
