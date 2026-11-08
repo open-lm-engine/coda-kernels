@@ -1,12 +1,12 @@
 import torch
 from einops import rearrange
-from quack.rms_final_reduce import rms_final_reduce as quack_rms_final_reduce
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 from coda.core.ops.constants import ALLOW_INPLACE_GRAD_OUTPUT
 from coda.core.elementwise.functional import rope_bwd_zdz
+from coda.core.elementwise.rms_final_reduce import partial_rmsnorm
 from coda.core.gemm.functional import (
-    gemm as coda_gemm,
+    gemm,
     gemm_scalar_scale,
     gemm_residual_partial_rmsnorm,
     gemm_residual_partial_rmsnorm_bwd,
@@ -16,15 +16,6 @@ from coda.core.gemm.functional import (
 )
 from coda.kernels.functional.cross_entropy import gemm_rmsnorm_cross_entropy_fwd_bwd
 
-USE_CODA_GEMM = False
-
-
-def gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    if USE_CODA_GEMM:
-        return coda_gemm(A=A, B=B)
-    else:
-        return torch.matmul(A, B)
-
 
 def block_pre_forward(
     x: torch.Tensor,
@@ -33,14 +24,13 @@ def block_pre_forward(
     positions: torch.Tensor,
     frequencies: torch.Tensor,
     eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert wn.dtype == x.dtype
     assert x.ndim == 2
-    dim = x.shape[1]
-    h = x * rearrange(wn, "d -> 1 d")
-    rstd = quack_rms_final_reduce(
-        x=x.float() ** 2,
-        scale=1.0 / dim,
+    # x * wn, the residual's copy and rstd from one read of x
+    residual, h, rstd = partial_rmsnorm(
+        x=x,
+        weight=wn,
         eps=eps,
     )
     qkv = gemm_rmsnorm_rope(
@@ -50,7 +40,7 @@ def block_pre_forward(
         positions=positions,
         frequencies=frequencies,
     )
-    return qkv, rstd
+    return qkv, rstd, residual
 
 
 def block_pre_backward(
@@ -105,7 +95,7 @@ class BlockPre(torch.autograd.Function):
         frequencies: torch.Tensor,
         eps: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        qkv, rstd = block_pre_forward(
+        qkv, rstd, residual = block_pre_forward(
             x=x,
             w=w,
             wn=wn,
@@ -122,7 +112,9 @@ class BlockPre(torch.autograd.Function):
             positions,
             frequencies,
         )
-        return x, qkv
+        # x feeds qkv and the residual, so dx sums two gradients; a copy lets
+        # backward sum them in fp32, where autograd would sum them in bf16
+        return residual, qkv
 
     @staticmethod
     @input_guard
