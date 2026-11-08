@@ -318,6 +318,7 @@ def cache_rope_cos_sin(
     # fp32 cos and sin tables of one head's rope angles; the angles are
     # computed in fp64, so the tables rotate by the oracle's angles
     assert frequencies.ndim == 1
+    assert frequencies.shape[0] >= head_dim
     assert frequencies.shape[0] % head_dim == 0
     head_frequencies = frequencies[:head_dim]
     head_frequencies_fp64 = head_frequencies.to(dtype=torch.float64)
@@ -967,6 +968,11 @@ def gemm_xsa_bwd_operands(
     )
     x = x_fp32.to(dtype=dtype)
 
+    # under causal attention, each sequence's first token sees only
+    # itself, so its attention output x is its value v
+    assert shape.tokens % models.SEQUENCE_LENGTH == 0
+    x[:: models.SEQUENCE_LENGTH, ...] = v[:: models.SEQUENCE_LENGTH, ...]
+
     # XSA reads v in place from a [Q | K | V] buffer; the rest is NaN, so
     # any read outside v shows up
     buffer = torch.full(
@@ -1354,18 +1360,25 @@ def block_operands(
     inputs["positions"] = token_positions(shape=shape)
     pair_frequencies = inv_freq(shape=shape)
 
-    # q's and k's heads alone; a transformer block has as many k heads
-    # as q heads
+    # q's and k's heads alone; a block has as many k heads as q heads
+    assert shape.kv_heads == shape.heads
+    assert shape.heads * shape.head_dim == shape.dim
     qk_heads = 2 * shape.heads
     frequencies = make_rope_frequencies(
         inv_freq=pair_frequencies,
         num_heads=qk_heads,
     )
+    assert frequencies.shape == (2 * shape.dim,)
 
     # v's columns at frequency 0, unrotated
     if block.rope_on_qkv:
-        zeros = torch.zeros_like(frequencies[: shape.dim])
-        frequencies = torch.cat(tensors=(frequencies, zeros))
+        v_frequencies = torch.zeros(
+            size=(shape.dim,),
+            dtype=frequencies.dtype,
+            device=frequencies.device,
+        )
+        frequencies = torch.cat(tensors=(frequencies, v_frequencies))
+        assert frequencies.shape == (3 * shape.dim,)
 
     inputs["frequencies"] = frequencies
     return inputs
