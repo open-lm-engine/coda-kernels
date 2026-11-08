@@ -36,12 +36,12 @@ class Sampler(object):
 
     def rand(
         self,
-        size: int,
+        shape: tuple[int, ...],
         dtype: torch.dtype,
     ) -> torch.Tensor:
         # uniform in [0, 1)
         return torch.rand(
-            size,
+            shape,
             generator=self.generator,
             dtype=dtype,
             device="cuda",
@@ -54,12 +54,11 @@ class Sampler(object):
         high: float,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        # uniform in [low, high)
-        values = torch.rand(
-            shape,
-            generator=self.generator,
+        # uniform in [low, high), in fp32
+        assert dtype == torch.float32
+        values = self.rand(
+            shape=shape,
             dtype=dtype,
-            device="cuda",
         )
         return low + (high - low) * values
 
@@ -70,9 +69,10 @@ class Sampler(object):
         high: float,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        # log-uniform in [low, high)
+        # log-uniform in [low, high), in fp32
+        assert dtype == torch.float32
         uniform = self.rand(
-            size=size,
+            shape=(size,),
             dtype=dtype,
         )
         exponent = math.log(low) + uniform * math.log(high / low)
@@ -148,7 +148,7 @@ class Sampler(object):
             vocab_size=vocab_size,
         )
         uniform = self.rand(
-            size=size,
+            shape=(size,),
             dtype=torch.float32,
         )
         ignored = (uniform < IGNORED_FRACTION)
