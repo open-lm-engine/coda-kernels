@@ -16,41 +16,157 @@ class Normal(NamedTuple):
     std: float
 
 
+class Output(NamedTuple):
+    # a block output; its cotangent is
+    # (B, T, dim_expansion * dim)
+    name: str
+    dim_expansion: int
+
+
 class Block(NamedTuple):
-    # a shifted block's forward outputs, each given a cotangent, and its
-    # leaves
-    outputs: tuple[str, ...]
+    # the outputs that take a cotangent;
+    # a final block's one is the loss
+    outputs: tuple[Output, ...]
     leaves: tuple[str, ...]
+    # the model's last block, which ends
+    # with the LM head as its w3
+    is_final: bool
+    # rope on the whole [q | k | v], v at
+    # frequency 0, not on q and k alone
+    rope_on_qkv: bool
+    # XSA on the previous attention's
+    # output, reading its v in place
+    has_xsa: bool
 
 
-# rope's base, Llama-3's
-ROPE_BASE = 500000.0
+# Llama-3's rope theta
+ROPE_THETA = 500000.0
 
+# std of a block's input activations;
+# v0's is 1
+ACTIVATION_STD = 0.5
+# max over min of an rmsnorm input's
+# rstd across tokens
+RSTD_SPREAD = 2.0
 
+# max over min of qk-norm's head mean
+# square across tokens and across heads
+HEAD_MEAN_SQ_TOKEN_SPREAD = 2.0
+HEAD_MEAN_SQ_HEAD_SPREAD = 4.0
+# largest cosine, either sign, between
+# qk-norm's cotangent and a normed head
+QK_COTANGENT_MAX_COSINE = 0.6
+
+# range of the cosine between XSA's x
+# and v, per head
+XSA_COSINE_LOW = -0.2
+XSA_COSINE_HIGH = 0.8
+# x's norm as a share of v's
+XSA_X_NORM_RATIO = 0.3
+
+# the LM head's logits, fit to
+# Llama-3.2-1B and Qwen3-0.6B: each
+# token's candidates sit at a height
+# above its background logits, each
+# candidate offset from that height
+CANDIDATE_HEIGHT = Normal(
+    mean=17.0,
+    std=1.1,
+)
+TARGET_OFFSET = Normal(
+    mean=1.8,
+    std=4.4,
+)
+# the rival is the strongest wrong
+# candidate
+RIVAL_OFFSET = Normal(
+    mean=-1.3,
+    std=2.7,
+)
+OTHER_CANDIDATE_OFFSET = Normal(
+    mean=0.0,
+    std=1.0,
+)
+# candidates per token: the target,
+# the rival and the others
+NUM_OTHER_CANDIDATES = 8
+NUM_CANDIDATES = 2 + NUM_OTHER_CANDIDATES
+# range of the background logits' std,
+# and the least variance they keep
+BACKGROUND_STD_LOW = 2.0
+BACKGROUND_STD_HIGH = 3.2
+BACKGROUND_VARIANCE_MIN = 1.0
+# keeps the candidates' Gram matrix
+# solvable when a candidate repeats
+GRAM_RIDGE = 1e-3
+# tokens per chunk, to bound memory
+LM_HEAD_INPUT_CHUNK_SIZE = 4096
+DLOGITS_CHUNK_SIZE = 1024
+
+# epsilon in Muon's input normalization
+MUON_EPS = 1e-7
+
+# each shifted block's outputs and
+# leaves: block_pre starts at the
+# embedding, block sits between
+# attentions, and block_post ends at
+# the loss
 BLOCKS = {
     "transformer.block_pre": Block(
-        outputs=("residual", "qkv", "v"),
+        outputs=(
+            Output(name="residual", dim_expansion=1),
+            Output(name="qkv", dim_expansion=3),
+            Output(name="v", dim_expansion=1),
+        ),
         leaves=("x", "w", "wn", "wn2"),
+        is_final=False,
+        rope_on_qkv=False,
+        has_xsa=False,
     ),
     "transformer.block": Block(
-        outputs=("x2", "qkv", "v"),
+        outputs=(
+            Output(name="x2", dim_expansion=1),
+            Output(name="qkv", dim_expansion=3),
+            Output(name="v", dim_expansion=1),
+        ),
         leaves=("x0", "o0", "v0", "w0", "w1", "w2", "w3", "wn0", "wn1", "wn2"),
+        is_final=False,
+        rope_on_qkv=False,
+        has_xsa=True,
     ),
     "transformer.block_post": Block(
-        outputs=("loss",),
+        outputs=(),
         leaves=("x0", "o0", "v0", "w0", "w1", "w2", "w3", "wn0", "wn1"),
+        is_final=True,
+        rope_on_qkv=False,
+        has_xsa=True,
     ),
     "llama3.block_pre": Block(
-        outputs=("residual", "qkv"),
+        outputs=(
+            Output(name="residual", dim_expansion=1),
+            Output(name="qkv", dim_expansion=3),
+        ),
         leaves=("x", "w", "wn"),
+        is_final=False,
+        rope_on_qkv=True,
+        has_xsa=False,
     ),
     "llama3.block": Block(
-        outputs=("x2", "qkv"),
+        outputs=(
+            Output(name="x2", dim_expansion=1),
+            Output(name="qkv", dim_expansion=3),
+        ),
         leaves=("x0", "y0", "w0", "w1", "w2", "w3", "wn0", "wn1"),
+        is_final=False,
+        rope_on_qkv=True,
+        has_xsa=False,
     ),
     "llama3.block_post": Block(
-        outputs=("loss",),
+        outputs=(),
         leaves=("x0", "y0", "w0", "w1", "w2", "w3", "wn0", "wn1"),
+        is_final=True,
+        rope_on_qkv=True,
+        has_xsa=False,
     ),
 }
 
@@ -90,7 +206,7 @@ def inv_freq(shape: Shape) -> torch.Tensor:
         device="cuda",
     )
     exponents = even_indices / shape.head_dim
-    powers = ROPE_BASE**exponents
+    powers = ROPE_THETA**exponents
     pair_frequencies = 1.0 / powers
     assert pair_frequencies.is_contiguous()
     return pair_frequencies
@@ -344,7 +460,7 @@ def calibrate_logits(
         dtype=torch.float32,
         device="cuda",
     )
-    ridged_dots = candidate_dots + RIDGE * identity
+    ridged_dots = candidate_dots + GRAM_RIDGE * identity
     step_coefficients = torch.linalg.solve(
         A=ridged_dots,
         B=logit_gap,
@@ -395,12 +511,12 @@ def rmsnorm_operands(
     sampler: Sampler,
     dtype: torch.dtype,
 ) -> dict:
-    # an rmsnorm input A and its rstd: x rescaled per row so its rstd lies
+    # an rmsnorm input A and its rstd: x rescaled per token so its rstd lies
     # near rstd_scale, a value measured on real models, which keeps A's
     # scale realistic
     row_multipliers = sampler.multipliers(
         size=shape.tokens,
-        ratio=ROW_RSTD_RATIO,
+        ratio=RSTD_SPREAD,
     )
     x_fp32 = x.to(dtype=torch.float32)
     x_square = x_fp32.square()
@@ -419,10 +535,9 @@ def rmsnorm_operands(
     A_fp32 = x_fp32 * row_scale
     A = A_fp32.to(dtype=dtype)
 
-    # rstd of A as stored, which is what the GEMM reads
-    stored = A.to(dtype=torch.float32)
+    # rstd of A after its rounding to dtype, which is what the GEMM reads
     rstd = torch_ops.rmsnorm_rstd(
-        x=stored,
+        x=A.to(dtype=torch.float32),
         eps=data.NORM_EPS,
     )
     return {
@@ -543,12 +658,13 @@ def calibrate_qk_cotangent(
     )
 
     # each head of the random cotangent turned to a cosine with its normed
-    # head drawn within COSINE_LIMIT, keeping its length; left random, the
-    # cosine sits near 0.1 and shrinks qk-norm's projection term to a tenth
+    # head drawn within QK_COTANGENT_MAX_COSINE, keeping its length; left
+    # random, the cosine sits near 0.1 and shrinks qk-norm's projection term
+    # to a tenth
     cosine_per_head = sampler.uniform(
         shape=(shape.tokens, num_heads),
-        low=-COSINE_LIMIT,
-        high=COSINE_LIMIT,
+        low=-QK_COTANGENT_MAX_COSINE,
+        high=QK_COTANGENT_MAX_COSINE,
     )
     norm_per_head = measure_head_norms(
         x=random_cotangent,
@@ -608,7 +724,7 @@ def calibrate_lm_head_input(
     # each position's candidates: its target first, or a random token where
     # the target is ignored, then a rival and the others
     candidate_tokens = sampler.tokens(
-        shape=(shape.tokens, CANDIDATES),
+        shape=(shape.tokens, NUM_CANDIDATES),
         vocab_size=shape.vocab_size,
     )
     non_ignored = (target != data.IGNORE_INDEX)
@@ -618,15 +734,16 @@ def calibrate_lm_head_input(
         other=candidate_tokens[:, 0],
     )
 
-    # their logits: each position's baseline, plus each candidate's offset
-    # over it
-    baseline_noise = sampler.randn(
+    # their logits: each token's height above its background, plus each
+    # candidate's offset from it
+    height_noise = sampler.randn(
         shape=(shape.tokens, 1),
         dtype=torch.float32,
     )
-    baseline = BASELINE.mean + BASELINE.std * baseline_noise
+    height_offset = CANDIDATE_HEIGHT.std * height_noise
+    candidate_height = CANDIDATE_HEIGHT.mean + height_offset
     offset_noise = sampler.randn(
-        shape=(shape.tokens, CANDIDATES),
+        shape=(shape.tokens, NUM_CANDIDATES),
         dtype=torch.float32,
     )
     background_std = sampler.log_uniform(
@@ -634,19 +751,20 @@ def calibrate_lm_head_input(
         low=BACKGROUND_STD_LOW,
         high=BACKGROUND_STD_HIGH,
     )
-    other_means = [OTHER_CANDIDATE.mean] * OTHER_CANDIDATES
-    other_stds = [OTHER_CANDIDATE.std] * OTHER_CANDIDATES
+    other_means = [OTHER_CANDIDATE_OFFSET.mean] * NUM_OTHER_CANDIDATES
+    other_stds = [OTHER_CANDIDATE_OFFSET.std] * NUM_OTHER_CANDIDATES
     offset_means = torch.tensor(
-        data=[TARGET.mean, RIVAL.mean] + other_means,
+        data=[TARGET_OFFSET.mean, RIVAL_OFFSET.mean] + other_means,
         dtype=torch.float32,
         device="cuda",
     )
     offset_stds = torch.tensor(
-        data=[TARGET.std, RIVAL.std] + other_stds,
+        data=[TARGET_OFFSET.std, RIVAL_OFFSET.std] + other_stds,
         dtype=torch.float32,
         device="cuda",
     )
-    candidate_logits = baseline + offset_means + offset_stds * offset_noise
+    mean_logits = candidate_height + offset_means
+    candidate_logits = mean_logits + offset_stds * offset_noise
 
     # the background: the random input, scaled so each position's other
     # logits have std background_std; each candidate's weight also adds its
@@ -674,18 +792,20 @@ def calibrate_lm_head_input(
     background = random_input_fp32 * background_scale
 
     # the background moved so the candidates' logits are the drawn ones,
-    # LM_HEAD_CHUNK_SIZE positions at a time to bound the candidate weights'
-    # memory
+    # LM_HEAD_INPUT_CHUNK_SIZE positions at a time to bound the candidate
+    # weights' memory
     A = torch.empty_like(background)
-    assert shape.tokens % LM_HEAD_CHUNK_SIZE == 0
-    for start in range(0, shape.tokens, LM_HEAD_CHUNK_SIZE):
-        stop = start + LM_HEAD_CHUNK_SIZE
+    assert shape.tokens % LM_HEAD_INPUT_CHUNK_SIZE == 0
+    chunk_shape = (LM_HEAD_INPUT_CHUNK_SIZE, shape.dim)
+    candidates_shape = (LM_HEAD_INPUT_CHUNK_SIZE, NUM_CANDIDATES)
+    for start in range(0, shape.tokens, LM_HEAD_INPUT_CHUNK_SIZE):
+        stop = start + LM_HEAD_INPUT_CHUNK_SIZE
         background_chunk = background[start:stop, ...]
         candidate_tokens_chunk = candidate_tokens[start:stop, ...]
         candidate_logits_chunk = candidate_logits[start:stop, ...]
-        assert background_chunk.shape == (LM_HEAD_CHUNK_SIZE, shape.dim)
-        assert candidate_tokens_chunk.shape == (LM_HEAD_CHUNK_SIZE, CANDIDATES)
-        assert candidate_logits_chunk.shape == (LM_HEAD_CHUNK_SIZE, CANDIDATES)
+        assert background_chunk.shape == chunk_shape
+        assert candidate_tokens_chunk.shape == candidates_shape
+        assert candidate_logits_chunk.shape == candidates_shape
         candidate_weights = weight[candidate_tokens_chunk]
         candidate_weights_fp32 = candidate_weights.to(dtype=torch.float32)
         A_chunk = calibrate_logits(
@@ -693,7 +813,7 @@ def calibrate_lm_head_input(
             candidate_weights=candidate_weights_fp32,
             logits=candidate_logits_chunk,
         )
-        assert A_chunk.shape == (LM_HEAD_CHUNK_SIZE, shape.dim)
+        assert A_chunk.shape == chunk_shape
         A[start:stop, ...] = A_chunk
 
     return A
@@ -825,19 +945,19 @@ def gemm_xsa_bwd_operands(
         dtype=dtype,
     )
 
-    # per head, x is X_OVER_V of v's length, at a drawn cosine to v
+    # per head, x is XSA_X_NORM_RATIO of v's length, at a drawn cosine to v
     assert shape.dim % shape.head_dim == 0
     num_heads = shape.dim // shape.head_dim
     cosines_to_v = sampler.uniform(
         shape=(shape.tokens, num_heads),
-        low=COSINE_LOW,
-        high=COSINE_LOW + 1.0,
+        low=XSA_COSINE_LOW,
+        high=XSA_COSINE_HIGH,
     )
     v_norms = measure_head_norms(
         x=v,
         head_dim=shape.head_dim,
     )
-    x_norms = X_OVER_V * v_norms
+    x_norms = XSA_X_NORM_RATIO * v_norms
     x_fp32 = calibrate_cosines(
         x=random_x,
         direction=v,
@@ -886,11 +1006,11 @@ def qknorm_rope_bwd_operands(
     )
     row_scales = sampler.multipliers(
         size=shape.tokens,
-        ratio=QKNORM_ROW_RATIO,
+        ratio=HEAD_MEAN_SQ_TOKEN_SPREAD,
     )
     head_scales = sampler.multipliers(
         size=heads,
-        ratio=QKNORM_HEAD_RATIO,
+        ratio=HEAD_MEAN_SQ_HEAD_SPREAD,
     )
     row_scales = rearrange(
         tensor=row_scales,
@@ -909,14 +1029,14 @@ def qknorm_rope_bwd_operands(
         size=2 * shape.head_dim,
         dtype=dtype,
     )
-    saved = {"gamma": gamma}
+    inputs = {"gamma": gamma}
 
     if rmsnorm:
         # rstd at the input norm's level, varied across tokens; preact is
         # the accumulator before rstd scales it
         multipliers = sampler.multipliers(
             size=shape.tokens,
-            ratio=QKNORM_ROW_RATIO,
+            ratio=HEAD_MEAN_SQ_TOKEN_SPREAD,
         )
         rstd = shape.statistics.rstd * multipliers
         rstd_column = rearrange(
@@ -926,20 +1046,21 @@ def qknorm_rope_bwd_operands(
         accumulator = z / rstd_column
         preact = accumulator.to(dtype=dtype)
         preact_fp32 = preact.to(dtype=torch.float32)
-        stored = preact_fp32 * rstd_column
-        saved["rstd"] = rstd
+        qknorm_input = preact_fp32 * rstd_column
+        inputs["rstd"] = rstd
     else:
         preact = z.to(dtype=dtype)
-        stored = preact.to(dtype=torch.float32)
+        qknorm_input = preact.to(dtype=torch.float32)
 
-    saved["preact"] = preact
+    inputs["preact"] = preact
 
-    # head_mean_sq as the backward forms it, from the stored preact
-    saved["head_mean_sq"] = torch_ops.head_mean_square(
-        x=stored,
+    # head_mean_sq as the backward forms it: from qk-norm's input, rebuilt
+    # from the stored preact
+    inputs["head_mean_sq"] = torch_ops.head_mean_square(
+        x=qknorm_input,
         head_dim=shape.head_dim,
     )
-    return saved
+    return inputs
 
 
 def qknorm_rope_bwd_zdz_operands(
@@ -1009,17 +1130,18 @@ def lm_head_operands(
         vocab_size=shape.vocab_size,
     )
 
-    A_fp32 = lm_head_input(
+    A_fp32 = calibrate_lm_head_input(
         shape=shape,
-        random=samples_gemm["A"],
+        random_input=samples_gemm["A"],
         weight=weight,
         target=target,
         sampler=sampler,
     )
 
     if rmsnorm:
-        # rmsnorm rescales each row of A / gamma to unit rms, so B carries
-        # gamma and the rows' median rms to keep the logits near the plain op's
+        # rmsnorm rescales each token of A / gamma to unit rms, so B carries
+        # gamma and the tokens' median rms to keep the logits near the plain
+        # op's
         gamma = sampler.gamma(
             size=shape.dim,
             dtype=torch.float32,
@@ -1063,7 +1185,7 @@ def linear_qknorm_rope_operands(
 ) -> dict:
     # a linear_qknorm_rope step's tensors: the [q | k | v] weight, x,
     # gamma, and the cotangents dq, dk and dv; dq and dk come from
-    # qk_cotangent
+    # calibrate_qk_cotangent
     size_qk = size_q + size_k
     weight = sampler.weight(
         shape=(size_qk + size_v, shape.dim),
@@ -1185,6 +1307,50 @@ def block_operands(
             dtype=dtype,
         )
 
+    # the previous block's v, read in place: the last columns of a
+    # NaN-filled [Q | K | V], so any read outside them shows up
+    if block.has_xsa:
+        v0 = inputs["v0"]
+        batch, length, width = v0.shape
+        buffer = torch.full(
+            size=(batch, length, 2 * shape.dim + width),
+            fill_value=math.nan,
+            dtype=v0.dtype,
+            device=v0.device,
+        )
+        v_columns = buffer[..., 2 * shape.dim :]
+        v_columns.copy_(v0)
+        inputs["v0"] = v_columns
+
+    # a final block's loss: its cotangent is 1, as a backward starts, and
+    # the targets have some ignored
+    if block.is_final:
+        inputs["grad_loss"] = torch.ones(
+            size=(),
+            dtype=torch.float32,
+            device="cuda",
+        )
+        targets = sampler.targets(
+            size=shape.tokens,
+            vocab_size=shape.vocab_size,
+        )
+        # one per token, (B, T) as a batch's labels
+        inputs["targets"] = rearrange(
+            tensor=targets,
+            pattern="(b t) -> b t",
+            t=models.SEQUENCE_LENGTH,
+        )
+
+    # a cotangent per other output, at its declared width
+    for output in block.outputs:
+        inputs[f"grad_{output.name}"] = sampler.randn(
+            shape=batched_shape(
+                shape=shape,
+                width=output.dim_expansion * shape.dim,
+            ),
+            dtype=dtype,
+        )
+
     inputs["positions"] = token_positions(shape=shape)
     pair_frequencies = inv_freq(shape=shape)
 
@@ -1195,6 +1361,11 @@ def block_operands(
         inv_freq=pair_frequencies,
         num_heads=qk_heads,
     )
+
+    # v's columns at frequency 0, unrotated
+    if block.rope_on_qkv:
+        zeros = torch.zeros_like(frequencies[: shape.dim])
+        frequencies = torch.cat(tensors=(frequencies, zeros))
 
     inputs["frequencies"] = frequencies
     return inputs
