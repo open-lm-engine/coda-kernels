@@ -30,14 +30,14 @@ def relative_l2_error(
 
 
 def precision(case: Case) -> Precision:
-    # CODA's eager call runs first: it sets each output's dtype, which every
-    # call is compared in, and its least possible error
+    # CODA's eager call runs first: its output dtypes are the reference
+    # every call is compared in, and they set the least possible error
     callables = make_callables(case=case)
     coda_eager = "coda/eager"
     assert next(iter(callables)) == "coda"
     assert next(iter(callables["coda"])) == coda_eager
 
-    dtypes = {}
+    dtypes_reference = {}
     errors = defaultdict(dict)
     errors_minimum = {}
     for impl_name, impl_variants in callables.items():
@@ -75,25 +75,29 @@ def precision(case: Case) -> Precision:
                 oracle_outputs,
                 strict=True,
             ):
-                # CODA's eager call sets each output's dtype and least
-                # possible error
+                # CODA's eager call records each output's reference dtype, and
+                # its least possible error: the exact answer's own error once
+                # rounded to that dtype
                 if variant == coda_eager:
-                    dtypes[output_name] = output.dtype
+                    dtypes_reference[output_name] = output.dtype
                     errors_minimum[output_name] = relative_l2_error(
                         output=oracle_output.to(dtype=output.dtype),
                         oracle=oracle_output,
                     )
 
-                # an output wider than CODA's (fp32 or fp64 where CODA stores 16
-                # bits) is rounded to CODA's dtype; a narrower one (16 bits where
-                # CODA keeps fp32) is read as it is, its coarser value its own
-                if (
-                    output.dtype in {torch.float32, torch.float64}
-                    and dtypes[output_name] in {torch.bfloat16, torch.float16}
-                ):
-                    output = output.to(dtype=dtypes[output_name])
+                # CODA's dtype is the reference: an output with more bits is
+                # rounded to it, one with fewer is kept as it is; only floating
+                # point outputs ever differ from it
+                dtype_reference = dtypes_reference[output_name]
+                if output.dtype.itemsize > dtype_reference.itemsize:
+                    assert output.dtype.is_floating_point
+                    assert dtype_reference.is_floating_point
+                    output = output.to(dtype=dtype_reference)
+                elif output.dtype.itemsize == dtype_reference.itemsize:
+                    assert output.dtype == dtype_reference
                 else:
-                    assert output.dtype == dtypes[output_name]
+                    assert output.dtype.is_floating_point
+                    assert dtype_reference.is_floating_point
 
                 # along M, keep what the oracle answered (a scalar has no M)
                 if oracle_output.ndim > 0:
