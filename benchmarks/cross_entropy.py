@@ -431,7 +431,7 @@ def gemm_scalar_scale_lm_head(
         sampler=sampler,
         dtype=dtype,
     )
-    A = operands.lm_head_operands_dlogits(
+    A = operands.lm_head_dlogits(
         A=samples["A"],
         B=samples["B"],
         target=samples["target"],
