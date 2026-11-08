@@ -3,8 +3,10 @@ from einops import rearrange
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 from coda.core.ops.constants import ALLOW_INPLACE_GRAD_OUTPUT
-from coda.core.elementwise.functional import rope_bwd_zdz
-from coda.core.elementwise.rms_final_reduce import partial_rmsnorm
+from coda.core.elementwise.functional import (
+    partial_rmsnorm,
+    rope_bwd_zdz,
+)
 from coda.core.gemm.functional import (
     gemm,
     gemm_scalar_scale,
@@ -14,7 +16,10 @@ from coda.core.gemm.functional import (
     gemm_rmsnorm_swiglu,
     gemm_swiglu_bwd_zdz,
 )
-from coda.kernels.functional.cross_entropy import gemm_rmsnorm_cross_entropy_fwd_bwd
+from coda.kernels.functional.cross_entropy import (
+    gemm_rmsnorm_cross_entropy_fwd_bwd,
+    reduce_losses,
+)
 
 
 def block_pre_forward(
@@ -196,12 +201,12 @@ def block_post_forward(
         ignore_index=ignore_index,
         return_zdz=True,
     )
-    if reduction == "mean":
-        scale = 1.0 / (targets != ignore_index).sum().float()
-        loss = losses.sum() * scale
-    else:
-        scale = None
-        loss = losses.sum()
+    loss, scale = reduce_losses(
+        losses=losses,
+        target=targets,
+        ignore_index=ignore_index,
+        reduction=reduction,
+    )
     return loss, x1, x2, rstd1, rstd2, z1, scale, dlogits, zdz2
 
 
