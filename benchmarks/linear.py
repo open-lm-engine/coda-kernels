@@ -111,7 +111,7 @@ def linear_swiglu(
     # reorder the weight for torch's split layout: all gates, then all ups
     # the split helpers work on (K, N) weights, the layout GEMMs use; this
     # weight is (N, K), so transpose it before and after the call
-    split_weight = operands.split_swiglu_weight(
+    split_weight = operands.split_layout_swiglu_weight(
         B=weight.mT,
     ).mT
     leaves = ("x", "weight")
@@ -229,21 +229,24 @@ def linear_qknorm_rope(
     # layout, which pairs element j with j + head_dim / 2
     # the split helpers work on (K, N) weights, the layout GEMMs use; this
     # weight is (N, K), so transpose it before and after the call
-    split_weight = operands.split_rope_weight(
+    split_weight = operands.split_layout_rope_weight(
         B=weight.mT,
         size_qk=size_qk,
         head_dim=shape.head_dim,
     ).mT
-    split_gamma = operands.split_pairs(
+    split_gamma = operands.split_layout_heads(
         x=gamma,
+        num_heads=2,
         head_dim=shape.head_dim,
     )
-    split_dq = operands.split_pairs(
+    split_dq = operands.split_layout_heads(
         x=dq,
+        num_heads=shape.heads,
         head_dim=shape.head_dim,
     )
-    split_dk = operands.split_pairs(
+    split_dk = operands.split_layout_heads(
         x=dk,
+        num_heads=shape.kv_heads,
         head_dim=shape.head_dim,
     )
     leaves = ("x", "weight", "gamma")
@@ -286,16 +289,25 @@ def linear_qknorm_rope(
         "layout": PairLayout.split,
     }
     # torch with its rope tables built once, outside the timed step
-    interleaved_cached = operands.cache_rope_cos_sin(
-        uncached=interleaved,
-        position_name="positions",
-        frequency_name="frequencies",
+    cos, sin = operands.cache_rope_cos_sin(
+        positions=samples_rope["positions"],
+        frequencies=frequencies,
+        head_dim=shape.head_dim,
     )
-    split_cached = operands.cache_rope_cos_sin(
-        uncached=split,
-        position_name="positions",
-        frequency_name="frequencies",
-    )
+    interleaved_cached = {
+        **interleaved,
+        "positions": None,
+        "frequencies": None,
+        "cos": cos,
+        "sin": sin,
+    }
+    split_cached = {
+        **split,
+        "positions": None,
+        "frequencies": None,
+        "cos": cos,
+        "sin": sin,
+    }
     # the oracles run torch's forward and backward in fp64
     torch_step = make_step_fn(
         fn=torch_linear.linear_qknorm_rope,
@@ -377,7 +389,7 @@ def linear_cross_entropy(
     dtype: torch.dtype,
 ) -> Case:
     sampler = Sampler(seed=seed)
-    samples = operands.lm_head(
+    samples = operands.lm_head_operands(
         shape=shape,
         rmsnorm=False,
         sampler=sampler,
@@ -478,7 +490,7 @@ def linear_cross_entropy_forward(
     dtype: torch.dtype,
 ) -> Case:
     sampler = Sampler(seed=seed)
-    samples = operands.lm_head(
+    samples = operands.lm_head_operands(
         shape=shape,
         rmsnorm=False,
         sampler=sampler,

@@ -127,23 +127,21 @@ def gemm_add_dual_precision(
         shape=(shape.dim, shape.ffn),
         dtype=torch.float32,
     )
-    iterate = operands.muon_iterate(
+    X = operands.muon_iterate(
         weight=weight,
         steps=X_STEPS,
         coefficients=(NS_A, NS_B, NS_C),
     )
-    # the step's polynomial P = b G + c G G with G = X X^T, from the fp64
-    # iterate
+    # the step's polynomial P = b G + c G G with G = X X^T
     gram = torch.mm(
-        input=iterate,
-        mat2=iterate.mT,
+        input=X,
+        mat2=X.mT,
     )
     gram_squared = torch.mm(
         input=gram,
         mat2=gram,
     )
     polynomial = NS_B * gram + NS_C * gram_squared
-    X = iterate.to(dtype=torch.float32)
     # the op computes a X + P X: P and X enter the GEMM in dtype, and X is
     # added in fp32
     A = polynomial.to(dtype=dtype)
