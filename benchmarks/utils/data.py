@@ -34,69 +34,49 @@ class Sampler(object):
             device="cuda",
         )
 
-    def weight(
-        self,
-        shape: tuple[int, int],
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        # a random (out, in) weight at the usual
-        # init scale, 1 / sqrt(in)
-        values = self.randn(
-            shape=shape,
-            dtype=torch.float32,
-        )
-        scaled = values * shape[1] ** -0.5
-        return scaled.to(dtype=dtype)
-
     def rand(
         self,
         size: int,
+        dtype: torch.dtype,
     ) -> torch.Tensor:
         # uniform in [0, 1)
         return torch.rand(
             size,
             generator=self.generator,
-            dtype=torch.float32,
+            dtype=dtype,
             device="cuda",
         )
+
+    def uniform(
+        self,
+        shape: tuple[int, ...],
+        low: float,
+        high: float,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        # uniform in [low, high)
+        values = torch.rand(
+            shape,
+            generator=self.generator,
+            dtype=dtype,
+            device="cuda",
+        )
+        return low + (high - low) * values
 
     def log_uniform(
         self,
         size: int,
         low: float,
         high: float,
-    ) -> torch.Tensor:
-        # log-uniform in [low, high)
-        uniform = self.rand(size=size)
-        exponent = math.log(low) + uniform * math.log(high / low)
-        return torch.exp(exponent)
-
-    def multipliers(
-        self,
-        size: int,
-        ratio: float,
-    ) -> torch.Tensor:
-        # random factors near 1; the largest is at
-        # most ratio times the smallest
-        return self.log_uniform(
-            size=size,
-            low=ratio**-0.5,
-            high=ratio**0.5,
-        )
-
-    def gamma(
-        self,
-        size: int,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        # a norm weight in the range of trained
-        # Llama-3 and Qwen3 norm weights
-        values = self.log_uniform(
+        # log-uniform in [low, high)
+        uniform = self.rand(
             size=size,
-            low=NORM_WEIGHT_LOW,
-            high=NORM_WEIGHT_HIGH,
+            dtype=dtype,
         )
-        return values.to(dtype=dtype)
+        exponent = math.log(low) + uniform * math.log(high / low)
+        return torch.exp(exponent)
 
     def tokens(
         self,
@@ -112,6 +92,50 @@ class Sampler(object):
             device="cuda",
         )
 
+    def weight(
+        self,
+        shape: tuple[int, int],
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        # a random (out, in) weight at the usual
+        # init scale, 1 / sqrt(in)
+        values = self.randn(
+            shape=shape,
+            dtype=torch.float32,
+        )
+        scaled = values * shape[1] ** -0.5
+        return scaled.to(dtype=dtype)
+
+    def gamma(
+        self,
+        size: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        # a norm weight in the range of trained
+        # Llama-3 and Qwen3 norm weights
+        values = self.log_uniform(
+            size=size,
+            low=NORM_WEIGHT_LOW,
+            high=NORM_WEIGHT_HIGH,
+            dtype=torch.float32,
+        )
+        return values.to(dtype=dtype)
+
+    def multipliers(
+        self,
+        size: int,
+        ratio: float,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        # random factors near 1; the largest is at
+        # most ratio times the smallest
+        return self.log_uniform(
+            size=size,
+            low=ratio**-0.5,
+            high=ratio**0.5,
+            dtype=dtype,
+        )
+
     def targets(
         self,
         size: int,
@@ -123,7 +147,11 @@ class Sampler(object):
             shape=(size,),
             vocab_size=vocab_size,
         )
-        ignored = self.rand(size=size) < IGNORED_FRACTION
+        uniform = self.rand(
+            size=size,
+            dtype=torch.float32,
+        )
+        ignored = (uniform < IGNORED_FRACTION)
         return values.masked_fill(
             mask=ignored,
             value=IGNORE_INDEX,
