@@ -518,6 +518,7 @@ def rmsnorm_operands(
     row_multipliers = sampler.multipliers(
         size=shape.tokens,
         ratio=RSTD_SPREAD,
+        dtype=torch.float32,
     )
     x_fp32 = x.to(dtype=torch.float32)
     x_square = x_fp32.square()
@@ -666,6 +667,7 @@ def calibrate_qk_cotangent(
         shape=(shape.tokens, num_heads),
         low=-QK_COTANGENT_MAX_COSINE,
         high=QK_COTANGENT_MAX_COSINE,
+        dtype=torch.float32,
     )
     norm_per_head = measure_head_norms(
         x=random_cotangent,
@@ -751,6 +753,7 @@ def calibrate_lm_head_input(
         size=shape.tokens,
         low=BACKGROUND_STD_LOW,
         high=BACKGROUND_STD_HIGH,
+        dtype=torch.float32,
     )
     other_means = [OTHER_CANDIDATE_OFFSET.mean] * NUM_OTHER_CANDIDATES
     other_stds = [OTHER_CANDIDATE_OFFSET.std] * NUM_OTHER_CANDIDATES
@@ -953,6 +956,7 @@ def gemm_xsa_bwd_operands(
         shape=(shape.tokens, num_heads),
         low=XSA_COSINE_LOW,
         high=XSA_COSINE_HIGH,
+        dtype=torch.float32,
     )
     v_norms = measure_head_norms(
         x=v,
@@ -1013,10 +1017,12 @@ def qknorm_rope_bwd_operands(
     row_scales = sampler.multipliers(
         size=shape.tokens,
         ratio=HEAD_MEAN_SQ_TOKEN_SPREAD,
+        dtype=torch.float32,
     )
     head_scales = sampler.multipliers(
         size=heads,
         ratio=HEAD_MEAN_SQ_HEAD_SPREAD,
+        dtype=torch.float32,
     )
     row_scales = rearrange(
         tensor=row_scales,
@@ -1043,6 +1049,7 @@ def qknorm_rope_bwd_operands(
         multipliers = sampler.multipliers(
             size=shape.tokens,
             ratio=HEAD_MEAN_SQ_TOKEN_SPREAD,
+            dtype=torch.float32,
         )
         rstd = shape.statistics.rstd * multipliers
         rstd_column = rearrange(
