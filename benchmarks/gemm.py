@@ -17,7 +17,7 @@ def gemm_sigmoid_fp32(
 ) -> Case:
     sampler = Sampler(seed=seed)
     # N is the head count, one gate per head
-    samples = operands.linear_operands(
+    samples = operands.gemm_operands(
         shape=shape,
         out_features=shape.heads,
         sampler=sampler,
@@ -82,7 +82,7 @@ def gemm_rmsnorm(
     dtype: torch.dtype,
 ) -> Case:
     sampler = Sampler(seed=seed)
-    samples_linear = operands.linear_operands(
+    samples_gemm = operands.gemm_operands(
         shape=shape,
         out_features=shape.dim,
         sampler=sampler,
@@ -91,13 +91,13 @@ def gemm_rmsnorm(
     # rescale A to the size a real norm input has, and compute its rstd
     samples_rmsnorm = operands.rmsnorm_operands(
         shape=shape,
-        x=samples_linear["A"],
-        rstd_nominal=shape.statistics.rstd,
+        x=samples_gemm["A"],
+        rstd_scale=shape.statistics.rstd,
         sampler=sampler,
         dtype=dtype,
     )
     A = samples_rmsnorm["A"]
-    B = samples_linear["B"]
+    B = samples_gemm["B"]
     rstd = samples_rmsnorm["rstd"]
     inputs = {
         "A": A,
@@ -300,7 +300,7 @@ def gemm_swiglu(
     dtype: torch.dtype,
 ) -> Case:
     sampler = Sampler(seed=seed)
-    samples = operands.linear_operands(
+    samples = operands.gemm_operands(
         shape=shape,
         out_features=2 * shape.ffn,
         sampler=sampler,
@@ -310,7 +310,7 @@ def gemm_swiglu(
     B = samples["B"]
     # two layouts of the gate and up columns: interleaved, as CODA takes
     # them, and split, all gates first, then all ups; torch runs both
-    split_B = operands.split_swiglu_weight(
+    split_B = operands.split_layout_swiglu_weight(
         B=B,
     )
     interleaved = {
@@ -381,7 +381,7 @@ def gemm_rmsnorm_swiglu(
     dtype: torch.dtype,
 ) -> Case:
     sampler = Sampler(seed=seed)
-    samples_linear = operands.linear_operands(
+    samples_gemm = operands.gemm_operands(
         shape=shape,
         out_features=2 * shape.ffn,
         sampler=sampler,
@@ -389,16 +389,16 @@ def gemm_rmsnorm_swiglu(
     )
     samples_rmsnorm = operands.rmsnorm_operands(
         shape=shape,
-        x=samples_linear["A"],
-        rstd_nominal=shape.statistics.rstd,
+        x=samples_gemm["A"],
+        rstd_scale=shape.statistics.rstd,
         sampler=sampler,
         dtype=dtype,
     )
     A = samples_rmsnorm["A"]
-    B = samples_linear["B"]
+    B = samples_gemm["B"]
     rstd = samples_rmsnorm["rstd"]
     # reorder the weight for torch's split layout, as in gemm_swiglu
-    split_B = operands.split_swiglu_weight(
+    split_B = operands.split_layout_swiglu_weight(
         B=B,
     )
     interleaved = {
@@ -572,7 +572,7 @@ def gemm_xsa_bwd(
     dtype: torch.dtype,
 ) -> Case:
     sampler = Sampler(seed=seed)
-    inputs = operands.xsa_operands(
+    inputs = operands.gemm_xsa_bwd_operands(
         shape=shape,
         sampler=sampler,
         dtype=dtype,

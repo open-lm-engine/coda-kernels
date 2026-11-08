@@ -21,7 +21,7 @@ def gemm_lse(
     dtype: torch.dtype,
 ) -> Case:
     sampler = Sampler(seed=seed)
-    samples = operands.lm_head(
+    samples = operands.lm_head_operands(
         shape=shape,
         rmsnorm=False,
         sampler=sampler,
@@ -75,7 +75,7 @@ def gemm_rmsnorm_lse(
     dtype: torch.dtype,
 ) -> Case:
     sampler = Sampler(seed=seed)
-    samples = operands.lm_head(
+    samples = operands.lm_head_operands(
         shape=shape,
         rmsnorm=True,
         sampler=sampler,
@@ -131,7 +131,7 @@ def gemm_lse_select_logits(
     dtype: torch.dtype,
 ) -> Case:
     sampler = Sampler(seed=seed)
-    samples = operands.lm_head(
+    samples = operands.lm_head_operands(
         shape=shape,
         rmsnorm=False,
         sampler=sampler,
@@ -193,7 +193,7 @@ def cross_entropy_fwd_bwd(
     dtype: torch.dtype,
 ) -> Case:
     sampler = Sampler(seed=seed)
-    samples = operands.lm_head(
+    samples = operands.lm_head_operands(
         shape=shape,
         rmsnorm=False,
         sampler=sampler,
@@ -287,7 +287,7 @@ def gemm_cross_entropy_fwd_bwd(
     dtype: torch.dtype,
 ) -> Case:
     sampler = Sampler(seed=seed)
-    samples = operands.lm_head(
+    samples = operands.lm_head_operands(
         shape=shape,
         rmsnorm=False,
         sampler=sampler,
@@ -355,7 +355,7 @@ def gemm_rmsnorm_cross_entropy_fwd_bwd(
     dtype: torch.dtype,
 ) -> Case:
     sampler = Sampler(seed=seed)
-    samples = operands.lm_head(
+    samples = operands.lm_head_operands(
         shape=shape,
         rmsnorm=True,
         sampler=sampler,
@@ -425,13 +425,13 @@ def gemm_scalar_scale_lm_head(
     dtype: torch.dtype,
 ) -> Case:
     sampler = Sampler(seed=seed)
-    samples = operands.lm_head(
+    samples = operands.lm_head_operands(
         shape=shape,
         rmsnorm=False,
         sampler=sampler,
         dtype=dtype,
     )
-    A = operands.lm_head_dlogits(
+    A = operands.lm_head_operands_dlogits(
         A=samples["A"],
         B=samples["B"],
         target=samples["target"],
