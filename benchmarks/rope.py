@@ -540,7 +540,7 @@ def gemm_qknorm_rope(
     B = samples_gemm["B"]
     # qk-norm's weight: one head's worth for q, then one for k
     gamma = sampler.gamma(
-        size=2 * shape.head_dim,
+        size=operands.NUM_QK_NORM_WEIGHTS * shape.head_dim,
         dtype=dtype,
     )
     positions = samples_rope["positions"]
@@ -565,10 +565,9 @@ def gemm_qknorm_rope(
         size_qk=size_qk,
         head_dim=shape.head_dim,
     )
-    # gamma is one q head's norm weight, then one k head's
     split["weight"] = operands.split_layout_heads(
         x=gamma,
-        num_heads=2,
+        num_heads=operands.NUM_QK_NORM_WEIGHTS,
         head_dim=shape.head_dim,
     )
     split["layout"] = PairLayout.split
@@ -693,7 +692,7 @@ def gemm_rmsnorm_qknorm_rope(
     rstd = samples_rmsnorm["rstd"]
     # qk-norm's weight: one head's worth for q, then one for k
     gamma = sampler.gamma(
-        size=2 * shape.head_dim,
+        size=operands.NUM_QK_NORM_WEIGHTS * shape.head_dim,
         dtype=dtype,
     )
     positions = samples_rope["positions"]
@@ -719,10 +718,9 @@ def gemm_rmsnorm_qknorm_rope(
         size_qk=size_qk,
         head_dim=shape.head_dim,
     )
-    # gamma is one q head's norm weight, then one k head's
     split["weight"] = operands.split_layout_heads(
         x=gamma,
-        num_heads=2,
+        num_heads=operands.NUM_QK_NORM_WEIGHTS,
         head_dim=shape.head_dim,
     )
     split["layout"] = PairLayout.split
@@ -894,10 +892,9 @@ def qknorm_rope_bwd(
         num_heads=shape.heads + shape.kv_heads,
         head_dim=shape.head_dim,
     )
-    # gamma is one q head's norm weight, then one k head's
     split["gamma"] = operands.split_layout_heads(
         x=gamma,
-        num_heads=2,
+        num_heads=operands.NUM_QK_NORM_WEIGHTS,
         head_dim=shape.head_dim,
     )
     split["layout"] = PairLayout.split
@@ -1065,10 +1062,9 @@ def qknorm_rope_bwd_zdz(
         num_heads=shape.heads + shape.kv_heads,
         head_dim=shape.head_dim,
     )
-    # gamma is one q head's norm weight, then one k head's
     split["gamma"] = operands.split_layout_heads(
         x=gamma,
-        num_heads=2,
+        num_heads=operands.NUM_QK_NORM_WEIGHTS,
         head_dim=shape.head_dim,
     )
     split["layout"] = PairLayout.split

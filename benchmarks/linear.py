@@ -234,10 +234,9 @@ def linear_qknorm_rope(
         size_qk=size_qk,
         head_dim=shape.head_dim,
     ).mT
-    # gamma is one q head's norm weight, then one k head's
     split_gamma = operands.split_layout_heads(
         x=gamma,
-        num_heads=2,
+        num_heads=operands.NUM_QK_NORM_WEIGHTS,
         head_dim=shape.head_dim,
     )
     split_dq = operands.split_layout_heads(
