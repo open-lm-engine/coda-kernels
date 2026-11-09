@@ -413,7 +413,7 @@ def linear_cross_entropy(
         "target": target,
         "grad_loss": grad_loss,
     }
-    # CODA takes int32 targets, as its GEMM epilogue passes them on
+    # CODA takes int32 targets
     coda_inputs = {
         **inputs,
         "target": inputs["target"].to(dtype=torch.int32),
@@ -510,7 +510,7 @@ def linear_cross_entropy_forward(
         "weight": weight,
         "target": target,
     }
-    # CODA takes int32 targets, as its GEMM epilogue passes them on
+    # CODA takes int32 targets
     coda_inputs = {
         **inputs,
         "target": inputs["target"].to(dtype=torch.int32),

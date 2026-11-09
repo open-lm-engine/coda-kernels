@@ -143,8 +143,7 @@ def gemm_lse_select_logits(
         "target": samples["target"],
         "ignore_index": data.IGNORE_INDEX,
     }
-    # CODA returns the lse only when asked for it, and takes int32 targets,
-    # as its GEMM epilogue passes them on
+    # CODA returns the lse only when asked for it, and takes int32 targets
     coda_inputs = {
         **inputs,
         "target": inputs["target"].to(dtype=torch.int32),
@@ -214,8 +213,7 @@ def cross_entropy_fwd_bwd(
         dim=-1,
     )
     lses = exact_lses.to(dtype=torch.float32)
-    # CODA takes int32 targets, as its GEMM epilogue passes them on; the
-    # torch reference takes the int64 ones
+    # CODA takes int32 targets; the torch reference takes the int64 ones
     target = samples["target"]
     target_int32 = target.to(dtype=torch.int32)
     coda_inputs = {
@@ -302,7 +300,7 @@ def gemm_cross_entropy_fwd_bwd(
         "ignore_index": data.IGNORE_INDEX,
         "return_zdz": True,
     }
-    # CODA takes int32 targets, as its GEMM epilogue passes them on
+    # CODA takes int32 targets
     coda_inputs = {
         **inputs,
         "target": inputs["target"].to(dtype=torch.int32),
@@ -376,7 +374,7 @@ def gemm_rmsnorm_cross_entropy_fwd_bwd(
         "ignore_index": data.IGNORE_INDEX,
         "return_zdz": True,
     }
-    # CODA takes int32 targets, as its GEMM epilogue passes them on
+    # CODA takes int32 targets
     coda_inputs = {
         **inputs,
         "target": inputs["target"].to(dtype=torch.int32),
