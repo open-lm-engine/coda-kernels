@@ -146,10 +146,12 @@ def qknorm_rope_bwd_kernel(
         head_index = (2 * col_coord_packed_begin) // head_dim
         gamma_offset = head_dim if head_index >= num_heads_q else 0
 
-        head_rstd = cute.math.rsqrt(
-            mHeadMeanSq[row_coord_clamped, head_index] + eps,
-            fastmath=True,
-        )
+        if cutlass.const_expr(mHeadMeanSq is None):
+            # Recompute each head's mean square from x as loaded here. The forward's value
+            # was taken before x was rounded to 16 bits, so it is slightly off for this x,
+            # and the gradient formula is exact only with the mean square of the same x
+            sum_sq = cute.Float32.zero
+
         dhead_rstd = cute.Float32.zero
         for col_index in cutlass.range_constexpr(vector_size):
             flat_index = row_index * vector_size + col_index
@@ -171,13 +173,37 @@ def qknorm_rope_bwd_kernel(
             g1 = mGamma[gamma_offset + gamma_index + 1].to(dtype=cute.Float32)
             rDZ[2 * col_index] = dz0
             rDZ[2 * col_index + 1] = dz1
+
+            if cutlass.const_expr(mHeadMeanSq is None):
+                sum_sq = sum_sq + x0 * x0 + x1 * x1
+
             dhead_rstd = dhead_rstd + dz0 * g0 * x0 + dz1 * g1 * x1
 
         if cutlass.const_expr(lanes_per_head > 1):
+
+            if cutlass.const_expr(mHeadMeanSq is None):
+                sum_sq = cute.arch.warp_reduction(
+                    val=sum_sq,
+                    op=operator.add,
+                    threads_in_group=lanes_per_head,
+                )
+
             dhead_rstd = cute.arch.warp_reduction(
                 dhead_rstd,
                 op=operator.add,
                 threads_in_group=lanes_per_head,
+            )
+
+        if cutlass.const_expr(mHeadMeanSq is not None):
+            # Use the forward's mean square, passed in as head_mean_sq
+            head_rstd = cute.math.rsqrt(
+                x=mHeadMeanSq[row_coord_clamped, head_index] + eps,
+                fastmath=True,
+            )
+        else:
+            head_rstd = cute.math.rsqrt(
+                x=sum_sq * cutlass.const_expr(1.0 / head_dim) + eps,
+                fastmath=True,
             )
 
         # dssq2 = 2 * dL/dssq
