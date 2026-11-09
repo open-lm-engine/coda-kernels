@@ -143,9 +143,11 @@ def gemm_lse_select_logits(
         "target": samples["target"],
         "ignore_index": data.IGNORE_INDEX,
     }
-    # CODA returns the lse only when asked for it
+    # CODA returns the lse only when asked for it, and takes int32 targets,
+    # as its GEMM epilogue passes them on
     coda_inputs = {
         **inputs,
+        "target": inputs["target"].to(dtype=torch.int32),
         "return_lse": True,
     }
     # loss logits: fp32 for torch, following TorchTitan, and fp64 for the oracle
@@ -300,6 +302,11 @@ def gemm_cross_entropy_fwd_bwd(
         "ignore_index": data.IGNORE_INDEX,
         "return_zdz": True,
     }
+    # CODA takes int32 targets, as its GEMM epilogue passes them on
+    coda_inputs = {
+        **inputs,
+        "target": inputs["target"].to(dtype=torch.int32),
+    }
     # loss logits: fp32 for torch, following TorchTitan, and fp64 for the oracle
     torch_inputs = {
         **inputs,
@@ -329,7 +336,7 @@ def gemm_cross_entropy_fwd_bwd(
         implementations={
             "coda": Implementation(
                 fn=cross_entropy_functional.gemm_cross_entropy_fwd_bwd,
-                inputs=inputs,
+                inputs=coda_inputs,
             ),
             "torch": Implementation(
                 fn=torch_ops.gemm_cross_entropy_fwd_bwd_bench,
@@ -369,6 +376,11 @@ def gemm_rmsnorm_cross_entropy_fwd_bwd(
         "ignore_index": data.IGNORE_INDEX,
         "return_zdz": True,
     }
+    # CODA takes int32 targets, as its GEMM epilogue passes them on
+    coda_inputs = {
+        **inputs,
+        "target": inputs["target"].to(dtype=torch.int32),
+    }
     # loss logits: fp32 for torch, following TorchTitan, and fp64 for the oracle
     torch_inputs = {
         **inputs,
@@ -399,7 +411,7 @@ def gemm_rmsnorm_cross_entropy_fwd_bwd(
         implementations={
             "coda": Implementation(
                 fn=cross_entropy_functional.gemm_rmsnorm_cross_entropy_fwd_bwd,
-                inputs=inputs,
+                inputs=coda_inputs,
             ),
             "torch": Implementation(
                 fn=torch_ops.gemm_rmsnorm_cross_entropy_fwd_bwd_bench,
