@@ -1,6 +1,10 @@
 import torch
 from einops import rearrange
-from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+from fla.utils import (
+    autocast_custom_bwd,
+    autocast_custom_fwd,
+    input_guard,
+)
 
 from coda.core.ops.constants import ALLOW_INPLACE_GRAD_OUTPUT
 from coda.core.elementwise.functional import (
@@ -117,8 +121,9 @@ class BlockPre(torch.autograd.Function):
             positions,
             frequencies,
         )
-        # x feeds qkv and the residual, so dx sums two gradients; a copy lets
-        # backward sum them in fp32, where autograd would sum them in bf16
+        # x is used twice, by qkv and as the residual, so its gradient is a sum
+        # of two. Returning a copy of x lets this backward add the two in fp32;
+        # returning x itself would leave the addition to autograd, in bf16
         return residual, qkv
 
     @staticmethod

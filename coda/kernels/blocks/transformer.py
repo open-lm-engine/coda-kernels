@@ -1,15 +1,22 @@
 import torch
 from einops import rearrange
-from quack.rms_final_reduce import rms_final_reduce as quack_rms_final_reduce
-from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+from fla.utils import (
+    autocast_custom_bwd,
+    autocast_custom_fwd,
+    input_guard,
+)
 
-from coda.core.ops.constants import ALLOW_INPLACE_GRAD_OUTPUT
+from coda.core.ops.constants import (
+    RETURN_HEAD_MEAN_SQ,
+    ALLOW_INPLACE_GRAD_OUTPUT,
+)
 from coda.core.elementwise.functional import (
+    partial_rmsnorm,
     qknorm_rope_bwd_zdz,
     xsa_fwd,
 )
 from coda.core.gemm.functional import (
-    gemm as coda_gemm,
+    gemm,
     gemm_scalar_scale,
     gemm_residual_partial_rmsnorm,
     gemm_residual_partial_rmsnorm_bwd,
@@ -19,16 +26,10 @@ from coda.core.gemm.functional import (
     gemm_swiglu_bwd_zdz,
     gemm_xsa_bwd,
 )
-from coda.kernels.functional.cross_entropy import gemm_rmsnorm_cross_entropy_fwd_bwd
-
-USE_CODA_GEMM = False
-
-
-def gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    if USE_CODA_GEMM:
-        return coda_gemm(A=A, B=B)
-    else:
-        return torch.matmul(A, B)
+from coda.kernels.functional.cross_entropy import (
+    gemm_rmsnorm_cross_entropy_fwd_bwd,
+    reduce_losses,
+)
 
 
 def block_pre_forward(
@@ -40,20 +41,19 @@ def block_pre_forward(
     frequencies: torch.Tensor,
     head_dim: int,
     eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
     assert wn.dtype == x.dtype
     assert x.ndim == 2
-    dim = x.shape[1]
     size_qkv = w.shape[0]
     assert size_qkv % (3 * head_dim) == 0
     num_heads = size_qkv // (3 * head_dim)
     size_qk = 2 * num_heads * head_dim
     size_v = num_heads * head_dim
 
-    h = x * rearrange(wn, "d -> 1 d")
-    rstd = quack_rms_final_reduce(
-        x=x.float() ** 2,
-        scale=1.0 / dim,
+    # x * wn, the residual's copy and rstd from one read of x
+    residual, h, rstd = partial_rmsnorm(
+        x=x,
+        weight=wn,
         eps=eps,
     )
 
@@ -63,6 +63,8 @@ def block_pre_forward(
     qk, v = qkv.split([size_qk, size_v], dim=1)
     w_qk, w_v = w.split([size_qk, size_v], dim=0)
 
+    # preact is saved for the backward. It is stored in fp16, which is more
+    # precise than bf16, and scaled by rstd so that it fits in fp16's range
     _, preact, head_mean_sq = gemm_rmsnorm_qknorm_rope(
         A=h,
         B=w_qk.mT,
@@ -74,7 +76,9 @@ def block_pre_forward(
         num_heads_q=num_heads,
         num_heads_k=num_heads,
         eps=eps,
+        return_head_mean_sq=RETURN_HEAD_MEAN_SQ,
         out=qk,
+        preact_scaled_by_rstd=True,
     )
     gemm_rmsnorm(
         A=h,
@@ -82,7 +86,7 @@ def block_pre_forward(
         rstd=rstd,
         out=v,
     )
-    return qkv, v, rstd, preact, head_mean_sq
+    return qkv, v, rstd, preact, head_mean_sq, residual
 
 
 def block_pre_backward(
@@ -96,7 +100,7 @@ def block_pre_backward(
     qkv: torch.Tensor,
     rstd: torch.Tensor,
     preact: torch.Tensor,
-    head_mean_sq: torch.Tensor,
+    head_mean_sq: torch.Tensor | None,
     positions: torch.Tensor,
     frequencies: torch.Tensor,
     head_dim: int,
@@ -128,7 +132,6 @@ def block_pre_backward(
         v=v,
         preact=preact,
         rstd=rstd,
-        head_mean_sq=head_mean_sq,
         gamma=wn2,
         pos=positions,
         freq=frequencies,
@@ -138,7 +141,9 @@ def block_pre_backward(
         eps=eps,
         scale=1.0 / dim,
         dv=dv,
+        head_mean_sq=head_mean_sq,
         dz=dz,
+        preact_scaled_by_rstd=True,
     )
     dx_out, dwn, x_out = gemm_residual_partial_rmsnorm_bwd(
         A=dz,
@@ -169,7 +174,7 @@ class BlockPre(torch.autograd.Function):
         head_dim: int,
         eps: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        qkv, v, rstd, preact, head_mean_sq = block_pre_forward(
+        qkv, v, rstd, preact, head_mean_sq, residual = block_pre_forward(
             x=x,
             w=w,
             wn=wn,
@@ -193,9 +198,12 @@ class BlockPre(torch.autograd.Function):
         )
         ctx.head_dim = head_dim
         ctx.eps = eps
+        # x is used twice, by qkv and as the residual, so its gradient is a sum
+        # of two. Returning a copy of x lets this backward add the two in fp32;
+        # returning x itself would leave the addition to autograd, in bf16
         # `v` is a view of `qkv`: as an output of its own, the next block's XSA grad
         # reaches the backward apart from FA's, with no slice to scatter it back
-        return x, qkv, v
+        return residual, qkv, v
 
     @staticmethod
     @input_guard
@@ -296,12 +304,12 @@ def block_post_forward(
         ignore_index=ignore_index,
         return_zdz=True,
     )
-    if reduction == "mean":
-        scale = 1.0 / (targets != ignore_index).sum().float()
-        loss = losses.sum() * scale
-    else:
-        scale = None
-        loss = losses.sum()
+    loss, scale = reduce_losses(
+        losses=losses,
+        target=targets,
+        ignore_index=ignore_index,
+        reduction=reduction,
+    )
     return loss, y0, x1, x2, rstd1, rstd2, z1, scale, dlogits, zdz2
 
 
@@ -538,7 +546,7 @@ def block_forward(
     frequencies: torch.Tensor,
     head_dim: int,
     eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     size_qkv = w3.shape[0]
     assert size_qkv % (3 * head_dim) == 0
     num_heads = size_qkv // (3 * head_dim)
@@ -576,6 +584,8 @@ def block_forward(
     qk, v2 = qkv.split([size_qk, size_v], dim=1)
     w3_qk, w3_v = w3.split([size_qk, size_v], dim=0)
 
+    # preact is saved for the backward. It is stored in fp16, which is more
+    # precise than bf16, and scaled by rstd so that it fits in fp16's range
     _, preact2, head_mean_sq2 = gemm_rmsnorm_qknorm_rope(
         A=h2,
         B=w3_qk.mT,
@@ -587,7 +597,9 @@ def block_forward(
         num_heads_q=num_heads,
         num_heads_k=num_heads,
         eps=eps,
+        return_head_mean_sq=RETURN_HEAD_MEAN_SQ,
         out=qk,
+        preact_scaled_by_rstd=True,
     )
     gemm_rmsnorm(
         A=h2,
@@ -619,7 +631,7 @@ def block_backward(
     rstd2: torch.Tensor,
     z1: torch.Tensor,
     preact2: torch.Tensor,
-    head_mean_sq2: torch.Tensor,
+    head_mean_sq2: torch.Tensor | None,
     positions: torch.Tensor,
     frequencies: torch.Tensor,
     head_dim: int,
@@ -652,7 +664,6 @@ def block_backward(
         v=v2,
         preact=preact2,
         rstd=rstd2,
-        head_mean_sq=head_mean_sq2,
         gamma=wn2,
         pos=positions,
         freq=frequencies,
@@ -662,7 +673,9 @@ def block_backward(
         eps=eps,
         scale=1.0 / dim,
         dv=dv2,
+        head_mean_sq=head_mean_sq2,
         dz=dz2,
+        preact_scaled_by_rstd=True,
     )
     dx_out, dwn1, x_out2 = gemm_residual_partial_rmsnorm_bwd(
         A=dz2,
