@@ -413,6 +413,11 @@ def linear_cross_entropy(
         "target": target,
         "grad_loss": grad_loss,
     }
+    # CODA takes int32 targets, as its GEMM epilogue passes them on
+    coda_inputs = {
+        **inputs,
+        "target": inputs["target"].to(dtype=torch.int32),
+    }
     # loss logits: fp32 for torch, following TorchTitan, and fp64 for the oracle
     torch_inputs = {
         **inputs,
@@ -458,7 +463,7 @@ def linear_cross_entropy(
         implementations={
             "coda": ImplementationFwdBwd(
                 fn=cross_entropy_functional.linear_cross_entropy,
-                inputs=inputs,
+                inputs=coda_inputs,
                 leaves=leaves,
                 cotangents=cotangents,
             ),
@@ -505,6 +510,11 @@ def linear_cross_entropy_forward(
         "weight": weight,
         "target": target,
     }
+    # CODA takes int32 targets, as its GEMM epilogue passes them on
+    coda_inputs = {
+        **inputs,
+        "target": inputs["target"].to(dtype=torch.int32),
+    }
     # loss logits: fp32 for torch, following TorchTitan, and fp64 for the oracle
     torch_inputs = {
         **inputs,
@@ -543,7 +553,7 @@ def linear_cross_entropy_forward(
         implementations={
             "coda": Implementation(
                 fn=cross_entropy_functional.linear_cross_entropy_forward,
-                inputs=inputs,
+                inputs=coda_inputs,
             ),
             "torch": Implementation(
                 fn=torch_linear.linear_cross_entropy,
