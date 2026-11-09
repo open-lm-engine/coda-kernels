@@ -22,7 +22,7 @@ def qknorm_rope_bwd_kernel(
     mDK_packed: cute.Tensor,
     mDGamma: cute.Tensor,
     mX_packed: cute.Tensor,
-    mHeadMeanSq: cute.Tensor,
+    mHeadMeanSq: cute.Tensor | None,
     mGamma: cute.Tensor,
     mPos: cute.Tensor,
     mFreq: cute.Tensor,
@@ -234,7 +234,7 @@ def _qknorm_rope_bwd(
     mDK: cute.Tensor,
     mDGamma: cute.Tensor,
     mX: cute.Tensor,
-    mHeadMeanSq: cute.Tensor,
+    mHeadMeanSq: cute.Tensor | None,
     mGamma: cute.Tensor,
     mPos: cute.Tensor,
     mFreq: cute.Tensor,
@@ -263,12 +263,14 @@ def _qknorm_rope_bwd(
     misc_utils.static_assert(len(mDK_packed.shape) == 2)
     misc_utils.static_assert(len(mDGamma.shape) == 2)
     misc_utils.static_assert(len(mX_packed.shape) == 2)
-    misc_utils.static_assert(len(mHeadMeanSq.shape) == 2)
+    if cutlass.const_expr(mHeadMeanSq is not None):
+        misc_utils.static_assert(len(mHeadMeanSq.shape) == 2)
     misc_utils.static_assert(len(mGamma.shape) == 1)
     misc_utils.static_assert(len(mPos.shape) == 1)
     misc_utils.static_assert(len(mFreq.shape) == 1)
-    misc_utils.static_assert(mHeadMeanSq.shape[1] == num_heads_qk)
     misc_utils.static_assert(mX.shape[1] == (head_dim * num_heads_qk))
+    if cutlass.const_expr(mHeadMeanSq is not None):
+        misc_utils.static_assert(mHeadMeanSq.shape[1] == num_heads_qk)
     misc_utils.static_assert(mDQ.shape[1] == (head_dim * num_heads_q))
     misc_utils.static_assert(mDK.shape[1] == (head_dim * num_heads_k))
     misc_utils.static_assert(mX_packed.shape[1] == mDX_packed.shape[1])
@@ -335,6 +337,7 @@ def _compile_qknorm_rope_bwd(
     num_heads_q: int,
     num_heads_k: int,
     eps: float,
+    has_head_mean_sq: bool,
     dtype: type[cute.Numeric],
     pos_dtype: type[cute.Numeric],
     freq_dtype: type[cute.Numeric],
@@ -379,12 +382,15 @@ def _compile_qknorm_rope_bwd(
         stride=(cute.sym_int64(divisibility=vector_size), 1),
         assumed_align=16,
     )
-    mHeadMeanSq = cute.runtime.make_fake_tensor(
-        dtype=cute.Float32,
-        shape=(m, num_heads_qk),
-        stride=(cute.sym_int64(divisibility=1), 1),
-        assumed_align=4,
-    )
+    if cutlass.const_expr(has_head_mean_sq):
+        mHeadMeanSq = cute.runtime.make_fake_tensor(
+            dtype=cute.Float32,
+            shape=(m, num_heads_qk),
+            stride=(cute.sym_int64(divisibility=1), 1),
+            assumed_align=4,
+        )
+    else:
+        mHeadMeanSq = None
     mGamma = cute.runtime.make_fake_tensor(
         dtype=dtype,
         shape=(2 * head_dim,),
@@ -433,7 +439,7 @@ def qknorm_rope_bwd_(
     dk: torch.Tensor,
     dgamma: torch.Tensor,
     x: torch.Tensor,
-    head_mean_sq: torch.Tensor,
+    head_mean_sq: torch.Tensor | None,
     gamma: torch.Tensor,
     pos: torch.Tensor,
     freq: torch.Tensor,
@@ -451,6 +457,7 @@ def qknorm_rope_bwd_(
         num_heads_q=num_heads_q,
         num_heads_k=num_heads_k,
         eps=eps,
+        has_head_mean_sq=head_mean_sq is not None,
         dtype=torch2cute_dtype_map[x.dtype],
         pos_dtype=torch2cute_dtype_map[pos.dtype],
         freq_dtype=torch2cute_dtype_map[freq.dtype],
