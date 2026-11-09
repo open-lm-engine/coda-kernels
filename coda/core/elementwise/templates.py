@@ -6,6 +6,7 @@ import cuda.bindings.driver as cuda
 from typing import Callable
 
 from quack.cache import jit_cache
+from quack.tile_scheduler import RasterOrder
 from quack.autotuner import autotune, AutotuneConfig
 from quack.cute_dsl_utils import torch2cute_dtype_map
 
@@ -23,6 +24,11 @@ class ElementwiseConfig(object):
     val_m: int
 
 
+@dataclasses.dataclass(frozen=True)
+class ElementwiseRasterConfig(ElementwiseConfig):
+    raster_order: RasterOrder
+
+
 @cute.kernel
 def elementwise_apply_kernel(
     fn: cutlass.Constexpr[Callable],
@@ -32,10 +38,18 @@ def elementwise_apply_kernel(
     tiler_mn: cute.Shape,
     tv_layout: cute.Layout,
     vector_size: cutlass.Constexpr[int],
+    raster_order: cutlass.Constexpr[RasterOrder],
 ) -> None:
     tidx, _, _ = cute.arch.thread_idx()
-    bidx, bidy, _ = cute.arch.block_idx()
+    bidxy, _, _ = cute.arch.block_idx()
     allocator = cutlass.utils.SmemAllocator()
+
+    # the tile this CTA computes, with the CTAs ordered along N or along M
+    num_blocks_m, num_blocks_n = cute.ceil_div(mX.shape, tiler_mn)
+    if cutlass.const_expr(raster_order == RasterOrder.AlongN):
+        bidy, bidx = cute.idx2crd(bidxy, (num_blocks_n, num_blocks_m))
+    else:
+        bidx, bidy = cute.idx2crd(bidxy, (num_blocks_m, num_blocks_n))
 
     idX = cute.make_identity_tensor(mX.shape)
     gX = cute.local_tile(mX, tiler_mn, (bidx, bidy))
@@ -114,6 +128,7 @@ def elementwise_apply(
     thr_m: cutlass.Constexpr[int],
     thr_n: cutlass.Constexpr[int],
     val_m: cutlass.Constexpr[int],
+    raster_order: cutlass.Constexpr[RasterOrder],
     stream: cuda.CUstream,
 ) -> int:
     vector_size = cutlass.const_expr(
@@ -150,9 +165,10 @@ def elementwise_apply(
         tiler_mn,
         tv_layout,
         vector_size,
+        raster_order,
     )
     kernel.launch(
-        grid=[*num_blocks, 1],
+        grid=[cute.size(num_blocks), 1, 1],
         block=[num_threads, 1, 1],
         cluster=None,
         smem=None,
@@ -171,6 +187,7 @@ def _compile_elementwise(
     thr_m: int,
     thr_n: int,
     val_m: int,
+    raster_order: RasterOrder,
 ) -> Callable:
     m = cute.sym_int()
     vector_size = cutlass.const_expr(
@@ -209,6 +226,7 @@ def _compile_elementwise(
         thr_m,
         thr_n,
         val_m,
+        raster_order,
         stream,
         options="--enable-tvm-ffi",
     )
@@ -222,6 +240,7 @@ def _elementwise_op(
     thr_m: int,
     thr_n: int,
     val_m: int,
+    raster_order: RasterOrder,
 ) -> None:
     assert X.shape == Y.shape == Z.shape
     size = X.shape[1]
@@ -234,6 +253,7 @@ def _elementwise_op(
         thr_m=thr_m,
         thr_n=thr_n,
         val_m=val_m,
+        raster_order=raster_order,
     )
     compiled_fn(X, Y, Z)
 
@@ -241,10 +261,11 @@ def _elementwise_op(
 @autotune(
     configs=[
         AutotuneConfig(
-            config=ElementwiseConfig(
+            config=ElementwiseRasterConfig(
                 thr_m=thr_m,
                 thr_n=thr_n,
                 val_m=val_m,
+                raster_order=raster_order,
             )
         )
         for thr_m, thr_n, val_m in (
@@ -264,6 +285,10 @@ def _elementwise_op(
             (8, 128, 1),
             (8, 128, 2),
         )
+        for raster_order in (
+            RasterOrder.AlongN,
+            RasterOrder.AlongM,
+        )
     ],
     # keyed on the op's name, not the op: str() of a function holds its address, so the on-disk cache never hits
     key=["op_name"],
@@ -277,10 +302,10 @@ def _elementwise_op_tuned_by_name(
     X: torch.Tensor,
     Y: torch.Tensor,
     Z: torch.Tensor,
-    config: ElementwiseConfig | None,
+    config: ElementwiseRasterConfig | None,
 ) -> None:
     if config is None:
-        config = ElementwiseConfig(thr_m=4, thr_n=32, val_m=4)
+        config = ElementwiseRasterConfig(thr_m=4, thr_n=32, val_m=4, raster_order=RasterOrder.AlongN)
 
     _elementwise_op(
         op=op,
@@ -290,6 +315,7 @@ def _elementwise_op_tuned_by_name(
         thr_m=config.thr_m,
         thr_n=config.thr_n,
         val_m=config.val_m,
+        raster_order=config.raster_order,
     )
 
 
