@@ -331,7 +331,7 @@ def qknorm_rope_bwd_zdz_kernel(
     mPreact_packed: cute.Tensor,
     mV_packed: cute.Tensor,
     mRstd: cute.Tensor,
-    mHeadMeanSq: cute.Tensor,
+    mHeadMeanSq: cute.Tensor | None,
     mGamma: cute.Tensor,
     mPos: cute.Tensor,
     mFreq: cute.Tensor,
@@ -340,7 +340,9 @@ def qknorm_rope_bwd_zdz_kernel(
     num_heads_k: cutlass.Constexpr[int],
     eps: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
+    preact_scaled_by_rstd: cutlass.Constexpr[bool],
     dtype: type[cute.Numeric],
+    preact_dtype: type[cute.Numeric],
     tiler_mn: cute.Shape,
     tv_layout: cute.Layout,
     thr_m: cutlass.Constexpr[int],
@@ -668,7 +670,7 @@ def _qknorm_rope_bwd_zdz(
     mPreact: cute.Tensor,
     mV: cute.Tensor,
     mRstd: cute.Tensor,
-    mHeadMeanSq: cute.Tensor,
+    mHeadMeanSq: cute.Tensor | None,
     mGamma: cute.Tensor,
     mPos: cute.Tensor,
     mFreq: cute.Tensor,
@@ -677,6 +679,7 @@ def _qknorm_rope_bwd_zdz(
     num_heads_k: cutlass.Constexpr[int],
     eps: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
+    preact_scaled_by_rstd: cutlass.Constexpr[bool],
     thr_m: cutlass.Constexpr[int],
     thr_n: cutlass.Constexpr[int],
     val_m: cutlass.Constexpr[int],
@@ -706,16 +709,18 @@ def _qknorm_rope_bwd_zdz(
         misc_utils.static_assert(len(mDV_packed.shape) == 2)
     misc_utils.static_assert(len(mDZ_packed.shape) == 2)
     misc_utils.static_assert(len(mZdZ.shape) == 1)
-    misc_utils.static_assert(len(mDGamma.shape) == 2)
+    misc_utils.static_assert(len(mDGamma.shape) == 1)
     misc_utils.static_assert(len(mPreact_packed.shape) == 2)
     misc_utils.static_assert(len(mV_packed.shape) == 2)
     misc_utils.static_assert(len(mRstd.shape) == 1)
-    misc_utils.static_assert(len(mHeadMeanSq.shape) == 2)
+    if cutlass.const_expr(mHeadMeanSq is not None):
+        misc_utils.static_assert(len(mHeadMeanSq.shape) == 2)
     misc_utils.static_assert(len(mGamma.shape) == 1)
     misc_utils.static_assert(len(mPos.shape) == 1)
     misc_utils.static_assert(len(mFreq.shape) == 1)
-    misc_utils.static_assert(mHeadMeanSq.shape[1] == num_heads_qk)
     misc_utils.static_assert(mPreact.shape[1] == (head_dim * num_heads_qk))
+    if cutlass.const_expr(mHeadMeanSq is not None):
+        misc_utils.static_assert(mHeadMeanSq.shape[1] == num_heads_qk)
     misc_utils.static_assert(mDY_packed.shape[1] == (mPreact_packed.shape[1] + mV_packed.shape[1]))
     misc_utils.static_assert(mDY_packed.shape[1] == mDZ_packed.shape[1])
     if cutlass.const_expr(mDV is not None):
@@ -729,7 +734,7 @@ def _qknorm_rope_bwd_zdz(
     # q and k use different gammas, so no tile may straddle the q | k boundary
     misc_utils.static_assert((size_q // 2) % (thr_n * vector_size) == 0)
     misc_utils.static_assert((size_k // 2) % (thr_n * vector_size) == 0)
-    misc_utils.static_assert(mDGamma.shape[1] == (2 * head_dim))
+    misc_utils.static_assert(mDGamma.shape[0] == (2 * head_dim))
     misc_utils.static_assert(mGamma.shape[0] == (2 * head_dim))
     misc_utils.static_assert(mFreq.shape[0] == mPreact.shape[1])
     misc_utils.static_assert((head_dim % (2 * vector_size)) == 0)
@@ -763,7 +768,9 @@ def _qknorm_rope_bwd_zdz(
         num_heads_k=num_heads_k,
         eps=eps,
         scale=scale,
+        preact_scaled_by_rstd=preact_scaled_by_rstd,
         dtype=mDY.element_type,
+        preact_dtype=mPreact.element_type,
         tiler_mn=tiler_mn,
         tv_layout=tv_layout,
         thr_m=thr_m,
@@ -789,8 +796,11 @@ def _compile_qknorm_rope_bwd_zdz(
     num_heads_k: int,
     eps: float,
     scale: float,
+    preact_scaled_by_rstd: bool,
     has_dv: bool,
+    has_head_mean_sq: bool,
     dtype: type[cute.Numeric],
+    preact_dtype: type[cute.Numeric],
     pos_dtype: type[cute.Numeric],
     freq_dtype: type[cute.Numeric],
     thr_m: int,
@@ -836,13 +846,16 @@ def _compile_qknorm_rope_bwd_zdz(
         assumed_align=4,
     )
     mDGamma = cute.runtime.make_fake_tensor(
-        dtype=cute.Float32,
-        shape=(cute.sym_int(), 2 * head_dim),
-        stride=(cute.sym_int64(divisibility=1), 1),
-        assumed_align=4,
+        dtype=cute.Float64,
+        shape=(2 * head_dim,),
+        stride=(1,),
+        assumed_align=8,
     )
+    # preact can be fp16 when dy is bf16, but must be 16-bit like dy:
+    # the kernel loads both in the same packed pairs
+    misc_utils.static_assert(preact_dtype.width == dtype.width)
     mPreact = cute.runtime.make_fake_tensor(
-        dtype=dtype,
+        dtype=preact_dtype,
         shape=(m, size_qk),
         stride=(cute.sym_int64(divisibility=vector_size), 1),
         assumed_align=16,
@@ -859,12 +872,15 @@ def _compile_qknorm_rope_bwd_zdz(
         stride=(1,),
         assumed_align=4,
     )
-    mHeadMeanSq = cute.runtime.make_fake_tensor(
-        dtype=cute.Float32,
-        shape=(m, num_heads_qk),
-        stride=(cute.sym_int64(divisibility=1), 1),
-        assumed_align=4,
-    )
+    if cutlass.const_expr(has_head_mean_sq):
+        mHeadMeanSq = cute.runtime.make_fake_tensor(
+            dtype=cute.Float32,
+            shape=(m, num_heads_qk),
+            stride=(cute.sym_int64(divisibility=1), 1),
+            assumed_align=4,
+        )
+    else:
+        mHeadMeanSq = None
     mGamma = cute.runtime.make_fake_tensor(
         dtype=dtype,
         shape=(2 * head_dim,),
@@ -903,6 +919,7 @@ def _compile_qknorm_rope_bwd_zdz(
         num_heads_k=num_heads_k,
         eps=eps,
         scale=scale,
+        preact_scaled_by_rstd=preact_scaled_by_rstd,
         thr_m=thr_m,
         thr_n=thr_n,
         val_m=val_m,
