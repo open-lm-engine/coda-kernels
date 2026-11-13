@@ -502,20 +502,19 @@ def qknorm_rope_bwd_zdz_kernel(
                 smem_allocator=allocator,
             )
             tDYrPreact_packed = copy_outputs_Preact.dst_thread
-            tDYrPreact = cute.recast_tensor(tDYrPreact_packed, dtype=dtype)
+            tDYrPreact = cute.recast_tensor(tDYrPreact_packed, dtype=preact_dtype)
             for row_index in cutlass.range_constexpr(val_m):
                 row_coord, col_coord_packed_begin = tDYcDY_packed[row_index * vector_size]
                 # the last tile can run past M. rows beyond M never load or store their tiles,
-                # read head_mean_sq from row M - 1 to stay in bounds,
                 # and are skipped by dgamma, which sums over rows
-                row_coord_clamped = cutlass.min(row_coord, mDY_packed.shape[0] - 1)
                 row_in_bound = row_coord < mDY_packed.shape[0]
-                head_index = (2 * col_coord_packed_begin) // head_dim
-                head_rstd = cute.math.rsqrt(
-                    mHeadMeanSq[row_coord_clamped, head_index] + eps,
-                    fastmath=True,
-                )
-                head_rstd_cubed = head_rstd * head_rstd * head_rstd
+
+                if cutlass.const_expr(mHeadMeanSq is None):
+                    # Recompute each head's mean square from x as loaded here. The forward's value
+                    # was taken before x was rounded to 16 bits, so it is slightly off for this x,
+                    # and the gradient formula is exact only with the mean square of the same x
+                    sum_sq = cute.Float32.zero
+
                 dhead_rstd = cute.Float32.zero
                 for col_index in cutlass.range_constexpr(vector_size):
                     flat_index = row_index * vector_size + col_index
@@ -531,17 +530,42 @@ def qknorm_rope_bwd_zdz_kernel(
                     # dn = R^T dy is the gradient of the qk-norm output n = gamma * z * head_rstd
                     dn0 = dy0 * c + dy1 * s
                     dn1 = dy1 * c - dy0 * s
-                    z0 = tDYrPreact[2 * flat_index].to(dtype=cute.Float32) * rRstd[row_index]
-                    z1 = tDYrPreact[2 * flat_index + 1].to(dtype=cute.Float32) * rRstd[row_index]
+                    z0 = tDYrPreact[2 * flat_index].to(dtype=cute.Float32)
+                    z1 = tDYrPreact[2 * flat_index + 1].to(dtype=cute.Float32)
+                    if cutlass.const_expr(not preact_scaled_by_rstd):
+                        z0 = z0 * rRstd[row_index]
+                        z1 = z1 * rRstd[row_index]
                     g0 = rGamma[2 * col_index]
                     g1 = rGamma[2 * col_index + 1]
                     rDN[2 * col_index] = dn0
                     rDN[2 * col_index + 1] = dn1
+
+                    if cutlass.const_expr(mHeadMeanSq is None):
+                        sum_sq = sum_sq + z0 * z0 + z1 * z1
+
                     dhead_rstd = dhead_rstd + dn0 * g0 * z0 + dn1 * g1 * z1
 
-                # zdz needs this head's sum(z * dz). the norm makes it exactly eps * head_rstd^3 * dhead_rstd.
-                # a direct sum of z * dz would be swamped by error: dz is rounded, and z is rebuilt
-                # from the bf16 preact, so mean(z^2) misses the forward's head_mean_sq by far more than eps.
+                if cutlass.const_expr(mHeadMeanSq is not None):
+                    row_coord_clamped = cutlass.min(row_coord, mDY_packed.shape[0] - 1)
+                    head_index = (2 * col_coord_packed_begin) // head_dim
+                    head_rstd = cute.math.rsqrt(
+                        x=mHeadMeanSq[row_coord_clamped, head_index] + eps,
+                        fastmath=True,
+                    )
+                else:
+                    if cutlass.const_expr(lanes_per_head > 1):
+                        sum_sq = cute.arch.warp_reduction(
+                            val=sum_sq,
+                            op=operator.add,
+                            threads_in_group=lanes_per_head,
+                        )
+
+                    head_rstd = cute.math.rsqrt(
+                        x=sum_sq * cutlass.const_expr(1.0 / head_dim) + eps,
+                        fastmath=True,
+                    )
+                head_rstd_cubed = head_rstd * head_rstd * head_rstd
+
                 # dhead_rstd is still split across the head's lanes here, so each lane adds its own part
                 rZdZ[row_index] = rZdZ[row_index] + eps * head_rstd_cubed * dhead_rstd
                 if cutlass.const_expr(lanes_per_head > 1):
@@ -559,8 +583,11 @@ def qknorm_rope_bwd_zdz_kernel(
                     g1 = rGamma[2 * col_index + 1]
                     dn0 = rDN[2 * col_index]
                     dn1 = rDN[2 * col_index + 1]
-                    z0 = tDYrPreact[2 * flat_index].to(dtype=cute.Float32) * rRstd[row_index]
-                    z1 = tDYrPreact[2 * flat_index + 1].to(dtype=cute.Float32) * rRstd[row_index]
+                    z0 = tDYrPreact[2 * flat_index].to(dtype=cute.Float32)
+                    z1 = tDYrPreact[2 * flat_index + 1].to(dtype=cute.Float32)
+                    if cutlass.const_expr(not preact_scaled_by_rstd):
+                        z0 = z0 * rRstd[row_index]
+                        z1 = z1 * rRstd[row_index]
                     tDYrDZ[2 * flat_index] = (head_rstd * g0 * dn0 + z0 * dssq2).to(dtype=tDYrDZ.element_type)
                     tDYrDZ[2 * flat_index + 1] = (head_rstd * g1 * dn1 + z1 * dssq2).to(dtype=tDYrDZ.element_type)
 
@@ -635,10 +662,9 @@ def qknorm_rope_bwd_zdz_kernel(
     for i in cutlass.range_constexpr(misc_utils.ceil_div(2 * head_dim, num_threads)):
         j = i * num_threads + tidx
         if j < 2 * head_dim:
-            dg = cute.Float32.zero
+            dg = cute.Float64.zero
             for group in cutlass.range_constexpr(num_head_groups):
-                dg = dg + sDGamma[group, j]
-            mDGamma[bidx, j] = dg
+                dg = dg + sDGamma[group, j].to(dtype=cute.Float64)
 
     zdzs = []
     for row_index in cutlass.range_constexpr(val_m):
