@@ -195,7 +195,7 @@ def qknorm_rope_bwd_kernel(
             )
 
         if cutlass.const_expr(mHeadMeanSq is not None):
-            # Use the forward's mean square, passed in as head_mean_sq
+            # read each head's mean of x^2, which the forward saved in head_mean_sq
             head_rstd = cute.math.rsqrt(
                 x=mHeadMeanSq[row_coord_clamped, head_index] + eps,
                 fastmath=True,
