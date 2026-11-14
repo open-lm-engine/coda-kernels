@@ -111,6 +111,15 @@ class GemmXsaBwdSm90(GemmSm90):
         chunks_per_lane = cutlass.const_expr(tile_N // vector_size // HOPPER_LANES_IN_N)
         head_chunks_per_lane = cutlass.const_expr(head_dim // vector_size // HOPPER_LANES_IN_N)
         heads_per_tile = cutlass.const_expr(tile_N // head_dim)
+        # this thread's lane along N
+        lane_in_n = tidx % HOPPER_LANES_IN_N
+        tile_shape_mn = (tile_M, tile_N)
+        tile_coord_mn = tile_coord_mnkl[:2]
+        # skip a tile that starts past M. A (2, 1) cluster takes tiles in
+        # pairs along M, so an odd number of tiles gets one extra
+        num_rows = params.x.shape[0]
+        tile_row_start = tile_coord_mnkl[0] * tile_M
+        tile_in_bound = tile_row_start < num_rows
 
         misc_utils.static_assert(vector_size == 8)
         misc_utils.static_assert(params.v.dtype == params.x.dtype)
@@ -125,11 +134,6 @@ class GemmXsaBwdSm90(GemmSm90):
         # so there must be no output D to store from it
         misc_utils.static_assert(self.d_dtype is None)
 
-        # this thread's lane along N
-        lane_in_n = tidx % HOPPER_LANES_IN_N
-        tile_shape_mn = (tile_M, tile_N)
-        tile_coord_mn = tile_coord_mnkl[:2]
-
         # this thread holds a few rows of G = dy W and some columns of each.
         # tCcC[i, j] is the (row, column) in the tile of the j-th value in
         # its i-th row, and rG_mn[i, j] is the value itself
@@ -141,3 +145,36 @@ class GemmXsaBwdSm90(GemmSm90):
         gV = _tile_chunks(params.v, tile_shape_mn=tile_shape_mn, tile_coord_mn=tile_coord_mn)
         gDX = _tile_chunks(params.dx, tile_shape_mn=tile_shape_mn, tile_coord_mn=tile_coord_mn)
         gDV = _tile_chunks(params.dv, tile_shape_mn=tile_shape_mn, tile_coord_mn=tile_coord_mn)
+
+        if tile_in_bound:
+            for row_index in cutlass.range_constexpr(cute.size(rG_mn, mode=[0])):
+                row_coord, _ = tCcC[row_index, 0]
+                # rows past M are not loaded or stored. They are still computed,
+                # as the warp shuffles and reductions need every lane
+                row_in_bound = (tile_row_start + row_coord) < num_rows
+                rG_row = cute.flat_divide(rG_mn[row_index, None], (vector_size,))
+
+                rX = cute.make_rmem_tensor(layout_or_shape=(vector_size, chunks_per_lane), dtype=params.x.dtype)
+                rV = cute.make_rmem_tensor(layout_or_shape=(vector_size, chunks_per_lane), dtype=params.v.dtype)
+                rDX = cute.make_rmem_tensor(layout_or_shape=(vector_size, chunks_per_lane), dtype=params.dx.dtype)
+                rDV = cute.make_rmem_tensor(layout_or_shape=(vector_size, chunks_per_lane), dtype=params.dv.dtype)
+
+                if row_in_bound:
+                    for k in cutlass.range_constexpr(chunks_per_lane):
+                        chunk_index = HOPPER_LANES_IN_N * k + lane_in_n
+                        # x, v, dx and dv pass through L2 once: evict them
+                        # first, so the dy panels stay resident
+                        memory_utils.g2r_copy_1d(
+                            src=gX[None, row_coord, chunk_index],
+                            dst=rX[None, k],
+                            cache_policy="evict_first",
+                        )
+                        memory_utils.g2r_copy_1d(
+                            src=gV[None, row_coord, chunk_index],
+                            dst=rV[None, k],
+                            cache_policy="evict_first",
+                        )
+                else:
+                    # a row past M computes from zeros and stores nothing
+                    rX.fill(0.0)
+                    rV.fill(0.0)
