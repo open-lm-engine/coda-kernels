@@ -3,6 +3,7 @@ import cutlass
 import cutlass.cute as cute
 from typing import cast, NamedTuple
 
+from coda.core.ops import constants
 from coda.core.ops import misc_utils
 from coda.core.ops import dtype_utils
 from coda.core.ops import layout_utils
@@ -373,6 +374,36 @@ def simple_copy(
     )
 
 
+def direct_copy(
+    op: cute.nvgpu.CopyG2ROp | cute.nvgpu.CopyR2GOp,
+    src: cute.Tensor,
+    dst: cute.Tensor,
+    cache_policy: str | None,
+) -> None:
+    # copy all of `src` to `dst` in a single vectorized load or store
+    dtype = misc_utils.get_dtype(src)
+    copy_atom = cute.make_copy_atom(
+        op=op,
+        copy_internal_type=dtype,
+        num_bits_per_copy=cute.size(src) * dtype.width,
+    )
+    if cutlass.const_expr(cache_policy is None):
+        cute.copy(
+            atom=copy_atom,
+            src=src,
+            dst=dst,
+        )
+    elif cutlass.const_expr(cache_policy == "evict_first"):
+        cute.copy(
+            atom=copy_atom,
+            src=src,
+            dst=dst,
+            cache_policy=cute.Int64(constants.L2_EVICT_FIRST),
+        )
+    else:
+        raise NotImplementedError(f"Unsupported cache policy: {cache_policy}")
+
+
 def dereference_load(
     tensor: cute.Tensor,
     coord: cute.Coord | None = None,
@@ -572,3 +603,35 @@ def s2r_copy_1d(
     if cutlass.const_expr(dtype is not None):
         dst = dtype_utils.convert(dst, dtype=dtype)
     return dst
+
+
+def g2r_copy_1d(
+    src: cute.Tensor,
+    dst: cute.Tensor,
+    cache_policy: str | None = None,
+) -> None:
+    # load `src` from global memory directly into the registers `dst`,
+    # without going through shared memory
+    # cache_policy="evict_first": the L2 cache evicts this data first
+    direct_copy(
+        op=cute.nvgpu.CopyG2ROp(),
+        src=src,
+        dst=dst,
+        cache_policy=cache_policy,
+    )
+
+
+def r2g_copy_1d(
+    src: cute.Tensor,
+    dst: cute.Tensor,
+    cache_policy: str | None = None,
+) -> None:
+    # store the registers `src` directly to `dst` in global memory,
+    # without going through shared memory
+    # cache_policy="evict_first": the L2 cache evicts this data first
+    direct_copy(
+        op=cute.nvgpu.CopyR2GOp(),
+        src=src,
+        dst=dst,
+        cache_policy=cache_policy,
+    )
