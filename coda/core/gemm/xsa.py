@@ -3,6 +3,7 @@ import cutlass
 import cutlass.cute as cute
 from typing import NamedTuple
 
+from quack import layout_utils as quack_layout_utils
 from quack.compile_utils import div_for_dtype, make_fake_tensor
 from quack.cute_dsl_utils import mlir_namedtuple
 from quack.epilogue.ops import EpiOp
@@ -11,6 +12,7 @@ from quack.gemm_sm90 import GemmSm90
 
 from coda.core.ops import constants
 from coda.core.ops import misc_utils
+from coda.core.ops import memory_utils
 from coda.core.gemm.epilogues import ConstInt
 
 
@@ -68,3 +70,24 @@ class GemmXsaBwdSm90(GemmSm90):
 
     def epi_to_underlying_arguments(self, args: EpilogueArguments, *, loc=None, ip=None) -> EpilogueArguments:
         return args
+
+    @cute.jit
+    def epi_visit_acc(
+        self,
+        params: EpilogueArguments,
+        acc: cute.Tensor,
+        tiled_mma: cute.TiledMma,
+        tile_coord_mnkl: cute.Coord,
+        tidx: cute.Int32,
+    ) -> None:
+        tile_M, tile_N, _ = self.cta_tile_shape_mnk
+        head_dim = params.head_dim
+        # each head's dot products are formed within one tile,
+        # so a tile must hold whole heads
+        misc_utils.static_assert(tile_N % head_dim == 0)
+        # x, v, dx and dv move 16 bytes at a time: 8 bf16 values
+        vector_size = cutlass.const_expr(constants.NUM_BITS_PER_COPY // params.x.dtype.width)
+        misc_utils.static_assert(vector_size == 8)
+        misc_utils.static_assert(params.v.dtype == params.x.dtype)
+        misc_utils.static_assert(params.dx.dtype == params.x.dtype)
+        misc_utils.static_assert(params.dv.dtype == params.x.dtype)
