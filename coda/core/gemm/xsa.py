@@ -51,3 +51,20 @@ class GemmXsaBwdSm90(GemmSm90):
         dx: cute.Tensor
         dv: cute.Tensor
         head_dim: cutlass.Constexpr[int]
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        # the split below is for two thread groups running the multiply
+        # and plain loads of A; quack uses other splits otherwise
+        assert not self.gather_A
+        assert self.mma_warp_groups == 2
+        # the threads that run the matrix multiply also hold the hook's
+        # working rows of x, v, dx and dv, so give them more registers
+        # than quack's default split does (40 for the loading threads,
+        # 232 for the rest). 24 and 240 is the split quack itself uses
+        # for register-heavy kernels; here it is 0.5 to 1% faster
+        self.num_regs_load = 24
+        self.num_regs_mma = 240
+
+    def epi_to_underlying_arguments(self, args: EpilogueArguments, *, loc=None, ip=None) -> EpilogueArguments:
+        return args
