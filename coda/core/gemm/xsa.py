@@ -41,6 +41,22 @@ class Tile(EpiOp):
         )
 
 
+@cute.jit
+def _tile_chunks(
+    tensor: cute.Tensor,
+    tile_shape_mn: cutlass.Constexpr[tuple[int, int]],
+    tile_coord_mn: cute.Coord,
+) -> cute.Tensor:
+    vector_size = cutlass.const_expr(constants.NUM_BITS_PER_COPY // tensor.dtype.width)
+    tile = cute.local_tile(tensor, tile_shape_mn, tile_coord_mn)
+    # divide along N only
+    # (1, VectorSize, TileM, TileN / VectorSize)
+    tile_chunks = cute.flat_divide(tile, (1, vector_size))
+    # squeeze the leading 1
+    # (VectorSize, TileM, TileN / VectorSize)
+    return tile_chunks[0, None, None, None]
+
+
 class GemmXsaBwdSm90(GemmSm90):
     _epi_ops = (
         Tile("x"),
@@ -100,3 +116,28 @@ class GemmXsaBwdSm90(GemmSm90):
         misc_utils.static_assert(params.v.dtype == params.x.dtype)
         misc_utils.static_assert(params.dx.dtype == params.x.dtype)
         misc_utils.static_assert(params.dv.dtype == params.x.dtype)
+        # each head's dot products are formed within one tile,
+        # so a tile must hold whole heads
+        misc_utils.static_assert(tile_N % head_dim == 0)
+        # a head must split into whole chunks, the same number on every lane
+        misc_utils.static_assert(head_dim % (vector_size * HOPPER_LANES_IN_N) == 0)
+        # the swap below rewrites the accumulator itself,
+        # so there must be no output D to store from it
+        misc_utils.static_assert(self.d_dtype is None)
+
+        # this thread's lane along N
+        lane_in_n = tidx % HOPPER_LANES_IN_N
+        tile_shape_mn = (tile_M, tile_N)
+        tile_coord_mn = tile_coord_mnkl[:2]
+
+        # this thread holds a few rows of G = dy W and some columns of each.
+        # tCcC[i, j] is the (row, column) in the tile of the j-th value in
+        # its i-th row, and rG_mn[i, j] is the value itself
+        idC = cute.make_identity_tensor(tile_shape_mn)
+        tCcC = quack_layout_utils.reshape_acc_to_mn(tiled_mma.get_slice(tidx).partition_C(idC))
+        rG_mn = quack_layout_utils.reshape_acc_to_mn(acc)
+
+        gX = _tile_chunks(params.x, tile_shape_mn=tile_shape_mn, tile_coord_mn=tile_coord_mn)
+        gV = _tile_chunks(params.v, tile_shape_mn=tile_shape_mn, tile_coord_mn=tile_coord_mn)
+        gDX = _tile_chunks(params.dx, tile_shape_mn=tile_shape_mn, tile_coord_mn=tile_coord_mn)
+        gDV = _tile_chunks(params.dv, tile_shape_mn=tile_shape_mn, tile_coord_mn=tile_coord_mn)
