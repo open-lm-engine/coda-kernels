@@ -60,6 +60,36 @@ def _tile_chunks(
     return lane_chunks[0, None, None, None]
 
 
+@cute.jit
+def _quad_transpose(
+    rG: cute.Tensor,
+    lane_in_n: cute.Int32,
+) -> None:
+    # Hopper's tensor cores spread a row over 4 lanes: each lane holds 2 of
+    # every 8 columns (a chunk). Hence the lanes swap values until each
+    # holds whole chunks. For every 4 chunks of the row:
+    #
+    #             before                       after
+    #   lane 0    columns 0-1 of each chunk    all 8 columns of chunk 0
+    #   lane 1    columns 2-3 of each chunk    all 8 columns of chunk 1
+    #   lane 2    columns 4-5 of each chunk    all 8 columns of chunk 2
+    #   lane 3    columns 6-7 of each chunk    all 8 columns of chunk 3
+    misc_utils.static_assert(rG.shape[0] == (2, 4))
+    for k in cutlass.range_constexpr(cute.size(rG, mode=[1])):
+        # two rounds of swaps: first with the lane 2 away, then with the neighbour
+        for offset in (2, 1):
+            keep_upper = (lane_in_n & offset) != 0
+            for j in cutlass.range_constexpr(4):
+                if cutlass.const_expr((j & offset) == 0):
+                    for e in cutlass.range_constexpr(2):
+                        lower = rG[(e, j), k]
+                        upper = rG[(e, j + offset), k]
+                        sent = cutlass.select_(keep_upper, lower, upper)
+                        received = cute.arch.shuffle_sync_bfly(sent, offset=offset)
+                        rG[(e, j), k] = cutlass.select_(keep_upper, received, lower)
+                        rG[(e, j + offset), k] = cutlass.select_(keep_upper, upper, received)
+
+
 class GemmXsaBwdSm90(GemmSm90):
     _epi_ops = (
         Tile("x"),
@@ -158,6 +188,10 @@ class GemmXsaBwdSm90(GemmSm90):
                 # this row of G, split into groups of vector_size values
                 # ((2, LanesInN), ChunksPerLane)
                 rG = cute.flat_divide(rG_mn[row_index, None], (vector_size,))
+                # Hopper's tensor cores spread a row of G over 4 lanes: each lane
+                # holds 2 of every 8 columns. x and v are loaded 8 neighbouring
+                # columns at a time, hence the lanes swap G so that each holds
+                # the same columns of G, x and v
                 _quad_transpose(rG, lane_in_n=lane_in_n)
 
                 rX = cute.make_rmem_tensor(layout_or_shape=(vector_size, chunks_per_lane), dtype=params.x.dtype)
