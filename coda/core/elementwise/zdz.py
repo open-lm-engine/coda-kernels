@@ -520,10 +520,13 @@ def qknorm_rope_bwd_zdz_kernel(
                     flat_index = row_index * vector_size + col_index
                     _, col_coord_packed = tDYcDY_packed[flat_index]
                     freq_index = 2 * col_coord_packed
+                    # accurate sin/cos: dgamma sums dn over every row
+                    # and head, so the rotation must be good to ~1 ulp
                     s, c = math_utils.rope_pos_freq(
                         pos=rPos[row_index],
                         freq_hi=mFreq[freq_index].to(dtype=cute.Float32),
                         freq_lo=mFreq[freq_index + 1].to(dtype=cute.Float32),
+                        fastmath=False,
                     )
                     dy0 = tDYrDY[2 * flat_index].to(dtype=cute.Float32)
                     dy1 = tDYrDY[2 * flat_index + 1].to(dtype=cute.Float32)
@@ -532,6 +535,9 @@ def qknorm_rope_bwd_zdz_kernel(
                     dn1 = dy1 * c - dy0 * s
                     z0 = tDYrPreact[2 * flat_index].to(dtype=cute.Float32)
                     z1 = tDYrPreact[2 * flat_index + 1].to(dtype=cute.Float32)
+                    # z is the rmsnormed input's q/k projection: z = rstd * (A @ B), with
+                    # rstd the row's rmsnorm scale. The forward saved preact as z itself
+                    # (preact_scaled_by_rstd) or as the raw A @ B, multiplied by rstd here
                     if cutlass.const_expr(not preact_scaled_by_rstd):
                         z0 = z0 * rRstd[row_index]
                         z1 = z1 * rRstd[row_index]
@@ -546,6 +552,9 @@ def qknorm_rope_bwd_zdz_kernel(
                     dhead_rstd = dhead_rstd + dn0 * g0 * z0 + dn1 * g1 * z1
 
                 if cutlass.const_expr(mHeadMeanSq is not None):
+                    # read each head's mean of z^2, which the forward saved in head_mean_sq.
+                    # The last tile can extend past the last row; those extra rows read the
+                    # last row instead, to stay in bounds, and their results are discarded
                     row_coord_clamped = cutlass.min(row_coord, mDY_packed.shape[0] - 1)
                     head_index = (2 * col_coord_packed_begin) // head_dim
                     head_rstd = cute.math.rsqrt(
@@ -565,8 +574,11 @@ def qknorm_rope_bwd_zdz_kernel(
                         fastmath=True,
                     )
                 head_rstd_cubed = head_rstd * head_rstd * head_rstd
-
-                # dhead_rstd is still split across the head's lanes here, so each lane adds its own part
+                # zdz = sum(z * dz) over the row's q and k heads, which the input norm's
+                # backward needs. The terms nearly cancel, so a direct sum is mostly
+                # rounding error; the qk-norm instead gives each head's sum in closed
+                # form, eps * head_rstd^3 * dhead_rstd (exact when head_rstd is computed
+                # from this z). Each lane adds its share; the row is summed at the end
                 rZdZ[row_index] = rZdZ[row_index] + eps * head_rstd_cubed * dhead_rstd
                 if cutlass.const_expr(lanes_per_head > 1):
                     dhead_rstd = cute.arch.warp_reduction(
@@ -662,9 +674,20 @@ def qknorm_rope_bwd_zdz_kernel(
     for i in cutlass.range_constexpr(misc_utils.ceil_div(2 * head_dim, num_threads)):
         j = i * num_threads + tidx
         if j < 2 * head_dim:
+            # sum this CTA's head groups in fp64 and add that to the fp64 total
+            # over all CTAs, which the caller rounds to fp32 once: summing in
+            # fp32 across thousands of CTAs would roughly double dgamma's error
             dg = cute.Float64.zero
             for group in cutlass.range_constexpr(num_head_groups):
                 dg = dg + sDGamma[group, j].to(dtype=cute.Float64)
+            cute.arch.red(
+                mDGamma.iterator + mDGamma.layout(j),
+                dg,
+                op="add",
+                dtype=cute.Float64,
+                sem="relaxed",
+                scope="gpu",
+            )
 
     zdzs = []
     for row_index in cutlass.range_constexpr(val_m):
