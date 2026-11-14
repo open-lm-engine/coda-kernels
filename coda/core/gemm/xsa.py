@@ -65,12 +65,12 @@ def _bfly_swap(
     rG: cute.Tensor,
     chunk: cutlass.Constexpr[int],
     offset: cutlass.Constexpr[int],
-    swap_lower: cutlass.Boolean,
+    swap_lower: cute.Boolean,
     index_pairs: cutlass.Constexpr[tuple[tuple[int, int], ...]],
 ) -> None:
     # each lane swaps values with the lane `offset` away. Of each pair of
     # indices it keeps one value and swaps the other: the lower one if
-    # swap_lower, else the upper one
+    # swap_lower, else the upper one. The other lane does the opposite
     for lower_index, upper_index in index_pairs:
         for column in cutlass.range_constexpr(2):
             lower = rG[(column, lower_index), chunk]
@@ -97,8 +97,9 @@ def _quad_transpose(
     #   lane 3    columns 6-7 of each chunk    all 8 columns of chunk 3
     misc_utils.static_assert(rG.shape[0] == (2, 4))
     for chunk in cutlass.range_constexpr(cute.size(rG, mode=[1])):
-        # round 1: lanes 0 and 2 swap, and lanes 1 and 3. After it, lanes 0
-        # and 1 hold chunks 0 and 1, and lanes 2 and 3 hold chunks 2 and 3
+        # round 1: lane 0 swaps with lane 2, and lane 1 with lane 3.
+        # Before it, every lane holds a piece of all 4 chunks. After it,
+        # lanes 0 and 1 hold only chunks 0 and 1, lanes 2 and 3 only 2 and 3
         _bfly_swap(
             rG,
             chunk=chunk,
@@ -106,8 +107,8 @@ def _quad_transpose(
             swap_lower=lane_in_n >= 2,
             index_pairs=((0, 2), (1, 3)),
         )
-        # round 2: lanes 0 and 1 swap, and lanes 2 and 3. After it, each
-        # lane holds one whole chunk
+        # round 2: lane 0 swaps with lane 1, and lane 2 with lane 3.
+        # After it, each lane holds one whole chunk
         _bfly_swap(
             rG,
             chunk=chunk,
@@ -200,6 +201,8 @@ class GemmXsaBwdSm90(GemmSm90):
         idC = cute.make_identity_tensor(tile_shape_mn)
         tCcC = quack_layout_utils.reshape_acc_to_mn(tiled_mma.get_slice(tidx).partition_C(idC))
         rG_mn = quack_layout_utils.reshape_acc_to_mn(acc)
+        # each lane must hold chunks_per_lane chunks of every row it has
+        misc_utils.static_assert(cute.size(rG_mn, mode=[1]) == vector_size * chunks_per_lane)
 
         gX = _tile_chunks(params.x, tile_shape_mn=tile_shape_mn, tile_coord_mn=tile_coord_mn)
         gV = _tile_chunks(params.v, tile_shape_mn=tile_shape_mn, tile_coord_mn=tile_coord_mn)
