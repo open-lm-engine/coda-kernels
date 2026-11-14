@@ -52,12 +52,33 @@ def _tile_chunks(
     # cut each row into chunks of vector_size columns
     # (1, VectorSize, TileM, TileN / VectorSize)
     tile_chunks = cute.flat_divide(tile, (1, vector_size))
-    # index a row's chunks by (lane, k): the k-th chunk that lane holds
+    # index a row's chunks by (lane, chunk): each lane's own chunks, in order
     # (1, VectorSize, TileM, (LanesInN, ChunksPerLane))
     lane_chunks = cute.logical_divide(tile_chunks, (None, None, None, HOPPER_LANES_IN_N))
     # drop the leading 1 from the shape
     # (VectorSize, TileM, (LanesInN, ChunksPerLane))
     return lane_chunks[0, None, None, None]
+
+
+@cute.jit
+def _bfly_swap(
+    rG: cute.Tensor,
+    chunk: cutlass.Constexpr[int],
+    offset: cutlass.Constexpr[int],
+    swap_lower: cutlass.Boolean,
+    index_pairs: cutlass.Constexpr[tuple[tuple[int, int], ...]],
+) -> None:
+    # each lane swaps values with the lane `offset` away. Of each pair of
+    # indices it keeps one value and swaps the other: the lower one if
+    # swap_lower, else the upper one
+    for lower_index, upper_index in index_pairs:
+        for column in cutlass.range_constexpr(2):
+            lower = rG[(column, lower_index), chunk]
+            upper = rG[(column, upper_index), chunk]
+            given = cutlass.select_(swap_lower, lower, upper)
+            taken = cute.arch.shuffle_sync_bfly(given, offset=offset)
+            rG[(column, lower_index), chunk] = cutlass.select_(swap_lower, taken, lower)
+            rG[(column, upper_index), chunk] = cutlass.select_(swap_lower, upper, taken)
 
 
 @cute.jit
@@ -75,19 +96,25 @@ def _quad_transpose(
     #   lane 2    columns 4-5 of each chunk    all 8 columns of chunk 2
     #   lane 3    columns 6-7 of each chunk    all 8 columns of chunk 3
     misc_utils.static_assert(rG.shape[0] == (2, 4))
-    for k in cutlass.range_constexpr(cute.size(rG, mode=[1])):
-        # two rounds of swaps: first with the lane 2 away, then with the neighbour
-        for offset in (2, 1):
-            keep_upper = (lane_in_n & offset) != 0
-            for j in cutlass.range_constexpr(4):
-                if cutlass.const_expr((j & offset) == 0):
-                    for e in cutlass.range_constexpr(2):
-                        lower = rG[(e, j), k]
-                        upper = rG[(e, j + offset), k]
-                        sent = cutlass.select_(keep_upper, lower, upper)
-                        received = cute.arch.shuffle_sync_bfly(sent, offset=offset)
-                        rG[(e, j), k] = cutlass.select_(keep_upper, received, lower)
-                        rG[(e, j + offset), k] = cutlass.select_(keep_upper, upper, received)
+    for chunk in cutlass.range_constexpr(cute.size(rG, mode=[1])):
+        # round 1: lanes 0 and 2 swap, and lanes 1 and 3. After it, lanes 0
+        # and 1 hold chunks 0 and 1, and lanes 2 and 3 hold chunks 2 and 3
+        _bfly_swap(
+            rG,
+            chunk=chunk,
+            offset=2,
+            swap_lower=lane_in_n >= 2,
+            index_pairs=((0, 2), (1, 3)),
+        )
+        # round 2: lanes 0 and 1 swap, and lanes 2 and 3. After it, each
+        # lane holds one whole chunk
+        _bfly_swap(
+            rG,
+            chunk=chunk,
+            offset=1,
+            swap_lower=lane_in_n % 2 == 1,
+            index_pairs=((0, 1), (2, 3)),
+        )
 
 
 class GemmXsaBwdSm90(GemmSm90):
@@ -200,17 +227,17 @@ class GemmXsaBwdSm90(GemmSm90):
                 rDV = cute.make_rmem_tensor(layout_or_shape=(vector_size, chunks_per_lane), dtype=params.dv.dtype)
 
                 if row_in_bound:
-                    for k in cutlass.range_constexpr(chunks_per_lane):
+                    for chunk in cutlass.range_constexpr(chunks_per_lane):
                         # x, v, dx and dv pass through L2 once: evict them
                         # first, so the dy panels stay resident
                         memory_utils.g2r_copy_1d(
-                            src=gX[None, row_coord, (lane_in_n, k)],
-                            dst=rX[None, k],
+                            src=gX[None, row_coord, (lane_in_n, chunk)],
+                            dst=rX[None, chunk],
                             cache_policy="evict_first",
                         )
                         memory_utils.g2r_copy_1d(
-                            src=gV[None, row_coord, (lane_in_n, k)],
-                            dst=rV[None, k],
+                            src=gV[None, row_coord, (lane_in_n, chunk)],
+                            dst=rV[None, chunk],
                             cache_policy="evict_first",
                         )
                 else:
@@ -223,11 +250,11 @@ class GemmXsaBwdSm90(GemmSm90):
                     x_dot_v = cute.Float32.zero
                     v_dot_v = cute.Float32.zero
                     for head_chunk in cutlass.range_constexpr(head_chunks_per_lane):
-                        k = head * head_chunks_per_lane + head_chunk
+                        chunk = head * head_chunks_per_lane + head_chunk
                         for col_index in cutlass.range_constexpr(vector_size):
-                            v = rV[col_index, k].to(dtype=cute.Float32)
-                            g_dot_v = g_dot_v + rG[col_index, k].to(dtype=cute.Float32) * v
-                            x_dot_v = x_dot_v + rX[col_index, k].to(dtype=cute.Float32) * v
+                            v = rV[col_index, chunk].to(dtype=cute.Float32)
+                            g_dot_v = g_dot_v + rG[col_index, chunk].to(dtype=cute.Float32) * v
+                            x_dot_v = x_dot_v + rX[col_index, chunk].to(dtype=cute.Float32) * v
                             v_dot_v = v_dot_v + v * v
 
                     g_dot_v = cute.arch.warp_reduction(g_dot_v, op=operator.add, threads_in_group=HOPPER_LANES_IN_N)
@@ -241,21 +268,21 @@ class GemmXsaBwdSm90(GemmSm90):
                     two_a_s = cute.Float32(2.0) * a * s
 
                     for head_chunk in cutlass.range_constexpr(head_chunks_per_lane):
-                        k = head * head_chunks_per_lane + head_chunk
+                        chunk = head * head_chunks_per_lane + head_chunk
                         for col_index in cutlass.range_constexpr(vector_size):
-                            g = rG[col_index, k].to(dtype=cute.Float32)
-                            x = rX[col_index, k].to(dtype=cute.Float32)
-                            v = rV[col_index, k].to(dtype=cute.Float32)
-                            rDV[col_index, k] = (two_a_s * v - (s * g + a * x)).to(dtype=rDV.dtype)
-                            rDX[col_index, k] = (g - a * v).to(dtype=rDX.dtype)
+                            g = rG[col_index, chunk].to(dtype=cute.Float32)
+                            x = rX[col_index, chunk].to(dtype=cute.Float32)
+                            v = rV[col_index, chunk].to(dtype=cute.Float32)
+                            rDV[col_index, chunk] = (two_a_s * v - (s * g + a * x)).to(dtype=rDV.dtype)
+                            rDX[col_index, chunk] = (g - a * v).to(dtype=rDX.dtype)
                         if row_in_bound:
                             memory_utils.r2g_copy_1d(
-                                src=rDX[None, k],
-                                dst=gDX[None, row_coord, (lane_in_n, k)],
+                                src=rDX[None, chunk],
+                                dst=gDX[None, row_coord, (lane_in_n, chunk)],
                                 cache_policy="evict_first",
                             )
                             memory_utils.r2g_copy_1d(
-                                src=rDV[None, k],
-                                dst=gDV[None, row_coord, (lane_in_n, k)],
+                                src=rDV[None, chunk],
+                                dst=gDV[None, row_coord, (lane_in_n, chunk)],
                                 cache_policy="evict_first",
                             )
