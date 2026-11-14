@@ -382,10 +382,11 @@ def direct_copy(
 ) -> None:
     # copy all of `src` to `dst` in a single vectorized load or store
     dtype = misc_utils.get_dtype(src)
+    num_bits_per_copy = cutlass.const_expr(cute.size(src) * dtype.width)
     copy_atom = cute.make_copy_atom(
         op=op,
         copy_internal_type=dtype,
-        num_bits_per_copy=cute.size(src) * dtype.width,
+        num_bits_per_copy=num_bits_per_copy,
     )
     if cutlass.const_expr(cache_policy is None):
         cute.copy(
