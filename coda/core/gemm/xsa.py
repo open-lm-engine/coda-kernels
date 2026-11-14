@@ -49,13 +49,13 @@ def _tile_chunks(
 ) -> cute.Tensor:
     vector_size = cutlass.const_expr(constants.NUM_BITS_PER_COPY // tensor.dtype.width)
     tile = cute.local_tile(tensor, tile_shape_mn, tile_coord_mn)
-    # divide along N only
+    # cut each row into chunks of vector_size columns
     # (1, VectorSize, TileM, TileN / VectorSize)
     tile_chunks = cute.flat_divide(tile, (1, vector_size))
-    # split a row's chunks by lane
+    # index a row's chunks by (lane, k): the k-th chunk that lane holds
     # (1, VectorSize, TileM, (LanesInN, ChunksPerLane))
     lane_chunks = cute.logical_divide(tile_chunks, (None, None, None, HOPPER_LANES_IN_N))
-    # squeeze the leading 1
+    # drop the leading 1 from the shape
     # (VectorSize, TileM, (LanesInN, ChunksPerLane))
     return lane_chunks[0, None, None, None]
 
@@ -155,8 +155,10 @@ class GemmXsaBwdSm90(GemmSm90):
                 # rows past M are not loaded or stored. They are still computed,
                 # as the warp shuffles and reductions need every lane
                 row_in_bound = (tile_row_start + row_coord) < num_rows
+                # this row of G, split into groups of vector_size values
                 # ((2, LanesInN), ChunksPerLane)
                 rG = cute.flat_divide(rG_mn[row_index, None], (vector_size,))
+                _quad_transpose(rG, lane_in_n=lane_in_n)
 
                 rX = cute.make_rmem_tensor(layout_or_shape=(vector_size, chunks_per_lane), dtype=params.x.dtype)
                 rV = cute.make_rmem_tensor(layout_or_shape=(vector_size, chunks_per_lane), dtype=params.v.dtype)
