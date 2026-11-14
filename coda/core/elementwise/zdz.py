@@ -510,9 +510,9 @@ def qknorm_rope_bwd_zdz_kernel(
                 row_in_bound = row_coord < mDY_packed.shape[0]
 
                 if cutlass.const_expr(mHeadMeanSq is None):
-                    # Recompute each head's mean square from x as loaded here. The forward's value
-                    # was taken before x was rounded to 16 bits, so it is slightly off for this x,
-                    # and the gradient formula is exact only with the mean square of the same x
+                    # Recompute each head's mean square from z as loaded here. The forward's value
+                    # was taken before z was rounded to 16 bits, so it is slightly off for this z,
+                    # and the gradient formula is exact only with the mean square of the same z
                     sum_sq = cute.Float32.zero
 
                 dhead_rstd = cute.Float32.zero
@@ -874,11 +874,11 @@ def _compile_qknorm_rope_bwd_zdz(
     mDGamma = cute.runtime.make_fake_tensor(
         dtype=cute.Float64,
         shape=(2 * head_dim,),
-        stride=(1,),
+        stride=(constants.NUM_BYTES_PER_CACHE_LINE * 8 // cute.Float64.width,),
         assumed_align=8,
     )
     # preact can be fp16 when dy is bf16, but must be 16-bit like dy:
-    # the kernel loads both in the same packed pairs
+    # the kernel loads both as two values per 32-bit word
     misc_utils.static_assert(preact_dtype.width == dtype.width)
     mPreact = cute.runtime.make_fake_tensor(
         dtype=preact_dtype,
