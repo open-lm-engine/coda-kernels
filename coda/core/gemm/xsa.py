@@ -22,9 +22,11 @@ class Tile(EpiOp):
         key: tuple[type[cute.Numeric], int],
         fctx: FakeArgCtx,
     ) -> cute.Tensor:
-        dtype, _ = key
+        # a plain 2-D GEMM only: no batch
+        # dimension, no swapped operands
         assert not fctx.batched
         assert not fctx.swapped
+        dtype, _ = key
         return make_fake_tensor(
             dtype=dtype,
             shape=(fctx.m, fctx.n),
